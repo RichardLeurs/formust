@@ -1,10 +1,12 @@
 mod about;
 mod assistant;
+mod bookmarks;
 mod bottom;
 mod editor_lines;
 mod prefs;
 mod unit_tests;
 mod vendor_ui;
+mod formatting;
 #[cfg(test)]
 mod demo_tests;
 mod recent;
@@ -21,6 +23,7 @@ mod external;
 mod highlight;
 mod hints;
 mod icons;
+mod laztools;
 mod livecheck;
 mod lsp;
 mod migrate;
@@ -29,6 +32,7 @@ mod style;
 mod terminal;
 mod terminal_view;
 mod theme;
+mod tools_editor;
 mod watch;
 
 use eframe::egui;
@@ -89,6 +93,13 @@ struct App {
     build_progress: Option<pascoda_fpc::Progress>,
     unit_counts: std::collections::HashMap<PathBuf, usize>,
     build_source: PathBuf,
+    /// Required packages the project does not find, for the Problems pane of the next build's result.
+    build_problems: Vec<Diagnostic>,
+    /// The external tools (Tools menu) and the Configure Tools window while it is open.
+    tools: Vec<pascoda_project::tools::Tool>,
+    tools_editor: Option<tools_editor::Editor>,
+    /// A tool that is running: its result comes back here.
+    tool_run: Option<Receiver<ToolRun>>,
     debug_after_build: bool,
     session: Option<debugger::Handle>,
     paused: Option<debugger::Paused>,
@@ -115,6 +126,10 @@ struct App {
     /// Diagnostics of the last build placed in the open files; dropped when a file changes.
     marks: Vec<hints::FileMarks>,
     live: livecheck::LiveCheck,
+    /// Quick Syntax Check running on its worker: the file, its text, whether the LCL was there, and the result.
+    syntax_rx: Option<Receiver<(PathBuf, String, bool, std::io::Result<Vec<Diagnostic>>)>>,
+    /// The console holds the output of Diff: its `+` and `-` lines are coloured in the Output tab.
+    console_diff: bool,
     /// The project's language mode (`pascoda.toml` in `mode_root`).
     mode: pascoda_fpc::Mode,
     mode_root: PathBuf,
@@ -129,6 +144,8 @@ struct App {
     vendor_dialog: Option<Vec<pascoda_fpc::vendor::Part>>,
     /// The missing language server was already pointed out this session.
     vendor_asked_pasls: bool,
+    /// Format Code is waiting for the language server (see `formatting`).
+    formatting: Option<formatting::Formatting>,
     designer_ui: designer::ui::UiState,
     native: Option<designer::native::Native>,
     selftest: Option<SelfTest>,
@@ -184,9 +201,17 @@ struct App {
     find: find::Bar,
     project_bar: find::ProjectBar,
     go_to: find::GoTo,
+    /// Numbered bookmarks 0-9 (session only).
+    bookmarks: bookmarks::Bookmarks,
+    /// The files the last Replace All in Project changed, for Undo Replace.
+    project_undo: Vec<find::Change>,
+    /// The results of a project search still running on its worker thread.
+    project_search_rx: Option<std::sync::mpsc::Receiver<(Vec<find::FileHits>, bool)>>,
     rename: find::Rename,
     /// The project's custom components, and the project (and file-tree revision) they were read for.
     custom_units: std::sync::Arc<designer::ClassUnits>,
+    /// The project's frames (their components by lower-case class), for forms that place them.
+    custom_frames: std::sync::Arc<std::collections::HashMap<String, pascoda_forms::Component>>,
     custom_scan: Option<(PathBuf, u64)>,
 }
 
@@ -242,6 +267,10 @@ impl App {
             build_progress: None,
             unit_counts: Default::default(),
             build_source: PathBuf::new(),
+            build_problems: Vec::new(),
+            tools: Vec::new(),
+            tools_editor: None,
+            tool_run: None,
             debug_after_build: false,
             session: None,
             paused: None,
@@ -260,6 +289,8 @@ impl App {
             hover: Default::default(),
             marks: Vec::new(),
             live: Default::default(),
+            syntax_rx: None,
+            console_diff: false,
             mode: Default::default(),
             mode_root: PathBuf::new(),
             build_texts: Vec::new(),
@@ -268,6 +299,7 @@ impl App {
             form_lfm: None,
             vendor_dialog: None,
             vendor_asked_pasls: false,
+            formatting: None,
             designer_ui: designer::ui::UiState::default(),
             native: None,
             selftest: None,
@@ -305,9 +337,13 @@ impl App {
             find: Default::default(),
             project_bar: Default::default(),
             go_to: Default::default(),
+            bookmarks: Default::default(),
+            project_undo: Vec::new(),
+            project_search_rx: None,
             rename: Default::default(),
             import_packages_open: false,
             custom_units: Default::default(),
+            custom_frames: Default::default(),
             custom_scan: None,
         };
         if let Some(p) = path {
@@ -332,6 +368,8 @@ impl App {
         app.recent = file.as_deref().map(recent::Recent::load).unwrap_or_default();
         app.recent_file = file;
         app.refresh_recent_menu();
+        app.tools = pascoda_project::tools::load();
+        app.refresh_tools_menu();
         app.start_watching(ctx);
         app.live.enabled = true;
         if pascoda_fpc::locate_fpc().is_none() {
@@ -761,24 +799,29 @@ impl App {
     /// with the form shown in the designer. The program is not changed, so the form is not built
     /// until a program uses it.
     fn new_form(&mut self, dir: &Path) {
-        self.new_unit(dir, false);
+        self.new_unit(dir, NewUnit::Form);
     }
 
-    /// Creates a form (or, with `data_module`, a data module) in `dir`, opens it in the designer and
-    /// adds it to the project's program.
-    fn new_unit(&mut self, dir: &Path, data_module: bool) {
-        let created = if data_module {
-            pascoda_project::new_data_module_unit(dir, &self.root)
-        } else {
-            pascoda_project::new_form_unit(dir, &self.root)
+    /// Creates a form, data module or frame in `dir` and opens it in the designer. A form or data module is
+    /// added to the project's program; a frame is not (forms place it).
+    fn new_unit(&mut self, dir: &Path, kind: NewUnit) {
+        let created = match kind {
+            NewUnit::Form => pascoda_project::new_form_unit(dir, &self.root),
+            NewUnit::DataModule => pascoda_project::new_data_module_unit(dir, &self.root),
+            NewUnit::Frame => pascoda_project::new_frame_unit(dir, &self.root),
         };
-        let what = if data_module { "data module" } else { "form" };
+        let what = match kind {
+            NewUnit::Form => "form",
+            NewUnit::DataModule => "data module",
+            NewUnit::Frame => "frame",
+        };
         match created {
             Ok(pas) => {
                 let shown = pas.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
                 let unit = shell::unit_name(&pas);
                 let form = std::fs::read_to_string(pas.with_extension("lfm"))
                     .ok()
+                    .filter(|_| kind != NewUnit::Frame)
                     .and_then(|t| pascoda_project::program::form_of_lfm(&t));
                 self.expanded.insert(dir.to_path_buf());
                 self.tree_sel = Some(pas.clone());
@@ -872,7 +915,8 @@ impl App {
 
     /// `run`: start the program after a successful build (not when debugging).
     fn start_build(&mut self, ctx: &egui::Context, debug: bool, run_after: bool) {
-        let Some(path) = self.docs.get(self.active).map(|d| program_for(&d.path)) else {
+        self.console_diff = false;
+        let Some(path) = self.docs.get(self.active).map(|d| program_for(&d.path, &self.root)) else {
             return;
         };
         self.sync_mode();
@@ -887,10 +931,14 @@ impl App {
         self.run_after_build = run_after;
         self.build_source = path.clone();
         self.build_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        self.console = "Building...\n".into();
+        self.console = format!(
+            "Building {}...\n",
+            path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+        );
         // A Lazarus or Delphi project in the program's folder adds its search paths and defines.
         let (mut project_args, project_note) = project_args(path.parent());
         self.console.push_str(&project_note);
+        self.build_problems = missing_package_problems(path.parent());
         // Debugging always builds the debug configuration; Run builds the project's configuration.
         let folder = path.parent().map(Path::to_path_buf).unwrap_or_default();
         let configuration = if debug {
@@ -915,6 +963,7 @@ impl App {
         let total = self.unit_counts.get(&path).copied();
         self.build_progress = None;
         let ctx = ctx.clone();
+        let lazarus = self.lazarus_setting(&path);
         std::thread::spawn(move || {
             let gui = is_gui_program(&path);
             let repaint = ctx.clone();
@@ -922,25 +971,7 @@ impl App {
                 let _ = ptx.send(p);
                 repaint.request_repaint();
             };
-            let built = if gui {
-                match pascoda_fpc::lcl::Lcl::find(&path) {
-                    Some(lcl) => {
-                        pascoda_fpc::lcl::build_gui_progress_with(
-                            &path,
-                            mode,
-                            &lcl,
-                            &project_args,
-                            total,
-                            &mut on,
-                        )
-                    }
-                    None => Err(std::io::Error::other(
-                        "vendor/lazarus not found (needed for GUI programs)",
-                    )),
-                }
-            } else {
-                pascoda_fpc::build_progress_configured(&path, mode, &project_args, total, release, &mut on)
-            };
+            let built = build_program(&path, lazarus.as_deref(), mode, &project_args, total, release, &mut on);
             let result = built.unwrap_or_else(|e| BuildResult {
                 success: false,
                 diagnostics: Vec::new(),
@@ -983,6 +1014,11 @@ impl App {
             self.console = result.raw_output.clone();
             if !result.success {
                 self.offer_vendor_for_build(&result.raw_output, &result.diagnostics);
+                let lazarus = self.lazarus_setting(&self.build_source);
+                let in_use = pascoda_fpc::lcl::Lcl::find_in(&self.build_source, lazarus.as_deref()).map(|l| l.lazarus_dir);
+                if let Some(hint) = lazarus_mismatch_hint(&result.diagnostics, in_use.as_deref()) {
+                    self.console.push_str(&format!("\n{hint}\n"));
+                }
             }
             if result.success && !self.debug_after_build && self.run_after_build {
                 self.console.push_str("\n--- program output ---\n");
@@ -996,10 +1032,184 @@ impl App {
             if result.success && self.debug_after_build {
                 self.start_debug(ctx);
             }
-            self.marks = self.place_marks(&result.diagnostics);
-            self.diagnostics = result.diagnostics.clone();
+            let mut diagnostics = result.diagnostics.clone();
+            diagnostics.append(&mut self.build_problems);
+            self.marks = self.place_marks(&diagnostics);
+            self.diagnostics = diagnostics;
             self.building = None;
             self.assistant_build_done(&result);
+        }
+    }
+
+    fn refresh_tools_menu(&mut self) {
+        if let Some(m) = self.menu.as_mut() {
+            m.set_tools(&self.tools);
+        }
+    }
+
+    /// Runs a tool from the Tools menu. Its output goes to the Output tab and its compiler-style errors to
+    /// Problems. One build or tool at a time, since they share the console.
+    /// Runs a built-in Lazarus tool. Quick Syntax Check and Diff run as tools (their output goes to the
+    /// Output tab); Check LFM reports into the console; Make Resource String edits the active unit.
+    fn run_laz_tool(&mut self, ctx: &egui::Context, tool: LazTool) {
+        let active = self.docs.get(self.active).map(|d| d.path.clone());
+        let is_source = |p: &Path| p.extension().and_then(|e| e.to_str()).is_some_and(|e| SOURCE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
+        match tool {
+            LazTool::QuickSyntaxCheck => {
+                let Some(path) = active.filter(|p| is_source(p)) else {
+                    self.note("Quick Syntax Check needs a Pascal file open");
+                    return;
+                };
+                // The same check as the squiggles: the project's search paths and the LCL, when it is built.
+                let text = self.docs[self.active].text.clone();
+                let mode = self.mode;
+                let lazarus = self.lazarus_setting(&program_for(&path, &self.root));
+                let (tx, rx) = channel();
+                self.syntax_rx = Some(rx);
+                let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                self.console = format!("Quick Syntax Check: checking {name}...\n");
+                self.auto_tab(ctx, bottom::BottomTab::Output);
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let lcl = pascoda_fpc::lcl::Lcl::find_in(&path, lazarus.as_deref()).filter(|l| !l.needs_build());
+                    let result = pascoda_fpc::check::check_text(&path, &text, mode, lcl.as_ref());
+                    let _ = tx.send((path, text, lcl.is_some(), result));
+                    ctx.request_repaint();
+                });
+            }
+            LazTool::Diff => {
+                if active.is_none() {
+                    self.note("Diff needs a file open");
+                    return;
+                }
+                let Some(other) = rfd::FileDialog::new().set_title("Compare the open file with").pick_file() else {
+                    return;
+                };
+                self.run_tool_value(
+                    ctx,
+                    pascoda_project::tools::Tool {
+                        name: tool.label().into(),
+                        command: "diff".into(),
+                        args: format!("-u \"{}\" \"$(File)\"", other.display()),
+                        workdir: "$(Dir)".into(),
+                    },
+                );
+                // The output is a diff only when the tool actually started.
+                self.console_diff = self.tool_run.is_some();
+            }
+            LazTool::CheckLfm => {
+                let Some(path) = active.filter(|p| {
+                    p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("lfm") || e.eq_ignore_ascii_case("dfm"))
+                }) else {
+                    self.note("Check LFM needs a form file (.lfm or .dfm) open");
+                    return;
+                };
+                let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                let text = self.docs[self.active].text.clone();
+                self.console = match pascoda_forms::lfm::parse(&text) {
+                    Ok(_) => format!("Check LFM: {name} is a valid form\n"),
+                    Err(e) => format!("Check LFM: {name}:{}:{}: {}\n", e.line, e.col, e.message),
+                };
+                self.auto_tab(ctx, bottom::BottomTab::Output);
+            }
+            LazTool::MakeResourceString => {
+                let Some(path) = active.filter(|p| is_source(p)) else {
+                    self.note("Make Resource String needs a Pascal file open");
+                    return;
+                };
+                let caret = self.cursor_index(ctx).unwrap_or(0);
+                let text = self.docs[self.active].text.clone();
+                match laztools::make_resource_string(&text, caret) {
+                    Ok(new) => {
+                        let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                        assistant::set_doc_text(&mut self.docs[self.active], new, false, Some(ctx));
+                        self.note(format!("Made a resource string in {name}"));
+                    }
+                    Err(e) => self.note(e),
+                }
+            }
+        }
+    }
+
+    fn run_tool(&mut self, ctx: &egui::Context, index: usize) {
+        let Some(tool) = self.tools.get(index).cloned() else {
+            return;
+        };
+        self.run_tool_value(ctx, tool);
+    }
+
+    /// Runs a tool: a custom one, or a built-in one (Quick Syntax Check, Diff).
+    fn run_tool_value(&mut self, ctx: &egui::Context, tool: pascoda_project::tools::Tool) {
+        self.console_diff = false;
+        if self.building.is_some() || self.tool_run.is_some() {
+            self.console.push_str("Wait for the build or tool to finish before running another tool.\n");
+            self.auto_tab(ctx, bottom::BottomTab::Output);
+            return;
+        }
+        self.save_all();
+        let file = self.docs.get(self.active).map(|d| d.path.clone());
+        let context = self.tool_context(ctx, file.as_deref());
+        let plan = pascoda_project::tools::plan(&tool, &context);
+        if !plan.unknown.is_empty() {
+            let names: Vec<String> = plan.unknown.iter().map(|m| format!("$({m})")).collect();
+            self.console = format!("{} uses an unknown macro: {}. Fix it in Configure Tools.\n", tool.name, names.join(", "));
+            self.auto_tab(ctx, bottom::BottomTab::Output);
+            return;
+        }
+        self.build_texts = self.docs.iter().map(|d| (d.path.clone(), d.text.clone())).collect();
+        self.build_dir = plan.workdir.clone();
+        self.console = format!("Running {}...\n$ {} {}\n", tool.name, plan.command, plan.args.join(" "));
+        self.auto_tab(ctx, bottom::BottomTab::Output);
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_tool_plan(&plan));
+            ctx.request_repaint();
+        });
+        self.tool_run = Some(rx);
+    }
+
+    /// What the tools' macros know now: the active file, its program and executable, the selected text and
+    /// the caret's line.
+    fn tool_context(&self, ctx: &egui::Context, file: Option<&Path>) -> pascoda_project::tools::Context {
+        let mut out = pascoda_project::tools::Context {
+            file: file.map(Path::to_path_buf),
+            project_dir: Some(self.root.clone()),
+            ..Default::default()
+        };
+        if let Some(file) = file {
+            let program = program_for(file, &self.root);
+            out.exe = Some(pascoda_project::executable_for(&program));
+            out.program = Some(program);
+        }
+        if let Some(doc) = self.docs.get(self.active)
+            && let Some(range) = egui::TextEdit::load_state(ctx, doc.editor_id).and_then(|s| s.cursor.char_range())
+        {
+            let (a, b) = (range.primary.index.0, range.secondary.index.0);
+            let (lo, hi) = (a.min(b), a.max(b));
+            out.selection = doc.text.chars().skip(lo).take(hi - lo).collect();
+            out.line = doc.text.chars().take(a).filter(|&c| c == '\n').count() as u32 + 1;
+        }
+        out
+    }
+
+    fn poll_tool(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.tool_run else {
+            return;
+        };
+        let Ok(done) = rx.try_recv() else {
+            return;
+        };
+        self.tool_run = None;
+        self.console.push_str(&done.output);
+        self.marks = self.place_marks(&done.diagnostics);
+        let failed = done
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d.severity, Severity::Fatal | Severity::Error));
+        self.diagnostics = done.diagnostics;
+        if failed {
+            self.auto_tab(ctx, bottom::BottomTab::Problems);
         }
     }
 
@@ -1011,7 +1221,7 @@ impl App {
         if self.exporting.is_some() || self.building.is_some() || self.session.is_some() {
             return;
         }
-        let Some(path) = self.docs.get(self.active).map(|d| program_for(&d.path)) else {
+        let Some(path) = self.docs.get(self.active).map(|d| program_for(&d.path, &self.root)) else {
             return;
         };
         self.sync_mode();
@@ -1097,14 +1307,14 @@ impl App {
             ui.label(egui::RichText::new(detail).weak());
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                if ui.button(discard_label).clicked() {
+                if crate::style::secondary_button(ui, discard_label).clicked() {
                     answer = Some(Answer::Discard);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(save_label).clicked() {
+                    if crate::style::primary_button(ui, save_label).clicked() {
                         answer = Some(Answer::Save);
                     }
-                    if ui.button("Cancel").clicked() {
+                    if crate::style::secondary_button(ui, "Cancel").clicked() {
                         answer = Some(Answer::Cancel);
                     }
                 });
@@ -1157,8 +1367,8 @@ impl App {
         match dialog.show(ctx, &self.root) {
             None => {}
             Some(export_dialog::Answer::Cancel) => self.export_dialog = None,
-            Some(export_dialog::Answer::Export(name, info)) => {
-                let start = self.docs.get(self.active).map(|d| program_for(&d.path));
+            Some(export_dialog::Answer::Export(name, info, arch)) => {
+                let start = self.docs.get(self.active).map(|d| program_for(&d.path, &self.root));
                 // A Save panel: the name is the file name of the disk image (the app beside it
                 // gets the same name), the folder is where both are written.
                 let dir = start
@@ -1183,7 +1393,7 @@ impl App {
                         self.console = format!("Could not save the export settings: {e}\n");
                     }
                 }
-                self.export_to(ctx, out, name, info);
+                self.export_to(ctx, out, name, info, arch);
             }
         }
     }
@@ -1195,8 +1405,9 @@ impl App {
         out: PathBuf,
         name: String,
         info: pascoda_fpc::lcl::BundleInfo,
+        arch: pascoda_fpc::Arch,
     ) {
-        let Some(path) = self.docs.get(self.active).map(|d| program_for(&d.path)) else {
+        let Some(path) = self.docs.get(self.active).map(|d| program_for(&d.path, &self.root)) else {
             return;
         };
         self.save_all();
@@ -1213,13 +1424,14 @@ impl App {
         self.build_progress_rx = Some(prx);
         let repaint = ctx.clone();
         let out_dir = out.clone();
+        let lazarus = self.lazarus_setting(&path);
         std::thread::spawn(move || {
             let mut on = move |p: pascoda_fpc::Progress| {
                 let _ = ptx.send(p);
                 repaint.request_repaint();
             };
             let lcl = if is_gui_program(&path) {
-                pascoda_fpc::lcl::Lcl::find(&path)
+                pascoda_fpc::lcl::Lcl::find_in(&path, lazarus.as_deref())
             } else {
                 None
             };
@@ -1232,6 +1444,7 @@ impl App {
                     &path,
                     mode,
                     lcl.as_ref(),
+                    arch,
                     &out_dir,
                     &name,
                     &info,
@@ -1242,7 +1455,7 @@ impl App {
             };
             let _ = tx.send(r);
         });
-        self.exporting = Some(Exporting { rx, out });
+        self.exporting = Some(Exporting { rx, out, arch });
     }
 
     fn poll_export(&mut self, ctx: &egui::Context) {
@@ -1256,6 +1469,7 @@ impl App {
             return;
         };
         let out = job.out.clone();
+        let arch = job.arch;
         self.exporting = None;
         if matches!(&result, Ok(d) if d.build.success)
             && let Some(p) = self.build_progress.as_ref().filter(|p| p.done > 0)
@@ -1270,7 +1484,7 @@ impl App {
                 self.console = done.build.raw_output.clone();
                 for p in done.product.iter().chain(done.dmg.iter()) {
                     self.console
-                        .push_str(&format!("\nExported {}", p.display()));
+                        .push_str(&format!("\nExported {} ({})", p.display(), arch.label()));
                 }
                 self.console.push('\n');
                 self.diagnostics = done.build.diagnostics;
@@ -1308,6 +1522,41 @@ impl App {
         self.diagnostics
             .retain(|d| canon(&dir.join(&d.file)) != this);
         self.diagnostics.extend(live.iter().cloned());
+    }
+
+    /// Shows the result of Quick Syntax Check: its errors go to Problems and the squiggles, like the live check.
+    /// Without the LCL, units such as Forms cannot be found, so those reports are dropped and the console says so.
+    fn poll_syntax_check(&mut self) {
+        let Some(rx) = self.syntax_rx.as_ref() else { return };
+        let Ok((path, text, lcl, result)) = rx.try_recv() else { return };
+        self.syntax_rx = None;
+        let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        match result {
+            Err(e) => self.console = format!("Quick Syntax Check: {e}\n"),
+            Ok(mut diags) => {
+                let mut note = String::new();
+                if !lcl {
+                    let before = diags.len();
+                    diags.retain(|d| !d.message.contains("Can't find unit"));
+                    if diags.len() != before {
+                        note = " (the LCL is not built, so units such as Forms were not checked: see Some tools are missing)".into();
+                    }
+                }
+                self.merge_live_problems(&path, &diags);
+                self.marks.retain(|m| m.path != path);
+                self.marks.extend(livecheck::marks(&path, &text, &diags));
+                let errors = diags.iter().filter(|d| matches!(d.severity, Severity::Error | Severity::Fatal)).count();
+                let warnings = diags.iter().filter(|d| matches!(d.severity, Severity::Warning)).count();
+                self.console = if errors == 0 && warnings == 0 {
+                    format!("Quick Syntax Check: no errors in {name}{note}\n")
+                } else {
+                    format!("Quick Syntax Check: {errors} errors, {warnings} warnings in {name}{note}\n")
+                };
+                if errors > 0 {
+                    self.bottom.tab = bottom::BottomTab::Problems;
+                }
+            }
+        }
     }
 
     /// Re-reads the language mode when the project folder changed.
@@ -1359,7 +1608,8 @@ impl App {
             .due(&doc.path, &doc.text, std::time::Instant::now())
         {
             let (path, text) = (doc.path.clone(), doc.text.clone());
-            self.live.start(ctx, path, text, self.mode);
+            let lazarus = self.lazarus_setting(&program_for(&path, &self.root));
+            self.live.start(ctx, path, text, self.mode, lazarus);
         } else {
             // Come back when the pause is over, even if nothing else repaints.
             ctx.request_repaint_after(livecheck::QUIET);
@@ -1376,10 +1626,13 @@ impl App {
                 let items: Vec<_> = diagnostics
                     .iter()
                     .filter(|d| {
-                        matches!(
-                            d.severity,
-                            Severity::Fatal | Severity::Error | Severity::Warning
-                        ) && canon(&self.build_dir.join(&d.file)) == canon(path)
+                        // Line 0 is a project-level problem (a missing package): it has no place in the text.
+                        d.line > 0
+                            && matches!(
+                                d.severity,
+                                Severity::Fatal | Severity::Error | Severity::Warning
+                            )
+                            && canon(&self.build_dir.join(&d.file)) == canon(path)
                     })
                     .map(|d| hints::Mark {
                         line: d.line.saturating_sub(1),
@@ -1701,6 +1954,7 @@ impl App {
                     self.nav_tab = shell::NavTab::Search;
                     self.show_navigator = true;
                 }
+                lsp::Resp::Formatted { error } => self.finish_format(ctx, error),
                 lsp::Resp::Rename(files) => {
                     if let Some(sent) = self.rename.sent.take() {
                         self.apply_rename(files, &sent);
@@ -1780,6 +2034,15 @@ impl App {
             self.go_to.open = true;
             self.go_to.focus = true;
             self.go_to.error.clear();
+        }
+        // Bookmarks: Ctrl+Shift+0-9 sets one at the caret's line, Ctrl+0-9 jumps to it.
+        const DIGITS: [Key; 10] = [Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
+        for (n, key) in DIGITS.into_iter().enumerate() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, key)) {
+                self.toggle_bookmark(ctx, n);
+            } else if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, key)) {
+                self.go_to_bookmark(ctx, n);
+            }
         }
         // Project search (Cmd+Shift+F) opens its tab with the query focused.
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::F)) {
@@ -2243,11 +2506,20 @@ impl App {
     }
 
     /// The program the build works on: the last build's, else the active tab's.
+    /// The Lazarus folder whose LCL builds `program` (`lazarus` in `pascoda.toml`): the program's folder first, then the
+    /// opened project folder. `None`: the bundled Lazarus (or the Lazarus tree the program lies in).
+    fn lazarus_setting(&self, program: &Path) -> Option<PathBuf> {
+        program
+            .parent()
+            .and_then(pascoda_project::load_lazarus)
+            .or_else(|| pascoda_project::load_lazarus(&self.root))
+    }
+
     fn build_source_or_active(&self) -> Option<PathBuf> {
         if !self.build_source.as_os_str().is_empty() {
             return Some(self.build_source.clone());
         }
-        self.docs.get(self.active).map(|d| program_for(&d.path))
+        self.docs.get(self.active).map(|d| program_for(&d.path, &self.root))
     }
 
     /// Runs the program until the caret's line (Run to Cursor, F4). Needs a stopped program.
@@ -2272,6 +2544,78 @@ impl App {
         self.paused = None;
         self.watch_eval = None;
         self.send(cmd);
+    }
+
+    /// Sets bookmark `n` at the caret's line of the active file, or clears it when it is already there.
+    fn toggle_bookmark(&mut self, ctx: &egui::Context, n: usize) {
+        let Some(doc) = self.docs.get(self.active) else {
+            self.note("No file open: a bookmark needs one");
+            return;
+        };
+        let line = line_col(&doc.text, self.cursor_index(ctx).unwrap_or(0)).0 + 1;
+        let path = doc.path.clone();
+        if self.bookmarks.toggle(n, &path, line) {
+            self.note(format!("Bookmark {n} set on line {line}"));
+        } else {
+            self.note(format!("Bookmark {n} cleared"));
+        }
+    }
+
+    /// Edit > Set Bookmark: the next free number, at the caret's line.
+    fn set_bookmark_here(&mut self, ctx: &egui::Context) {
+        let Some(doc) = self.docs.get(self.active) else {
+            self.note("No file open: a bookmark needs one");
+            return;
+        };
+        let line = line_col(&doc.text, self.cursor_index(ctx).unwrap_or(0)).0 + 1;
+        let path = doc.path.clone();
+        if let Some(n) = self.bookmarks.at(&path, line) {
+            self.note(format!("Line {line} already has bookmark {n}"));
+        } else if let Some(n) = self.bookmarks.next_free() {
+            self.bookmarks.toggle(n, &path, line);
+            self.note(format!("Bookmark {n} set on line {line}"));
+        } else {
+            self.note("All ten bookmarks (0-9) are set: clear one first (Ctrl+Shift+digit)");
+        }
+    }
+
+    /// Edit > Unset Bookmark: clears the bookmark on the caret's line, if there is one.
+    fn unset_bookmark_here(&mut self, ctx: &egui::Context) {
+        let Some(doc) = self.docs.get(self.active) else {
+            self.note("No file open: a bookmark needs one");
+            return;
+        };
+        let line = line_col(&doc.text, self.cursor_index(ctx).unwrap_or(0)).0 + 1;
+        let path = doc.path.clone();
+        match self.bookmarks.remove_at(&path, line) {
+            Some(n) => self.note(format!("Bookmark {n} removed from line {line}")),
+            None => self.note(format!("Line {line} has no bookmark")),
+        }
+    }
+
+    /// Edit > Go to Previous / Next Bookmark, in file and line order, wrapping around.
+    fn step_bookmark(&mut self, ctx: &egui::Context, forward: bool) {
+        let Some(doc) = self.docs.get(self.active) else {
+            self.note("No file open: a bookmark needs one");
+            return;
+        };
+        let line = line_col(&doc.text, self.cursor_index(ctx).unwrap_or(0)).0 + 1;
+        let path = doc.path.clone();
+        let Some((n, to, to_line)) = self.bookmarks.step(&path, line, forward).map(|(n, p, l)| (n, p.to_path_buf(), l)) else {
+            self.note("No bookmarks are set: Set Bookmark (Edit menu) adds one");
+            return;
+        };
+        self.note(format!("Bookmark {n}"));
+        self.goto(ctx, &to, to_line, 1);
+    }
+
+    /// Jumps to bookmark `n`, opening its file when it is closed.
+    fn go_to_bookmark(&mut self, ctx: &egui::Context, n: usize) {
+        let Some((path, line)) = self.bookmarks.get(n).map(|(p, l)| (p.to_path_buf(), l)) else {
+            self.note(format!("Bookmark {n} is not set"));
+            return;
+        };
+        self.goto(ctx, &path, line, 1);
     }
 
     /// Opens the diagnostic's file and moves the cursor to its 1-based line/column.
@@ -2321,6 +2665,43 @@ fn export_key(program: &Path) -> PathBuf {
     program.with_extension("export")
 }
 
+/// What a tool printed, and its errors in compiler form (relative file names are in the tool's folder).
+struct ToolRun {
+    output: String,
+    diagnostics: Vec<Diagnostic>,
+}
+
+/// Runs a tool without a shell, so its arguments (a selection, say) stay single arguments.
+fn run_tool_plan(plan: &pascoda_project::tools::Plan) -> ToolRun {
+    match Command::new(&plan.command).args(&plan.args).current_dir(&plan.workdir).output() {
+        Ok(out) => {
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            let diagnostics = pascoda_fpc::parse_output(&text)
+                .into_iter()
+                .map(|mut d| {
+                    if d.file.is_relative() {
+                        d.file = plan.workdir.join(&d.file);
+                    }
+                    d
+                })
+                .collect();
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            let status = out
+                .status
+                .code()
+                .map_or_else(|| "The tool was stopped.".to_string(), |code| format!("Exit code {code}."));
+            ToolRun { output: format!("{text}{status}\n"), diagnostics }
+        }
+        Err(e) => ToolRun {
+            output: format!("Could not run {}: {e}\n", plan.command),
+            diagnostics: Vec::new(),
+        },
+    }
+}
+
 /// The compiler arguments of the Lazarus or Delphi project file in `folder`, and a console note
 /// when that file cannot be read.
 fn project_args(folder: Option<&Path>) -> (Vec<std::ffi::OsString>, String) {
@@ -2332,10 +2713,105 @@ fn project_args(folder: Option<&Path>) -> (Vec<std::ffi::OsString>, String) {
         _ => String::new(),
     };
     let mut note = note;
-    for missing in pascoda_project::packages::resolve(folder).missing {
+    let resolved = pascoda_project::packages::resolve(folder);
+    for missing in resolved.missing {
         note.push_str(&format!("A required package, {missing}, was not found: its units are not on the search path\n"));
     }
+    for used in resolved.notes {
+        note.push_str(&format!("{used}\n"));
+    }
     (pascoda_project::compiler_args(folder), note)
+}
+
+/// One warning per required package of the project in `folder` that is not found, for the Problems pane.
+/// The problem is in the project file (`.lpi`) when there is one, else in the folder; it has no line.
+fn missing_package_problems(folder: Option<&Path>) -> Vec<Diagnostic> {
+    let Some(folder) = folder else {
+        return Vec::new();
+    };
+    let file = pascoda_project::foreign::find(folder).unwrap_or_else(|| folder.to_path_buf());
+    pascoda_project::packages::resolve(folder)
+        .missing
+        .into_iter()
+        .map(|name| Diagnostic {
+            file: file.clone(),
+            line: 0,
+            col: 0,
+            severity: Severity::Warning,
+            message: format!(
+                "Required package {name} was not found: its units are not on the search path. Import it with File > Import Component Package..."
+            ),
+        })
+        .collect()
+}
+
+/// Builds `path`: with the LCL (of the Lazarus the project names, `lazarus`) for a program that uses `Interfaces`, else plainly. A plain build that fails only
+/// because a unit of the LCL (`LCLType`, `LCLIntf`, ...) cannot be found is repeated once with the LCL's search
+/// paths: a program can use LCL units without `Interfaces` (a console tool, a library). The text of a build that
+/// needed this starts with a line saying so.
+fn build_program(
+    path: &Path,
+    lazarus: Option<&Path>,
+    mode: pascoda_fpc::Mode,
+    project_args: &[std::ffi::OsString],
+    total: Option<usize>,
+    release: bool,
+    on: &mut dyn FnMut(pascoda_fpc::Progress),
+) -> std::io::Result<BuildResult> {
+    let with_lcl = |on: &mut dyn FnMut(pascoda_fpc::Progress)| match pascoda_fpc::lcl::Lcl::find_in(path, lazarus) {
+        Some(lcl) => pascoda_fpc::lcl::build_gui_progress_with(path, mode, &lcl, project_args, total, on),
+        None => Err(std::io::Error::other("vendor/lazarus not found (needed for GUI programs)")),
+    };
+    if is_gui_program(path) {
+        return with_lcl(on);
+    }
+    let plain = pascoda_fpc::build_progress_configured(path, mode, project_args, total, release, on)?;
+    if !plain.success
+        && let Some(lcl) = pascoda_fpc::lcl::Lcl::find_in(path, lazarus)
+        && plain
+            .diagnostics
+            .iter()
+            .filter_map(|d| shell::missing_unit(&d.message))
+            .any(|unit| lcl.provides_unit(unit))
+    {
+        let mut again = with_lcl(on)?;
+        again.raw_output = format!("Built with the LCL: the program uses LCL units.\n{}", again.raw_output);
+        return Ok(again);
+    }
+    Ok(plain)
+}
+
+/// What to tell the user when the first error of a failed build is in a file of another Lazarus than the one whose LCL
+/// built the project: a Lazarus source tree (a folder of its components on the unit path) or a copy of a Lazarus
+/// package that lives in the project. Their code was written for their own LCL, so it can fail against another one
+/// (`identifier not found` for a field that was renamed). `in_use` is the Lazarus the LCL comes from.
+fn lazarus_mismatch_hint(diagnostics: &[pascoda_fpc::Diagnostic], in_use: Option<&Path>) -> Option<String> {
+    let error = diagnostics.iter().find(|d| d.severity == pascoda_fpc::Severity::Error)?;
+    let file = error.file.canonicalize().unwrap_or_else(|_| error.file.clone());
+    let in_use = in_use.map(|d| d.canonicalize().unwrap_or_else(|_| d.to_path_buf()));
+    let name = file.file_name()?.to_string_lossy().into_owned();
+    // a Lazarus source tree other than the one in use
+    if let Some(tree) = file.ancestors().skip(1).find(|d| pascoda_fpc::lcl::is_lazarus_tree(d))
+        && in_use.as_deref() != Some(tree)
+    {
+        return Some(format!(
+            "The error is in {name}, a file of the Lazarus in {}. The LCL this build uses comes from {}. Code written for one Lazarus can fail against another: set Project Options > Lazarus folder to {} to build with its LCL.",
+            tree.display(),
+            in_use.as_deref().map_or("the bundled Lazarus".to_string(), |d| d.display().to_string()),
+            tree.display()
+        ));
+    }
+    // a package of Lazarus's own (its author is "Lazarus Team") copied into the project
+    let copy = file.ancestors().skip(1).take(3).find(|dir| {
+        std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| {
+            e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("lpk"))
+                && std::fs::read_to_string(e.path()).is_ok_and(|t| t.contains("Author Value=\"Lazarus Team\""))
+        })
+    })?;
+    Some(format!(
+        "The error is in {name}, part of a copy of a Lazarus package in {}. A copy made for another Lazarus than the one this build uses can fail against its LCL: set Project Options > Lazarus folder to the Lazarus the copy came from.",
+        copy.display()
+    ))
 }
 
 /// The main program of the Lazarus or Delphi project file in `dir`, if it exists.
@@ -2347,31 +2823,41 @@ fn project_main(dir: &Path) -> Option<PathBuf> {
         .filter(|m| m.is_file())
 }
 
-fn program_for(path: &Path) -> PathBuf {
+/// The program a Build/Run/Debug/Export of `path` builds. A program file builds itself. Any other file (a
+/// unit, a package, a form file, a text file) builds the project's program: from the file's folder up to the
+/// project folder `root`, the first folder with a Lazarus or Delphi project file (its main program) or a single
+/// `.lpr` decides, so a unit in `src/` builds the program in the project root. A folder with several programs
+/// and no project file is ambiguous and ends the search; with nothing found the file builds itself.
+fn program_for(path: &Path, root: &Path) -> PathBuf {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
-    // A program file builds itself.
     if ext == "lpr" || ext == "dpr" {
         return path.to_path_buf();
     }
-    // Any other selected file (a unit, a package, a form file, a text file) builds the folder's program.
-    let Some(dir) = path.parent() else {
-        return path.to_path_buf();
-    };
-    // A Lazarus or Delphi project in the folder names its main program.
-    if let Some(main) = project_main(dir) {
-        return main;
+    let mut cur = path.parent();
+    // A file outside the opened folder only has its own folder.
+    let inside = path.starts_with(root);
+    while let Some(dir) = cur {
+        if let Some(main) = project_main(dir) {
+            return main;
+        }
+        let programs: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("lpr")))
+            .collect();
+        match programs.as_slice() {
+            [only] => return only.clone(),
+            [] => {}
+            _ => break, // several programs: ambiguous
+        }
+        if !inside || dir == root {
+            break;
+        }
+        cur = dir.parent();
     }
-    let programs: Vec<PathBuf> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("lpr")))
-        .collect();
-    match programs.as_slice() {
-        [only] => only.clone(),
-        _ => path.to_path_buf(),
-    }
+    path.to_path_buf()
 }
 
 /// A program that uses the LCL (`Interfaces` unit) needs the GUI build.
@@ -2423,13 +2909,13 @@ struct NativeMenu {
     new_library: muda::MenuId,
     new_package: muda::MenuId,
     new_form: muda::MenuId,
-    new_data_module: muda::MenuId,
     import_packages: muda::MenuId,
     new_file: muda::MenuId,
     new_folder: muda::MenuId,
     rename_item: muda::MenuId,
     preferences: muda::MenuId,
     run_to: muda::MenuId,
+    format: muda::MenuId,
     rebuild: muda::MenuId,
     clean: muda::MenuId,
     build_package: muda::MenuId,
@@ -2440,6 +2926,18 @@ struct NativeMenu {
     recent_ids: Vec<(muda::MenuId, usize)>,
     recent_items: Vec<muda::MenuItem>,
     recent_clear: muda::MenuId,
+    /// Tools: the submenu, its tools' items (by index in the App's list), Configure Tools... and the items alive.
+    tools_menu: muda::Submenu,
+    tool_ids: Vec<(muda::MenuId, usize)>,
+    /// The built-in Lazarus tools: their items' ids, and the items alive.
+    laz_ids: Vec<(muda::MenuId, LazTool)>,
+    laz_items: Vec<muda::MenuItem>,
+    /// Bookmarks (Edit menu): the item of each bookmark command, and the items alive (the menu needs them to stay).
+    bookmark_ids: Vec<(muda::MenuId, MenuAction)>,
+    #[allow(dead_code)]
+    bookmark_items: Vec<muda::MenuItem>,
+    configure_tools: muda::MenuId,
+    tool_items: Vec<muda::MenuItem>,
     project_options: muda::MenuId,
     toggle_view: muda::MenuId,
     jump_bar: muda::CheckMenuItem,
@@ -2468,16 +2966,46 @@ enum Confirm {
 }
 
 /// An export running on a worker thread, and where it writes.
+/// A unit with a designer file that File > New creates.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NewUnit {
+    Form,
+    DataModule,
+    Frame,
+}
+
 struct Exporting {
     rx: Receiver<std::io::Result<pascoda_fpc::export::Exported>>,
     out: PathBuf,
+    arch: pascoda_fpc::Arch,
+}
+
+/// The built-in Lazarus tools (Tools > Lazarus Tools), beside the custom tools.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LazTool {
+    QuickSyntaxCheck,
+    MakeResourceString,
+    Diff,
+    CheckLfm,
+}
+
+impl LazTool {
+    const ALL: [LazTool; 4] = [LazTool::QuickSyntaxCheck, LazTool::MakeResourceString, LazTool::Diff, LazTool::CheckLfm];
+
+    fn label(self) -> &'static str {
+        match self {
+            LazTool::QuickSyntaxCheck => "Quick Syntax Check",
+            LazTool::MakeResourceString => "Make Resource String",
+            LazTool::Diff => "Diff Checker",
+            LazTool::CheckLfm => "Check LFM",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 enum MenuAction {
     NewGui,
     NewForm,
-    NewDataModule,
     ImportPackages,
     NewFile,
     NewFolder,
@@ -2488,6 +3016,15 @@ enum MenuAction {
     Preferences,
     RunTests,
     RunToCursor,
+    /// Edit > Set Bookmark (the next free number at the caret's line), and Previous / Next Bookmark.
+    SetBookmark,
+    UnsetBookmark,
+    PreviousBookmark,
+    NextBookmark,
+    /// A built-in Lazarus tool (Tools > Lazarus Tools).
+    Laz(LazTool),
+    /// Edit > Format Code.
+    Format,
     ProjectOptions,
     Rebuild,
     Clean,
@@ -2497,6 +3034,10 @@ enum MenuAction {
     BuildPackage,
     /// An item of File > Open Recent (its index in the menu's list).
     OpenRecent(usize),
+    /// Tools > Configure Tools...
+    ConfigureTools,
+    /// Tools > a tool, by its index in the App's list.
+    Tool(usize),
     ClearRecent,
     Open,
     Save,
@@ -2572,7 +3113,6 @@ impl NativeMenu {
             true,
             Some(Accelerator::new(Modifiers::META | Modifiers::SHIFT, Code::KeyN)),
         );
-        let new_data_module = MenuItem::new("New Data Module", true, None);
         let toggle_view = MenuItem::new(
             "Switch Between Code and Form",
             true,
@@ -2637,6 +3177,32 @@ impl NativeMenu {
             }
             edit_menu.append(item).ok()?;
         }
+        // Under the Edit commands; Ctrl+Cmd+I (Re-Indent in Xcode) is free of the other shortcuts.
+        let format = MenuItem::new(
+            "Format Code",
+            true,
+            Some(Accelerator::new(Modifiers::META | Modifiers::CONTROL, Code::KeyI)),
+        );
+        edit_menu.append(&PredefinedMenuItem::separator()).ok()?;
+        edit_menu.append(&format).ok()?;
+        // Bookmarks, all on Cmd+Ctrl (the editor's Ctrl+digit and Ctrl+Shift+digit keys are separate).
+        let bookmark_key = |code| Some(Accelerator::new(Modifiers::META | Modifiers::CONTROL, code));
+        let set_bookmark = MenuItem::new("Set Bookmark", true, bookmark_key(Code::KeyB));
+        let unset_bookmark = MenuItem::new("Unset Bookmark", true, bookmark_key(Code::KeyU));
+        let prev_bookmark = MenuItem::new("Go to Previous Bookmark", true, bookmark_key(Code::BracketLeft));
+        let next_bookmark = MenuItem::new("Go to Next Bookmark", true, bookmark_key(Code::BracketRight));
+        edit_menu.append(&PredefinedMenuItem::separator()).ok()?;
+        edit_menu.append(&set_bookmark).ok()?;
+        edit_menu.append(&unset_bookmark).ok()?;
+        edit_menu.append(&prev_bookmark).ok()?;
+        edit_menu.append(&next_bookmark).ok()?;
+        let bookmark_ids = vec![
+            (set_bookmark.id().clone(), MenuAction::SetBookmark),
+            (unset_bookmark.id().clone(), MenuAction::UnsetBookmark),
+            (prev_bookmark.id().clone(), MenuAction::PreviousBookmark),
+            (next_bookmark.id().clone(), MenuAction::NextBookmark),
+        ];
+        let bookmark_items = vec![set_bookmark, unset_bookmark, prev_bookmark, next_bookmark];
         let menu = Menu::new();
         // Not the system's Quit: that ends the process without asking about unsaved changes.
         let quit = MenuItem::new("Quit Pascoda", true, cmd(Code::KeyQ));
@@ -2667,7 +3233,6 @@ impl NativeMenu {
                 &new_library,
                 &new_package,
                 &new_form,
-                &new_data_module,
                 &PredefinedMenuItem::separator(),
                 &new_file,
                 &new_folder,
@@ -2713,6 +3278,8 @@ impl NativeMenu {
             ],
         )
         .ok()?;
+        let configure_tools = MenuItem::new("Configure Tools...", true, None);
+        let tools_menu = Submenu::with_items("Tools", true, &[&configure_tools]).ok()?;
         let current = theme::Appearance::load();
         let appearance: Vec<_> = theme::Appearance::ALL
             .into_iter()
@@ -2728,7 +3295,7 @@ impl NativeMenu {
             &[&toggle_view, &jump_bar, &assistant, &appearance_menu],
         )
         .ok()?;
-        menu.append_items(&[&app, &file, &edit_menu, &view, &build])
+        menu.append_items(&[&app, &file, &edit_menu, &view, &build, &tools_menu])
             .ok()?;
         menu.init_for_nsapp();
 
@@ -2745,13 +3312,13 @@ impl NativeMenu {
             new_library: new_library.id().clone(),
             new_package: new_package.id().clone(),
             new_form: new_form.id().clone(),
-            new_data_module: new_data_module.id().clone(),
             import_packages: import_packages.id().clone(),
             new_file: new_file.id().clone(),
             new_folder: new_folder.id().clone(),
             rename_item: rename_item.id().clone(),
             preferences: preferences.id().clone(),
             run_to: run_to.id().clone(),
+            format: format.id().clone(),
             rebuild: rebuild.id().clone(),
             clean: clean.id().clone(),
             build_package: build_package.id().clone(),
@@ -2759,6 +3326,14 @@ impl NativeMenu {
             recent_entries: Vec::new(),
             recent_ids: Vec::new(),
             recent_items: Vec::new(),
+            tools_menu,
+            tool_ids: Vec::new(),
+            laz_ids: Vec::new(),
+            laz_items: Vec::new(),
+            bookmark_ids,
+            bookmark_items,
+            configure_tools: configure_tools.id().clone(),
+            tool_items: vec![configure_tools],
             recent_clear: recent_clear.id().clone(),
             project_options: project_options.id().clone(),
             toggle_view: toggle_view.id().clone(),
@@ -2826,6 +3401,36 @@ impl NativeMenu {
         self.recent_entries = entries;
     }
 
+    /// Rebuilds the Tools menu: one item per tool, then Configure Tools....
+    fn set_tools(&mut self, tools: &[pascoda_project::tools::Tool]) {
+        while self.tools_menu.remove_at(0).is_some() {}
+        self.tool_ids.clear();
+        self.tool_items.clear();
+        for (i, tool) in tools.iter().enumerate() {
+            let item = muda::MenuItem::new(&tool.name, true, None);
+            let _ = self.tools_menu.append(&item);
+            self.tool_ids.push((item.id().clone(), i));
+            self.tool_items.push(item);
+        }
+        if !tools.is_empty() {
+            let _ = self.tools_menu.append(&muda::PredefinedMenuItem::separator());
+        }
+        let configure = muda::MenuItem::new("Configure Tools...", true, None);
+        let _ = self.tools_menu.append(&configure);
+        self.configure_tools = configure.id().clone();
+        self.tool_items.push(configure);
+        // The built-in Lazarus tools, after the custom tools and Configure Tools.
+        let _ = self.tools_menu.append(&muda::PredefinedMenuItem::separator());
+        self.laz_ids.clear();
+        self.laz_items.clear();
+        for tool in LazTool::ALL {
+            let item = muda::MenuItem::new(tool.label(), true, None);
+            let _ = self.tools_menu.append(&item);
+            self.laz_ids.push((item.id().clone(), tool));
+            self.laz_items.push(item);
+        }
+    }
+
     fn poll(&self) -> Vec<MenuAction> {
         self.events
             .try_iter()
@@ -2836,7 +3441,6 @@ impl NativeMenu {
                     (&self.new_library, MenuAction::NewLibrary),
                     (&self.new_package, MenuAction::NewPackage),
                     (&self.new_form, MenuAction::NewForm),
-                    (&self.new_data_module, MenuAction::NewDataModule),
                     (&self.import_packages, MenuAction::ImportPackages),
                     (&self.new_file, MenuAction::NewFile),
                     (&self.new_folder, MenuAction::NewFolder),
@@ -2849,12 +3453,14 @@ impl NativeMenu {
                     (&self.run_tests, MenuAction::RunTests),
                     (&self.debug, MenuAction::Debug),
                     (&self.run_to, MenuAction::RunToCursor),
+                    (&self.format, MenuAction::Format),
                     (&self.project_options, MenuAction::ProjectOptions),
                     (&self.rebuild, MenuAction::Rebuild),
                     (&self.clean, MenuAction::Clean),
                     (&self.build_package, MenuAction::BuildPackage),
                     (&self.recent_clear, MenuAction::ClearRecent),
                     (&self.export, MenuAction::Export),
+                    (&self.configure_tools, MenuAction::ConfigureTools),
                     (&self.quit, MenuAction::Quit),
                 ]
                 .into_iter()
@@ -2867,7 +3473,15 @@ impl NativeMenu {
                         .find(|(item, _)| *item == id)
                         .map(|(_, i)| MenuAction::OpenRecent(*i))
                 })
+                .or_else(|| {
+                    self.tool_ids
+                        .iter()
+                        .find(|(item, _)| *item == id)
+                        .map(|(_, i)| MenuAction::Tool(*i))
+                })
                 .or_else(|| (*self.assistant.id() == id).then_some(MenuAction::ToggleAssistant))
+                .or_else(|| self.bookmark_ids.iter().find(|(item, _)| *item == id).map(|(_, a)| *a))
+                .or_else(|| self.laz_ids.iter().find(|(item, _)| *item == id).map(|(_, t)| MenuAction::Laz(*t)))
                 .or_else(|| {
                     self.edit
                         .iter()
@@ -3290,14 +3904,14 @@ mod tests {
             assert!(app.exporting.is_none(), "the export finished");
         };
         let mut app = App::bare(Some(good.clone()));
-        app.export_to(&ctx, out.clone(), "tool".into(), Default::default());
+        app.export_to(&ctx, out.clone(), "tool".into(), Default::default(), pascoda_fpc::Arch::Arm64);
         assert!(app.exporting.is_some());
         wait(&mut app);
         assert!(out.join("tool").is_file() && out.join("tool.dmg").is_file());
         // the next export of this program knows how many units to expect (a determinate bar)
         assert!(
             app.unit_counts
-                .contains_key(&export_key(&program_for(&good))),
+                .contains_key(&export_key(&program_for(&good, &app.root))),
             "{:?}",
             app.unit_counts
         );
@@ -3311,7 +3925,7 @@ mod tests {
         std::fs::write(&good, "program tool;\nbegin\n  nope;\nend.\n").unwrap();
         let mut app = App::bare(Some(good));
         let out2 = dir.join("out2");
-        app.export_to(&ctx, out2.clone(), "tool".into(), Default::default());
+        app.export_to(&ctx, out2.clone(), "tool".into(), Default::default(), pascoda_fpc::Arch::Arm64);
         wait(&mut app);
         assert!(app.console.contains("Export failed"), "{}", app.console);
         assert!(!app.diagnostics.is_empty());
@@ -3710,5 +4324,120 @@ mod project_switch_tests {
         assert!(app.docs[0].path.starts_with(&b));
         let saved = std::fs::read_to_string(a.join("unit1.pas")).unwrap();
         assert!(saved.ends_with("// edited\n"), "the edit was saved to the old project");
+    }
+}
+
+#[cfg(test)]
+mod missing_package_problem_tests {
+    use super::*;
+
+    /// A project whose `.lpi` requires a package that is nowhere on the search path gets one Problems
+    /// warning for it, in the `.lpi`, with no line; a project that requires nothing gets none.
+    #[test]
+    fn a_missing_required_package_is_a_project_level_warning() {
+        let dir = std::env::temp_dir().join(format!("pascoda-missing-package-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("app.lpr"), "program app;\nbegin end.\n").unwrap();
+        std::fs::write(
+            dir.join("app.lpi"),
+            "<CONFIG><ProjectOptions><Units Count=\"1\"><Unit0><Filename Value=\"app.lpr\"/></Unit0></Units></ProjectOptions><RequiredPackages Count=\"1\"><Item1><PackageName Value=\"NoSuchPackageHere\"/></Item1></RequiredPackages></CONFIG>",
+        )
+        .unwrap();
+
+        let problems = missing_package_problems(Some(&dir));
+        assert_eq!(problems.len(), 1, "one warning for the one missing package: {problems:?}");
+        let p = &problems[0];
+        assert_eq!(p.file, dir.join("app.lpi"));
+        assert_eq!((p.line, p.col), (0, 0));
+        assert_eq!(p.severity, Severity::Warning);
+        assert!(p.message.contains("NoSuchPackageHere"), "{}", p.message);
+
+        let plain = dir.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("app.lpr"), "program app;\nbegin end.\n").unwrap();
+        assert!(missing_package_problems(Some(&plain)).is_empty());
+        assert!(missing_package_problems(None).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod tool_run_tests {
+    use super::*;
+    use pascoda_project::tools::Tool;
+
+    fn tool(name: &str, command: &str, args: &str) -> Tool {
+        Tool { name: name.into(), command: command.into(), args: args.into(), workdir: String::new() }
+    }
+
+    /// Runs tool `index` and waits for its result (the worker thread answers in a moment).
+    fn run_and_wait(app: &mut App, ctx: &egui::Context, index: usize) {
+        app.run_tool(ctx, index);
+        for _ in 0..500 {
+            if app.tool_run.is_none() {
+                return;
+            }
+            app.poll_tool(ctx);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the tool did not finish");
+    }
+
+    fn project(name: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("pascoda-tools-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The app keeps canonical paths (macOS temp folders are behind a symlink).
+        let dir = dir.canonicalize().unwrap();
+        let unit = dir.join("unit.pas");
+        std::fs::write(&unit, "unit unit;\ninterface\nimplementation\nend.\n").unwrap();
+        (dir, unit)
+    }
+
+    #[test]
+    fn a_tool_runs_with_the_active_file_and_its_output_goes_to_the_console() {
+        let (dir, unit) = project("echo");
+        let mut app = App::bare(Some(unit.clone()));
+        app.tools = vec![tool("Echo", "/bin/echo", "hello $(File)")];
+        let ctx = egui::Context::default();
+        run_and_wait(&mut app, &ctx, 0);
+        assert!(app.console.contains(&format!("hello {}", unit.display())), "{}", app.console);
+        assert!(app.console.contains("Exit code 0."), "{}", app.console);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_compiler_style_error_from_a_tool_becomes_a_problem_in_the_tools_folder() {
+        let (dir, unit) = project("errors");
+        let mut app = App::bare(Some(unit));
+        app.tools = vec![tool("Check", "/bin/sh", "-c 'echo \"unit.pas(3,5) Error: boom\"'")];
+        let ctx = egui::Context::default();
+        run_and_wait(&mut app, &ctx, 0);
+        let error = app
+            .diagnostics
+            .iter()
+            .find(|d| d.message.contains("boom"))
+            .expect("the error is a problem");
+        assert_eq!(error.file, dir.join("unit.pas"), "a relative name is in the tool's folder");
+        assert_eq!(error.line, 3);
+        assert!(matches!(app.bottom.tab, bottom::BottomTab::Problems), "errors switch to Problems");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_command_says_so_and_an_unknown_macro_is_refused_without_running() {
+        let (dir, unit) = project("missing");
+        let mut app = App::bare(Some(unit));
+        let ctx = egui::Context::default();
+        app.tools = vec![tool("Nope", "/no/such/tool/here", "")];
+        run_and_wait(&mut app, &ctx, 0);
+        assert!(app.console.contains("Could not run /no/such/tool/here"), "{}", app.console);
+
+        app.tools = vec![tool("Bad", "/bin/echo", "$(Nonsense)")];
+        app.run_tool(&ctx, 0);
+        assert!(app.tool_run.is_none(), "an unknown macro does not start the tool");
+        assert!(app.console.contains("$(Nonsense)"), "{}", app.console);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

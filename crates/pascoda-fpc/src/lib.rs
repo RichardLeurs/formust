@@ -4,9 +4,12 @@ pub mod check;
 pub mod export;
 pub mod bundled;
 pub mod lcl;
+pub mod target;
+pub mod winres;
 pub mod vendor;
 pub mod unittest;
 
+pub use target::{Arch, Target};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -28,8 +31,14 @@ pub struct Diagnostic {
     pub message: String,
 }
 
+/// Whether a hint is fpc's `Parameter "Sender" not used`. Event handlers have such parameters by design,
+/// so it is not a problem and is not reported.
+pub fn is_unused_parameter_hint(severity: Severity, message: &str) -> bool {
+    severity == Severity::Hint && message.starts_with("Parameter \"") && message.ends_with("\" not used")
+}
+
 /// Parses one fpc output line such as `hello.pas(3,5) Error: Identifier not found "x"`.
-/// Returns `None` for progress lines and linker noise.
+/// Returns `None` for progress lines, linker noise and the hints that are not problems.
 pub fn parse_line(line: &str) -> Option<Diagnostic> {
     let open = line.find('(')?;
     let close = line[open..].find(')')? + open;
@@ -44,12 +53,16 @@ pub fn parse_line(line: &str) -> Option<Diagnostic> {
         "Hint" => Severity::Hint,
         _ => return None,
     };
+    let message = message.trim();
+    if is_unused_parameter_hint(severity, message) {
+        return None;
+    }
     Some(Diagnostic {
         file: PathBuf::from(&line[..open]),
         line: l.trim().parse().ok()?,
         col: c.trim().parse().ok()?,
         severity,
-        message: message.trim().to_string(),
+        message: message.to_string(),
     })
 }
 
@@ -318,6 +331,46 @@ pub(crate) fn build_with(
     build_streaming(source, mode, extra, Plan::WHOLE, &mut |_| {})
 }
 
+/// `-Fu` and `-Fi` for every folder under `dir` (the program's folder) that holds Pascal sources, as
+/// Lazarus does. Without them a unit in a subfolder cannot find the units beside it ("Can't find unit").
+pub(crate) fn source_folder_args(dir: &Path) -> Vec<std::ffi::OsString> {
+    let mut folders = Vec::new();
+    collect_source_folders(dir, 0, &mut folders);
+    folders
+        .iter()
+        .flat_map(|f| [format!("-Fu{}", f.display()), format!("-Fi{}", f.display())])
+        .map(Into::into)
+        .collect()
+}
+
+/// Folders below `dir` (at most six levels) that hold `.pas`, `.pp` or `.inc` files, in name order.
+/// Hidden folders, build output and bundles are skipped, as the project tree skips them.
+fn collect_source_folders(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth >= 6 {
+        return;
+    }
+    let Ok(read) = std::fs::read_dir(dir) else { return };
+    let mut subdirs: Vec<PathBuf> = read.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    subdirs.sort();
+    for sub in subdirs {
+        let name = sub.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let skipped = name.starts_with('.')
+            || ["lib", "target", "vendor", "backup", "__history", "node_modules"].contains(&name.as_str())
+            || name.ends_with(".app")
+            || name.ends_with(".dSYM");
+        if skipped {
+            continue;
+        }
+        let has_source = std::fs::read_dir(&sub).into_iter().flatten().flatten().any(|e| {
+            e.path().extension().and_then(|x| x.to_str()).is_some_and(|x| ["pas", "pp", "inc"].contains(&x.to_ascii_lowercase().as_str()))
+        });
+        if has_source {
+            out.push(sub.clone());
+        }
+        collect_source_folders(&sub, depth + 1, out);
+    }
+}
+
 pub(crate) fn build_streaming(
     source: &Path,
     mode: Mode,
@@ -338,6 +391,20 @@ pub(crate) fn build_streaming_as(
     release: bool,
     on: &mut dyn FnMut(Progress),
 ) -> std::io::Result<BuildResult> {
+    build_streaming_for(Target::native(), source, mode, extra, plan, release, on)
+}
+
+/// [`build_streaming_as`] for one `target`: its compiler, with the target's switches ahead of the
+/// configuration file. A target whose compiler is missing is a `NotFound` error naming it.
+pub(crate) fn build_streaming_for(
+    target: Target,
+    source: &Path,
+    mode: Mode,
+    extra: &[std::ffi::OsString],
+    plan: Plan,
+    release: bool,
+    on: &mut dyn FnMut(Progress),
+) -> std::io::Result<BuildResult> {
     use std::io::{BufRead, BufReader, Read};
     use std::process::Stdio;
     let dir = source
@@ -345,11 +412,19 @@ pub(crate) fn build_streaming_as(
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let file = source.file_name().unwrap_or(source.as_os_str());
-    let fpc = locate_fpc()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, NOT_FOUND_HINT))?;
+    let fpc = target.compiler().ok_or_else(|| {
+        let hint = if target.is_native() {
+            NOT_FOUND_HINT.to_string()
+        } else {
+            format!("The compiler for {} Macs is not installed (see Some tools are missing).", target.label())
+        };
+        std::io::Error::new(std::io::ErrorKind::NotFound, hint)
+    })?;
     let config = config_args(&fpc, dir);
     let mut child = Command::new(fpc)
+        .args(target.args())
         .args(config)
+        .args(source_folder_args(dir))
         .args(if release {
             &["-O2", "-Xs"][..]
         } else {
@@ -514,6 +589,17 @@ mod tests {
     fn known_linker_warnings_are_dropped() {
         let raw = "ld: warning: -ld_classic is deprecated and will be removed in a future release\n-macosx_version_min has been renamed to -macos_version_min\nreal.pas(3,1) Error: x\n";
         assert_eq!(without_linker_noise(raw), "real.pas(3,1) Error: x\n");
+    }
+
+    #[test]
+    fn an_unused_parameter_hint_is_not_a_problem_but_other_hints_are() {
+        let hint = |m: &str| parse_line(&format!("unit1.pas(12,30) Hint: {m}"));
+        assert!(hint("Parameter \"Sender\" not used").is_none(), "event handler parameters are not problems");
+        assert_eq!(hint("Local variable \"x\" is not used").map(|d| d.severity), Some(Severity::Hint));
+        assert!(is_unused_parameter_hint(Severity::Hint, "Parameter \"Sender\" not used"));
+        assert!(!is_unused_parameter_hint(Severity::Error, "Parameter \"Sender\" not used"), "an error stays");
+        let error = parse_line("unit1.pas(12,30) Error: Parameter \"Sender\" not used").expect("errors are kept");
+        assert_eq!(error.severity, Severity::Error);
     }
 
     #[test]

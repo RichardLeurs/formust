@@ -103,6 +103,8 @@ fn run(
         args.push(format!("-Fu{}", lib.display()).into());
     }
     args.push(format!("-Fu{}", dir.display()).into());
+    // The folders below the program's folder too, so a unit in a subfolder finds its neighbours.
+    args.extend(crate::source_folder_args(dir));
     let mut child = Command::new(fpc)
         .args(crate::config_args(fpc, work))
         .args(&args)

@@ -7,8 +7,7 @@ uses
   Forms,
   mainunit,
   settingsunit,
-  aboutunit, 
-  Unit1;
+  aboutunit, Test4;
 
 begin
   RequireDerivedFormResource := True;
@@ -17,6 +16,5 @@ begin
   Application.CreateForm(TMainForm, MainForm);
   Application.CreateForm(TSettingsForm, SettingsForm);
   Application.CreateForm(TAboutForm, AboutForm);
-  Application.CreateForm(TForm1, Form1);
   Application.Run;
 end.

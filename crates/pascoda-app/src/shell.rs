@@ -165,10 +165,12 @@ impl App {
         let ctx = &ctx;
         let pal = Palette::of(ctx);
         self.poll_build(ctx);
+        self.poll_tool(ctx);
         self.poll_debug(ctx);
         self.poll_lsp(ctx);
         self.refresh_custom_classes();
         self.poll_live_check(ctx);
+        self.poll_syntax_check();
         self.poll_export(ctx);
         self.handle_close_request(ctx);
         self.show_export_dialog(ctx);
@@ -177,8 +179,10 @@ impl App {
         self.show_go_to_line(ctx);
         self.show_rename(ctx);
         self.show_preferences(ctx);
+        self.show_tools_editor(ctx);
         self.show_project_options(ctx);
         self.show_import_packages(ctx);
+        self.poll_project_search(ctx);
         self.show_breakpoint_edit(ctx);
         self.show_value_edit(ctx);
         self.poll_assistant(ctx);
@@ -303,7 +307,14 @@ impl App {
                 MenuAction::NewPackage => self.new_project(pascoda_project::Template::Package),
                 MenuAction::Preferences => self.preferences_open = true,
                 MenuAction::RunToCursor => self.run_to_cursor(ctx),
+                MenuAction::SetBookmark => self.set_bookmark_here(ctx),
+                MenuAction::UnsetBookmark => self.unset_bookmark_here(ctx),
+                MenuAction::PreviousBookmark => self.step_bookmark(ctx, false),
+                MenuAction::NextBookmark => self.step_bookmark(ctx, true),
+                MenuAction::Laz(tool) => self.run_laz_tool(ctx, tool),
                 MenuAction::OpenRecent(i) => self.open_recent(i),
+                MenuAction::ConfigureTools => self.tools_editor = Some(crate::tools_editor::Editor::new(self.tools.clone())),
+                MenuAction::Tool(i) => self.run_tool(ctx, i),
                 MenuAction::Clean if self.building.is_none() => self.clean_project(),
                 MenuAction::BuildPackage if can_build => match self.active_package() {
                     Some(package) => self.build_package(ctx, package),
@@ -329,10 +340,6 @@ impl App {
                 MenuAction::NewForm => {
                     let dir = self.root.clone();
                     self.new_form(&dir);
-                }
-                MenuAction::NewDataModule => {
-                    let dir = self.root.clone();
-                    self.new_unit(&dir, true);
                 }
                 MenuAction::NewFile | MenuAction::NewFolder => {
                     // The same as the file tree's buttons: the new name is typed in the tree.
@@ -375,7 +382,8 @@ impl App {
                 }
                 MenuAction::ToggleAssistant => self.toggle_assistant(),
                 MenuAction::Open => self.pick_file(),
-                MenuAction::Save => self.save_doc(self.active),
+                MenuAction::Save => self.save_active(),
+                MenuAction::Format => self.format_active(true),
                 MenuAction::Run if can_build => self.build_and_run(ctx, false),
                 MenuAction::RunTests => self.start_unit_tests(ctx, None),
                 MenuAction::ImportPackages => self.import_packages_open = true,
@@ -905,14 +913,12 @@ impl App {
                 ui.set_width(ui.available_width());
                 ui.add(egui::Label::new(RichText::new(text).size(12.0).color(pal.text)).wrap());
                 ui.horizontal(|ui| {
-                    if ui
-                        .add(egui::Button::new(RichText::new("Move to Trash").color(pal.error)))
-                        .clicked()
-                    {
-                        actions.push(TreeAction::ConfirmDelete(path.to_path_buf()));
-                    }
-                    if ui.button("Cancel").clicked() {
+                    // Cancel on the left, the destructive button on the right (as in a macOS dialog).
+                    if crate::style::secondary_button(ui, "Cancel").clicked() {
                         self.tree_delete = None;
+                    }
+                    if crate::style::destructive_button(ui, "Move to Trash").clicked() {
+                        actions.push(TreeAction::ConfirmDelete(path.to_path_buf()));
                     }
                 });
             });
@@ -990,10 +996,12 @@ impl App {
         let key = (self.root.clone(), self.external.tree_rev);
         if self.custom_scan.as_ref() != Some(&key) {
             self.custom_units = std::sync::Arc::new(designer::custom_classes(&self.root));
+            self.custom_frames = std::sync::Arc::new(designer::frame_layouts(&self.root));
             self.custom_scan = Some(key);
         }
         for d in &mut self.designers {
             d.custom_units = self.custom_units.clone();
+            d.frames = self.custom_frames.clone();
         }
     }
 
@@ -1033,6 +1041,7 @@ impl App {
                 TreeAction::AskDelete(path) => self.tree_delete = Some(path),
                 TreeAction::ConfirmDelete(path) => {
                     self.tree_delete = None;
+                    self.bookmarks.remove_under(&path);
                     self.delete_in_tree(&path);
                 }
                 TreeAction::AskRename(path) => {
@@ -1054,7 +1063,8 @@ impl App {
                 }
                 TreeAction::MoveInto { path, dir } => self.move_in_tree(&path, &dir),
                 TreeAction::NewForm { dir } => self.new_form(&dir),
-                TreeAction::NewDataModule { dir } => self.new_unit(&dir, true),
+                TreeAction::NewDataModule { dir } => self.new_unit(&dir, NewUnit::DataModule),
+                TreeAction::NewFrame { dir } => self.new_unit(&dir, NewUnit::Frame),
             }
         }
     }
@@ -1232,8 +1242,9 @@ impl App {
                     if let Ok(text) = std::fs::read_to_string(&new_pas) {
                         let out = pascoda_project::program::rename_unit_line(&text, &old_name, &new_name);
                         if out != text {
-                            if let Err(e) = std::fs::write(&new_pas, out) {
-                                self.note(format!("Could not rename the unit line: {e}"));
+                            match std::fs::write(&new_pas, &out) {
+                                Ok(()) => self.rename_unit_in_tabs(&new_pas, &old_name, &new_name),
+                                Err(e) => self.note(format!("Could not rename the unit line: {e}")),
                             }
                         }
                     }
@@ -1243,8 +1254,21 @@ impl App {
         updated
     }
 
+    /// The unit line of an open tab of `path` is renamed as well as the file on disk. Otherwise a save of
+    /// the tab would write the old name back. A tab that was clean stays clean.
+    fn rename_unit_in_tabs(&mut self, path: &Path, old: &str, new: &str) {
+        for d in self.docs.iter_mut().filter(|d| d.path == path) {
+            let out = pascoda_project::program::rename_unit_line(&d.text, old, new);
+            if out != d.text {
+                let clean = d.text == d.saved;
+                crate::assistant::set_doc_text(d, out, clean, None);
+            }
+        }
+    }
+
     /// Points everything that names `from` (or a path inside it) at `to` instead.
     fn follow_move(&mut self, from: &Path, to: &Path) {
+        self.bookmarks.follow_move(from, to);
         for d in &mut self.docs {
             if let Some(p) = files::moved(&d.path, from, to) {
                 d.path = p;
@@ -1748,7 +1772,7 @@ impl App {
                 // The width the text wraps to: the row past the gutter (no limit when not wrapping).
                 let wrap_width = if wrap { (ui.available_width() - GUTTER_W).max(40.0) } else { f32::INFINITY };
                 let galley = {
-                    let mut job = highlight::layout(doc.text.as_str(), pal, editor_font(), crate::prefs::line_height());
+                    let mut job = highlight::layout_for(highlight::language_for(&doc.path), doc.text.as_str(), pal, editor_font(), crate::prefs::line_height());
                     job.wrap.max_width = wrap_width;
                     ui.fonts_mut(|f| f.layout_job(job))
                 };
@@ -1774,8 +1798,9 @@ impl App {
                     )
                 };
                 if let Some(l) = caret_line {
-                    ui.painter()
-                        .rect_filled(band(l as u32), 0.0, pal.current_line);
+                    let color = crate::prefs::current_line_color(pal.dark)
+                        .map_or(pal.current_line, |[r, g, b]| egui::Color32::from_rgb(r, g, b));
+                    ui.painter().rect_filled(band(l as u32), 0.0, color);
                 }
                 if let Some(l) = exec_line {
                     ui.painter().rect_filled(band(l), 0.0, pal.exec_line);
@@ -1794,6 +1819,8 @@ impl App {
                 }
 
                 let mut edit_line = None;
+                let mut unset_line = None;
+                let bookmark_lines = self.bookmarks.lines_in(&doc.path);
                 if gutter(
                     ui,
                     pal,
@@ -1803,8 +1830,14 @@ impl App {
                     exec_line,
                     caret_line.map(|l| l as u32),
                     &flagged,
+                    &bookmark_lines,
                     &mut edit_line,
+                    &mut unset_line,
                 ) {
+                    // Clicking a bookmark's chip unsets it.
+                    if let Some(line) = unset_line {
+                        self.bookmarks.remove_at(&doc.path, line);
+                    }
                     // A condition stays only with its breakpoint.
                     let lines = doc.breakpoints.clone();
                     doc.stops.retain(|line, _| lines.contains(line));
@@ -1815,8 +1848,9 @@ impl App {
                     p.edit_breakpoint = Some((doc.path.clone(), line));
                 }
                 // The same width as the map above, so the galley the text is drawn with is the one it was measured with.
+                let lang = highlight::language_for(&doc.path);
                 let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _: f32| {
-                    let mut job = highlight::layout(text.as_str(), pal, editor_font(), crate::prefs::line_height());
+                    let mut job = highlight::layout_for(lang, text.as_str(), pal, editor_font(), crate::prefs::line_height());
                     job.wrap.max_width = wrap_width;
                     ui.fonts_mut(|f| f.layout_job(job))
                 };
@@ -2116,6 +2150,26 @@ impl App {
                     .labelled_by(l.id);
                 });
                 ui.horizontal(|ui| {
+                    let l = ui.label("Lazarus folder");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut e.lazarus)
+                            .id(egui::Id::unique("project-lazarus"))
+                            .hint_text("Bundled Lazarus")
+                            .desired_width(240.0),
+                    )
+                    .labelled_by(l.id);
+                    if ui.button("Choose...").clicked()
+                        && let Some(f) = rfd::FileDialog::new().set_directory(&root).pick_folder()
+                    {
+                        e.lazarus = f.to_string_lossy().into_owned();
+                    }
+                });
+                ui.label(
+                    RichText::new("The Lazarus source folder whose LCL builds this project, for a project made with another Lazarus than the bundled one (for example one that brings its own copy of LazControls).")
+                        .size(11.0)
+                        .color(pal.text_tertiary),
+                );
+                ui.horizontal(|ui| {
                     let l = ui.label("Output file");
                     ui.add(
                         egui::TextEdit::singleline(&mut e.output)
@@ -2173,11 +2227,11 @@ impl App {
                 );
                 });
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
+                crate::style::buttons(ui, |ui| {
+                    if crate::style::primary_button(ui, "Save").clicked() {
                         save = true;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if crate::style::secondary_button(ui, "Cancel").clicked() {
                         cancel = true;
                     }
                 });
@@ -2201,8 +2255,12 @@ impl App {
         if !self.import_packages_open {
             return;
         }
-        let files = pascoda_project::imports::list();
+        // The packages that ship with the app stay imported but are not listed: only the user's own are.
         let built_in = pascoda_project::imports::builtin();
+        let files: Vec<PathBuf> = pascoda_project::imports::list()
+            .into_iter()
+            .filter(|f| !built_in.contains(f))
+            .collect();
         let mut add = false;
         let mut remove: Option<PathBuf> = None;
         let mut done = false;
@@ -2221,20 +2279,20 @@ impl App {
                     let name = file.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
                     ui.label(RichText::new(name).strong());
                     ui.label(RichText::new(file.display().to_string()).size(11.0).color(egui::Color32::GRAY));
-                    if built_in.contains(file) {
-                        ui.label(RichText::new("built in").size(11.0).color(egui::Color32::GRAY));
-                    } else if ui.button("Remove").clicked() {
+                    if ui.button("Remove").clicked() {
                         remove = Some(file.clone());
                     }
                 });
             }
             ui.horizontal(|ui| {
-                if ui.button("Add Package...").clicked() {
+                if crate::style::secondary_button(ui, "Add Package...").clicked() {
                     add = true;
                 }
-                if ui.button("Done").clicked() {
-                    done = true;
-                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if crate::style::primary_button(ui, "Done").clicked() {
+                        done = true;
+                    }
+                });
             });
         });
         let Some(store) = pascoda_project::imports::default_store() else {
@@ -2287,7 +2345,23 @@ impl App {
             || self.bp_edit.is_some()
             || self.value_edit.is_some()
             || self.import_packages_open
+            || self.tools_editor.is_some()
             || self.designer_ui.connection.is_some()
+    }
+
+    /// The Configure Tools window: Save writes the tools and rebuilds the Tools menu.
+    fn show_tools_editor(&mut self, ctx: &egui::Context) {
+        let Some(mut editor) = self.tools_editor.take() else {
+            return;
+        };
+        match crate::tools_editor::dialog(ctx, &mut editor) {
+            crate::tools_editor::Outcome::Open => self.tools_editor = Some(editor),
+            crate::tools_editor::Outcome::Saved => {
+                self.tools = editor.tools;
+                self.refresh_tools_menu();
+            }
+            crate::tools_editor::Outcome::Cancelled => {}
+        }
     }
 
     /// The Preferences window (Cmd+,): the editor's font size and what the Tab key inserts. Each
@@ -2308,6 +2382,9 @@ impl App {
                     ui.end_row();
                     ui.label("Long lines");
                     ui.checkbox(&mut self.prefs.word_wrap, "Wrap to the editor width");
+                    ui.end_row();
+                    ui.label("Saving");
+                    ui.checkbox(&mut self.prefs.format_on_save, "Format Pascal files (Cmd+S)");
                     ui.end_row();
                     let font_label = ui.label("Font");
                     egui::ComboBox::from_id_salt("prefs-font")
@@ -2334,6 +2411,23 @@ impl App {
                             }
                             if self.prefs.background[dark as usize].is_some() && ui.small_button("Reset").clicked() {
                                 self.prefs.set_background(dark, None);
+                            }
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Current line");
+                    ui.horizontal(|ui| {
+                        for dark in [false, true] {
+                            let pal = if dark { Palette::DARK } else { Palette::LIGHT };
+                            let fallback = pal.current_line;
+                            let mut rgb = self.prefs.current_line[dark as usize]
+                                .unwrap_or([fallback.r(), fallback.g(), fallback.b()]);
+                            ui.label(if dark { "Dark" } else { "Light" });
+                            if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                self.prefs.set_current_line(dark, Some(rgb));
+                            }
+                            if self.prefs.current_line[dark as usize].is_some() && ui.small_button("Reset").clicked() {
+                                self.prefs.set_current_line(dark, None);
                             }
                         }
                     });
@@ -2392,12 +2486,14 @@ impl App {
                 );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Reset to Defaults").clicked() {
+                    if crate::style::secondary_button(ui, "Reset to Defaults").clicked() {
                         self.prefs = prefs::Prefs::default();
                     }
-                    if ui.button("Done").clicked() {
-                        done = true;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if crate::style::primary_button(ui, "Done").clicked() {
+                            done = true;
+                        }
+                    });
                 });
         });
         if done {
@@ -2417,15 +2513,7 @@ impl App {
         let pal = Palette::of(ctx);
         let mut save = false;
         let mut cancel = false;
-        let mut open = true;
-        egui::Window::new("Change Value")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(320.0)
-            .anchor(egui::Align2::CENTER_TOP, [0.0, 90.0])
-            .frame(egui::Frame::window(&ctx.global_style()).fill(pal.chrome))
-            .show(ctx, |ui| {
+        crate::style::dialog(ctx, "change-value", Some("Change Value"), 320.0, |ui| {
                 ui.label(RichText::new(&edit.name).monospace());
                 let l = ui.label("New value");
                 let field = ui.add(
@@ -2440,11 +2528,11 @@ impl App {
                 if !edit.error.is_empty() {
                     ui.label(RichText::new(&edit.error).size(12.0).color(pal.error));
                 }
-                ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
+                crate::style::buttons(ui, |ui| {
+                    if crate::style::primary_button(ui, "Save").clicked() {
                         save = true;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if crate::style::secondary_button(ui, "Cancel").clicked() {
                         cancel = true;
                     }
                 });
@@ -2464,7 +2552,7 @@ impl App {
                     }
                 }
             }
-        } else if cancel || !open {
+        } else if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.value_edit = None;
         }
     }
@@ -2477,16 +2565,8 @@ impl App {
         let mut save = false;
         let mut remove = false;
         let mut cancel = false;
-        let mut open = true;
         let title = format!("Breakpoint at line {}", edit.line);
-        egui::Window::new(title)
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(360.0)
-            .anchor(egui::Align2::CENTER_TOP, [0.0, 90.0])
-            .frame(egui::Frame::window(&ctx.global_style()).fill(pal.chrome))
-            .show(ctx, |ui| {
+        crate::style::dialog(ctx, "breakpoint-edit", Some(&title), 360.0, |ui| {
                 let l = ui.label("Condition");
                 ui.add(
                     egui::TextEdit::singleline(&mut edit.condition)
@@ -2511,14 +2591,14 @@ impl App {
                 if !edit.error.is_empty() {
                     ui.label(RichText::new(&edit.error).size(12.0).color(pal.error));
                 }
-                ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
+                crate::style::buttons(ui, |ui| {
+                    if crate::style::primary_button(ui, "Save").clicked() {
                         save = true;
                     }
-                    if ui.button("Remove Breakpoint").clicked() {
+                    if crate::style::secondary_button(ui, "Remove Breakpoint").clicked() {
                         remove = true;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if crate::style::secondary_button(ui, "Cancel").clicked() {
                         cancel = true;
                     }
                 });
@@ -2536,7 +2616,7 @@ impl App {
         } else if remove {
             self.remove_breakpoint(&edit.path, edit.line);
             self.bp_edit = None;
-        } else if cancel || !open {
+        } else if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.bp_edit = None;
         }
     }
@@ -2666,11 +2746,8 @@ impl App {
         }
         let mut go = false;
         let mut close = false;
-        egui::Window::new(format!("Rename “{}”", self.rename.old))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_TOP, [0.0, 90.0])
-            .show(ctx, |ui| {
+        let title = format!("Rename “{}”", self.rename.old);
+        crate::style::dialog(ctx, "rename-symbol", Some(&title), 300.0, |ui| {
                 let field = ui.add(
                     egui::TextEdit::singleline(&mut self.rename.name)
                         .id(egui::Id::unique("rename-symbol"))
@@ -2687,11 +2764,11 @@ impl App {
                 if field.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     close = true;
                 }
-                ui.horizontal(|ui| {
-                    if ui.button("Rename").clicked() {
+                crate::style::buttons(ui, |ui| {
+                    if crate::style::primary_button(ui, "Rename").clicked() {
                         go = true;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if crate::style::secondary_button(ui, "Cancel").clicked() {
                         close = true;
                     }
                 });
@@ -2841,11 +2918,7 @@ impl App {
         }
         let mut go = false;
         let mut close = false;
-        egui::Window::new("Go to Line")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_TOP, [0.0, 90.0])
-            .show(ctx, |ui| {
+        crate::style::dialog(ctx, "go-to-line", Some("Go to Line"), 300.0, |ui| {
                 let field = ui.add(
                     egui::TextEdit::singleline(&mut self.go_to.text)
                         .id(egui::Id::unique("go-to-line"))
@@ -2862,11 +2935,11 @@ impl App {
                 if field.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     close = true;
                 }
-                ui.horizontal(|ui| {
-                    if ui.button("Go").clicked() {
+                crate::style::buttons(ui, |ui| {
+                    if crate::style::primary_button(ui, "Go").clicked() {
                         go = true;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if crate::style::secondary_button(ui, "Cancel").clicked() {
                         close = true;
                     }
                 });
@@ -2898,7 +2971,8 @@ impl App {
     /// The project search (the navigator's Search tab): find across the project's files, and replace
     /// in them. Rows fill the sidebar's width; the results list takes the rest of its height.
     fn search_tab(&mut self, ui: &mut egui::Ui, pal: &Palette) {
-        let (mut run, mut replace) = (false, false);
+        let (mut run, mut replace, mut undo) = (false, false, false);
+        let can_undo = !self.project_undo.is_empty();
         let mut open: Option<(PathBuf, u32, u32)> = None;
         ui.add_space(4.0);
         let bar = &mut self.project_bar;
@@ -2923,11 +2997,16 @@ impl App {
             if ui.selectable_label(bar.opts.word, "Whole word").clicked() {
                 bar.opts.word = !bar.opts.word;
             }
+            if ui.selectable_label(bar.opts.regex, "Regex").on_hover_text("The search is a regular expression").clicked() {
+                bar.opts.regex = !bar.opts.regex;
+            }
             if ui.button("Search").clicked() {
                 run = true;
             }
         });
-        let status = if !bar.title.is_empty() {
+        let status = if bar.searching {
+            "Searching…".to_string()
+        } else if !bar.title.is_empty() {
             bar.title.clone()
         } else if !bar.searched {
             String::new()
@@ -2952,6 +3031,9 @@ impl App {
                 .clicked()
             {
                 replace = true;
+            }
+            if can_undo && ui.button("Undo Replace").on_hover_text("Puts back the files the last Replace All changed").clicked() {
+                undo = true;
             }
             if !bar.note.is_empty() {
                 ui.label(RichText::new(&bar.note).size(12.0).color(pal.text_secondary));
@@ -2991,6 +3073,9 @@ impl App {
         if replace {
             self.replace_in_project();
         }
+        if undo {
+            self.undo_replace_in_project();
+        }
         if let Some((path, line, col)) = open {
             let ctx = ui.ctx().clone();
             self.goto(&ctx, &path, line, col);
@@ -2999,38 +3084,71 @@ impl App {
 
     /// The text of every project file the tree lists, with the unsaved text of open tabs.
     fn project_texts(&self) -> Vec<(PathBuf, String)> {
-        let mut files = Vec::new();
-        collect_files(&self.root, 0, &mut files);
-        files
-            .into_iter()
-            .filter_map(|path| {
-                if let Some(d) = self.docs.iter().find(|d| d.path == path) {
-                    return Some((path, d.text.clone()));
-                }
-                // Big or non-text files are not searched.
-                if std::fs::metadata(&path).ok()?.len() > 2_000_000 {
-                    return None;
-                }
-                let text = std::fs::read_to_string(&path).ok()?;
-                Some((path, text))
-            })
-            .collect()
+        let open: Vec<(PathBuf, String)> = self.docs.iter().map(|d| (d.path.clone(), d.text.clone())).collect();
+        project_texts_of(&self.root, &open)
     }
 
+    /// Searches the project on a worker thread: the files are read there, and the open tabs' text is
+    /// used for their files. The results are shown by `poll_project_search` when they are ready.
     pub(crate) fn run_project_search(&mut self) {
-        let texts = self.project_texts();
+        if self.project_search_rx.is_some() {
+            return;
+        }
+        let root = self.root.clone();
+        let open: Vec<(PathBuf, String)> = self.docs.iter().map(|d| (d.path.clone(), d.text.clone())).collect();
+        let (query, opts) = (self.project_bar.query.clone(), self.project_bar.opts);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let texts = project_texts_of(&root, &open);
+            let hits = find::project_hits(
+                texts.iter().map(|(p, t)| (p.clone(), t.as_str())),
+                &query,
+                opts,
+                find::PROJECT_LIMIT,
+            );
+            let _ = tx.send(hits);
+        });
+        self.project_search_rx = Some(rx);
+        self.project_bar.searching = true;
+        self.project_bar.note.clear();
+    }
+
+    /// Shows the results of a project search once its worker has sent them.
+    pub(crate) fn poll_project_search(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.project_search_rx.as_ref() else { return };
+        match rx.try_recv() {
+            Ok(hits) => {
+                self.project_search_rx = None;
+                self.show_project_hits(hits);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.project_search_rx = None;
+                self.project_bar.searching = false;
+            }
+        }
+    }
+
+    /// Waits for a running project search and shows its results (for tests).
+    #[cfg(test)]
+    pub(crate) fn finish_project_search(&mut self) {
+        if let Some(rx) = self.project_search_rx.take() {
+            if let Ok(hits) = rx.recv() {
+                self.show_project_hits(hits);
+            }
+        }
+        self.project_bar.searching = false;
+    }
+
+    fn show_project_hits(&mut self, (results, truncated): (Vec<find::FileHits>, bool)) {
         let bar = &mut self.project_bar;
-        let (results, truncated) = find::project_hits(
-            texts.iter().map(|(p, t)| (p.clone(), t.as_str())),
-            &bar.query,
-            bar.opts,
-            find::PROJECT_LIMIT,
-        );
         bar.results = results;
         bar.title.clear();
         bar.truncated = truncated;
         bar.searched = true;
-        bar.note.clear();
+        bar.searching = false;
     }
 
     /// Replaces every match in the project. An open tab takes the change in its text (unsaved, as
@@ -3042,20 +3160,57 @@ impl App {
             self.project_bar.with.clone(),
             self.project_bar.opts,
         );
+        let before: std::collections::HashMap<PathBuf, String> = texts.iter().cloned().collect();
         let changed = find::replace_in_files(texts, &query, &with, opts);
         let (mut total, mut files) = (0, 0);
+        let mut undo = Vec::new();
         for (path, text, n) in changed {
+            let old = before.get(&path).cloned().unwrap_or_default();
             if let Some(d) = self.docs.iter_mut().find(|d| d.path == path) {
-                d.text = text;
+                d.text = text.clone();
             } else if let Err(e) = std::fs::write(&path, &text) {
                 self.note(format!("Could not write {}: {e}", path.display()));
                 continue;
             }
+            undo.push(find::Change { path, before: old, after: text });
             total += n;
             files += 1;
         }
+        // Only the last replace can be undone.
+        self.project_undo = undo;
         self.run_project_search();
         self.project_bar.note = format!("Replaced {total} in {files} files");
+    }
+
+    /// Undoes the last Replace All in Project. A file that no longer holds the replaced text (it was
+    /// edited since) is left alone, and the bar says how many.
+    fn undo_replace_in_project(&mut self) {
+        let changes = std::mem::take(&mut self.project_undo);
+        let (mut restored, mut kept) = (0, 0);
+        for c in changes {
+            let now = match self.docs.iter().find(|d| d.path == c.path) {
+                Some(d) => Some(d.text.clone()),
+                None => std::fs::read_to_string(&c.path).ok(),
+            };
+            if now.as_deref() != Some(c.after.as_str()) {
+                kept += 1;
+                continue;
+            }
+            if let Some(d) = self.docs.iter_mut().find(|d| d.path == c.path) {
+                d.text = c.before;
+            } else if let Err(e) = std::fs::write(&c.path, &c.before) {
+                self.note(format!("Could not write {}: {e}", c.path.display()));
+                kept += 1;
+                continue;
+            }
+            restored += 1;
+        }
+        self.run_project_search();
+        self.project_bar.note = if kept == 0 {
+            format!("Undid the replace in {restored} files")
+        } else {
+            format!("Undid the replace in {restored} files; {kept} changed since, left as they are")
+        };
     }
 
     fn bottom_tabs(&mut self, ui: &mut egui::Ui, pal: &Palette) {
@@ -3267,6 +3422,10 @@ impl App {
                     .stick_to_bottom(true)
                     .auto_shrink(false)
                     .show(ui, |ui| {
+                        if self.console_diff {
+                            diff_view(ui, &self.console, pal);
+                            return;
+                        }
                         ui.add(
                             egui::Label::new(
                                 RichText::new(&self.console)
@@ -3280,7 +3439,43 @@ impl App {
             });
     }
 
+    /// The Terminal pane's shell tabs: one per shell (click to show it, its × closes it) and New Shell. A
+    /// click takes effect before the shell is drawn, so the new one asks for focus in the same frame.
+    fn shell_strip(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        let shells = self.bottom.shells();
+        let (mut show, mut close, mut new) = (None, None, false);
+        Frame::new()
+            .fill(pal.chrome)
+            .inner_margin(Margin::symmetric(8, 2))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    for (n, shown) in &shells {
+                        if ui.selectable_label(*shown, format!("Shell {n}")).clicked() {
+                            show = Some(*n);
+                        }
+                        if shells.len() > 1
+                            && text_button(ui, pal, "\u{d7}").on_hover_text(format!("Close Shell {n}")).clicked()
+                        {
+                            close = Some(*n);
+                        }
+                        ui.add_space(6.0);
+                    }
+                    new = text_button(ui, pal, "+ New Shell").clicked();
+                });
+            });
+        if let Some(n) = close {
+            self.bottom.close_shell(n);
+        } else if let Some(n) = show {
+            self.bottom.show_shell(n);
+        }
+        if new {
+            self.bottom.new_shell();
+        }
+    }
+
     fn terminal_tab(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        self.shell_strip(ui, pal);
         let just_shown = !self.bottom.view_shown;
         self.bottom.view_shown = true;
         // The project folder changed (another file or project was opened): a shell nobody has
@@ -3389,6 +3584,12 @@ impl App {
                             self.resume_with(debugger::Cmd::Step(kind));
                         }
                     }
+                    let run_to = icon_button(ui, pal, Icon::RunToCursor, paused, false).on_hover_text("Run to Cursor (F4)");
+                    run_to.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, paused, "Run to Cursor"));
+                    if run_to.clicked() {
+                        let ctx = ui.ctx().clone();
+                        self.run_to_cursor(&ctx);
+                    }
                     ui.add_space(8.0);
                     let text = match self.paused.as_ref().and_then(|s| s.source_frames().next()) {
                         Some(f) => format!("Thread 1 \u{203a} {}", f.name),
@@ -3451,6 +3652,10 @@ fn find_bar(ui: &mut egui::Ui, pal: &Palette, bar: &mut find::Bar, found: usize)
         }
         if ui.selectable_label(bar.opts.word, "Whole word").clicked() {
             bar.opts.word = !bar.opts.word;
+            changed = true;
+        }
+        if ui.selectable_label(bar.opts.regex, "Regex").on_hover_text("The search is a regular expression").clicked() {
+            bar.opts.regex = !bar.opts.regex;
             changed = true;
         }
         if changed {
@@ -3530,12 +3735,23 @@ fn row(
         ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click_and_drag());
     // Every row can be dragged onto a folder; the payload is the item's path.
     resp.dnd_set_drag_payload(path.to_path_buf());
+    let label = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label.clone()));
     let painter = ui.painter();
     let inner = rect.shrink2(vec2(6.0, 0.0));
+    // While another item is dragged over this row, show where it would land: a folder is outlined (the item
+    // goes into it); a file gets an insertion line under its row (the item goes into the file's folder).
+    let dragged_over = resp.dnd_hover_payload::<PathBuf>().is_some_and(|from| from.as_path() != path);
     if selected {
         painter.rect_filled(inner, 5.0, pal.row_selected);
-    } else if resp.hovered() || (is_dir && resp.dnd_hover_payload::<PathBuf>().is_some()) {
+    } else if resp.hovered() || (is_dir && dragged_over) {
         painter.rect_filled(inner, 5.0, pal.row_hover);
+    }
+    if dragged_over && is_dir {
+        painter.rect_stroke(inner, 5.0, egui::Stroke::new(1.5, pal.accent), egui::StrokeKind::Inside);
+    }
+    if dragged_over && !is_dir {
+        painter.line_segment([inner.left_bottom(), inner.right_bottom()], egui::Stroke::new(2.0, pal.accent));
     }
     let x = rect.left() + 12.0 + depth as f32 * 14.0;
     if is_dir {
@@ -3588,6 +3804,7 @@ pub(crate) enum TreeAction {
     MoveInto { path: PathBuf, dir: PathBuf },
     NewForm { dir: PathBuf },
     NewDataModule { dir: PathBuf },
+    NewFrame { dir: PathBuf },
 }
 
 /// A name being typed for a new file or folder: an editable row at the top of `dir`.
@@ -3753,6 +3970,27 @@ fn form_units_under(path: &Path) -> Vec<(PathBuf, String, Option<(String, String
         .collect()
 }
 
+/// The text of every file under `root` that a search reads: the open tabs' text where a tab is open,
+/// else the file on disk (big and non-text files are left out).
+fn project_texts_of(root: &Path, open: &[(PathBuf, String)]) -> Vec<(PathBuf, String)> {
+    let mut files = Vec::new();
+    collect_files(root, 0, &mut files);
+    files
+        .into_iter()
+        .filter_map(|path| {
+            if let Some((_, text)) = open.iter().find(|(p, _)| *p == path) {
+                return Some((path, text.clone()));
+            }
+            // Big or non-text files are not searched.
+            if std::fs::metadata(&path).ok()?.len() > 2_000_000 {
+                return None;
+            }
+            let text = std::fs::read_to_string(&path).ok()?;
+            Some((path, text))
+        })
+        .collect()
+}
+
 fn collect_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     for p in listing(dir) {
         if p.is_dir() {
@@ -3796,6 +4034,10 @@ fn tree_rows(ui: &mut egui::Ui, pal: &Palette, dir: &Path, depth: usize, is_root
             view.actions.push(TreeAction::NewDataModule { dir: dir.to_path_buf() });
             ui.close();
         }
+        if ui.button("New Frame").clicked() {
+            view.actions.push(TreeAction::NewFrame { dir: dir.to_path_buf() });
+            ui.close();
+        }
         if !is_root {
             if ui.button("Rename").clicked() {
                 view.actions.push(TreeAction::AskRename(dir.to_path_buf()));
@@ -3827,6 +4069,13 @@ fn tree_rows(ui: &mut egui::Ui, pal: &Palette, dir: &Path, depth: usize, is_root
                 &p,
                 view.active == Some(p.as_path()) || view.sel == Some(p.as_path()),
             );
+            // Dropping onto a file moves the dragged item into the file's folder.
+            if let Some(from) = resp.dnd_release_payload::<PathBuf>()
+                && from.as_path() != p.as_path()
+                && let Some(folder) = p.parent()
+            {
+                view.actions.push(TreeAction::MoveInto { path: (*from).clone(), dir: folder.to_path_buf() });
+            }
             let renaming = view.rename.as_ref().is_some_and(|r| r.path == p);
             if renaming {
                 rename_overlay(ui, pal, resp.rect, depth + 1, view);
@@ -4110,6 +4359,12 @@ fn var_row(
     }
 }
 
+/// The yellow of warnings in the gutter and the Problems pane. The light palette's warning colour is
+/// an amber brown, so light mode uses a clear yellow instead; dark mode already has one.
+fn warning_yellow(pal: &Palette) -> egui::Color32 {
+    if pal.dark { pal.warning } else { egui::Color32::from_rgb(0xF5, 0xB8, 0x00) }
+}
+
 fn problem_rows(ui: &mut egui::Ui, pal: &Palette, diagnostics: &[Diagnostic], p: &mut Pending) {
     if diagnostics.is_empty() {
         ui.label(
@@ -4122,7 +4377,7 @@ fn problem_rows(ui: &mut egui::Ui, pal: &Palette, diagnostics: &[Diagnostic], p:
     for d in diagnostics {
         let (color, tag) = match d.severity {
             Severity::Fatal | Severity::Error => (pal.error, "Error"),
-            Severity::Warning => (pal.warning, "Warning"),
+            Severity::Warning => (warning_yellow(pal), "Warning"),
             _ => (pal.text_tertiary, "Note"),
         };
         let name = d
@@ -4132,8 +4387,10 @@ fn problem_rows(ui: &mut egui::Ui, pal: &Palette, diagnostics: &[Diagnostic], p:
         // One allocated row takes the click, as the navigator's rows do: the marker, the position and
         // the message are painted into it. The message wraps to the panel's width.
         let width = ui.available_width();
+        // A project-level problem (line 0, such as a missing package) has no position to show or go to.
+        let place = if d.line == 0 { name.clone() } else { format!("{name}:{}:{}", d.line, d.col) };
         let position = ui.painter().layout_no_wrap(
-            format!("{name}:{}:{}", d.line, d.col),
+            place,
             egui::FontId::proportional(12.5),
             pal.text_secondary,
         );
@@ -4157,7 +4414,7 @@ fn problem_rows(ui: &mut egui::Ui, pal: &Palette, diagnostics: &[Diagnostic], p:
         ui.painter().galley(at, position.clone(), pal.text_secondary);
         let at = egui::pos2(at.x + position.size().x + 8.0, mid - message.size().y / 2.0);
         ui.painter().galley(at, message, pal.text);
-        if resp.clicked() {
+        if resp.clicked() && d.line > 0 {
             p.goto = Some((d.file.clone(), d.line, d.col));
         }
         // fpc cannot find a unit: the folder that has it can be added to the search path.
@@ -4189,10 +4446,13 @@ fn gutter(
     exec_line: Option<u32>,
     caret_line: Option<u32>,
     flagged: &std::collections::BTreeMap<u32, bool>,
+    marks: &std::collections::BTreeMap<u32, usize>,
     edit: &mut Option<u32>,
+    unset: &mut Option<u32>,
 ) -> bool {
     let size = vec2(GUTTER_W, map.height());
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Line numbers"));
     let painter = ui.painter_at(rect);
     let clip = ui.clip_rect();
     let lh = crate::prefs::line_height();
@@ -4249,11 +4509,76 @@ fn gutter(
             );
         }
     }
+    // Wrapped lines: a small hook on each row after the first, so the row reads as part of the line above.
+    for line in 1..=map.lines() as u32 {
+        let rows = ((map.bottom(line) - map.top(line)) / lh).round() as u32;
+        for k in 1..rows {
+            let y = rect.top() + map.top(line) + k as f32 * lh + lh / 2.0;
+            let x = rect.right() - 6.0;
+            let stroke = egui::Stroke::new(1.0, pal.line_number);
+            painter.line_segment([egui::pos2(x, y - 4.0), egui::pos2(x, y)], stroke);
+            painter.line_segment([egui::pos2(x, y), egui::pos2(x + 4.0, y)], stroke);
+        }
+    }
+    // Errors and warnings: a chip shaped like the breakpoint's, red for an error and yellow for a warning,
+    // with the line number in it. A line with a breakpoint keeps the blue chip.
     for (&line, &error) in flagged {
+        if line as usize > map.lines() || breakpoints.contains(&line) {
+            continue;
+        }
+        let y = rect.top() + map.top(line);
+        let row = egui::Rect::from_min_size(egui::pos2(rect.left(), y), vec2(rect.width(), lh));
+        let (l, r, t, b) = (row.left() + 5.0, row.right() - 3.0, row.top() + 2.0, row.bottom() - 2.0);
+        let (fill, text) = if error {
+            (pal.error, egui::Color32::WHITE)
+        } else {
+            (warning_yellow(pal), egui::Color32::BLACK)
+        };
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                egui::pos2(l, t),
+                egui::pos2(r - 7.0, t),
+                egui::pos2(r, row.center().y),
+                egui::pos2(r - 7.0, b),
+                egui::pos2(l, b),
+            ],
+            fill,
+            egui::Stroke::NONE,
+        ));
+        if crate::prefs::line_numbers() {
+            painter.text(
+                egui::pos2(r - 11.0, row.center().y),
+                egui::Align2::RIGHT_CENTER,
+                line.to_string(),
+                egui::FontId::monospace(11.0),
+                text,
+            );
+        }
+    }
+    // Bookmarks: a short green chip with the number, at the gutter's left edge, shaped like the other chips.
+    for (&line, &n) in marks {
         if line as usize <= map.lines() {
-            let y = rect.top() + map.top(line) + lh / 2.0;
-            let color = if error { pal.error } else { pal.warning };
-            painter.circle_filled(egui::pos2(rect.right() - 5.0, y), 3.0, color);
+            let y = rect.top() + map.top(line);
+            let row = egui::Rect::from_min_size(egui::pos2(rect.left(), y), vec2(rect.width(), lh));
+            let (l, r, t, b) = (row.left() + 1.0, row.left() + 15.0, row.top() + 2.0, row.bottom() - 2.0);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(l, t),
+                    egui::pos2(r - 4.0, t),
+                    egui::pos2(r, row.center().y),
+                    egui::pos2(r - 4.0, b),
+                    egui::pos2(l, b),
+                ],
+                egui::Color32::from_rgb(0x2E, 0xA0, 0x43),
+                egui::Stroke::NONE,
+            ));
+            painter.text(
+                egui::pos2(l + 5.0, row.center().y),
+                egui::Align2::CENTER_CENTER,
+                n.to_string(),
+                egui::FontId::monospace(9.0),
+                egui::Color32::WHITE,
+            );
         }
     }
     let Some(pos) = response
@@ -4263,6 +4588,11 @@ fn gutter(
         return false;
     };
     let line = map.line_at(pos.y - rect.top());
+    // A click on a bookmark's chip (the green one at the gutter's left edge) unsets that bookmark.
+    if response.clicked() && pos.x - rect.left() < 16.0 && marks.contains_key(&line) {
+        *unset = Some(line);
+        return true;
+    }
     // A secondary click sets the breakpoint (if it is not there) and opens its condition box.
     if response.secondary_clicked() {
         breakpoints.insert(line);
@@ -4547,6 +4877,7 @@ mod tree_tests {
         app.project_bar.query = "foo".into();
         app.project_bar.with = "bar".into();
         app.run_project_search();
+        app.finish_project_search();
         let total: usize = app.project_bar.results.iter().map(|f| f.hits.len()).sum();
         assert_eq!(total, 4, "three in the tab's unsaved text, one in b.txt");
         app.replace_in_project();
@@ -4793,6 +5124,85 @@ mod tree_tests {
     }
 
     #[test]
+    fn undo_replace_in_project_restores_the_files_and_leaves_later_edits_alone() {
+        let base = std::env::temp_dir().join(format!("pascoda-undo-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("a.pas"), "program a; var foo: Integer; begin end.\n").unwrap();
+        std::fs::write(base.join("b.txt"), "foo and foo\n").unwrap();
+        std::fs::write(base.join("c.txt"), "foo\n").unwrap();
+        let mut app = App::bare(Some(base.join("a.pas")));
+        let root = app.root.clone();
+        app.project_bar.query = "foo".into();
+        app.project_bar.with = "bar".into();
+        app.replace_in_project();
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "bar and bar\n");
+        assert_eq!(app.project_undo.len(), 3, "every changed file is remembered");
+
+        // c.txt is edited after the replace: undo must not overwrite that edit.
+        std::fs::write(root.join("c.txt"), "typed later\n").unwrap();
+        app.undo_replace_in_project();
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "foo and foo\n", "restored");
+        assert_eq!(std::fs::read_to_string(root.join("a.pas")).unwrap(), "program a; var foo: Integer; begin end.\n", "restored");
+        assert_eq!(std::fs::read_to_string(root.join("c.txt")).unwrap(), "typed later\n", "left alone");
+        assert!(app.project_bar.note.contains("1 changed since"), "{}", app.project_bar.note);
+        assert!(app.project_undo.is_empty(), "one undo only");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn renaming_an_open_file_leaves_no_read_error_behind() {
+        let base = std::env::temp_dir().join(format!("pascoda-rename-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        pascoda_project::create_gui_app(&base, "GuiApp1").unwrap();
+        let mut app = App::bare(Some(base.join("GuiApp1").join("unit1.pas")));
+        let root = app.root.clone();
+        let test3 = root.join("test3.pas");
+        std::fs::write(&test3, "unit test3;\n\ninterface\n\nimplementation\n\nend.\n").unwrap();
+        let mut app = App::bare(Some(test3.clone()));
+        let mut p = Pending::default();
+        app.apply_tree_actions(vec![TreeAction::RenameTo { path: test3.clone(), name: "test4.pas".into() }], &mut p);
+        // What the file system reports for a rename: the old path and the new one.
+        let batch = crate::watch::Batch {
+            paths: [test3.clone(), root.join("test4.pas")].into_iter().collect(),
+            rescan: false,
+        };
+        app.handle_external(None, &batch);
+        let shown: Vec<String> = app.external.banners.values().map(|b| format!("{b:?}")).collect();
+        let tabs: Vec<String> = app.docs.iter().map(|d| d.path.display().to_string()).collect();
+        assert!(shown.is_empty(), "banners {shown:?}; tabs {tabs:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn renaming_a_unit_renames_its_unit_line_on_disk_and_in_an_open_tab() {
+        let base = std::env::temp_dir().join(format!("pascoda-unit-line-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        pascoda_project::create_gui_app(&base, "GuiApp1").unwrap();
+        let mut p = Pending::default();
+        let mut setup = App::bare(Some(base.join("GuiApp1").join("unit1.pas")));
+        let root = setup.root.clone();
+        setup.apply_tree_actions(vec![TreeAction::NewForm { dir: root.clone() }], &mut p);
+        let unit2 = root.join("unit2.pas");
+        // unit2 is the open tab, so the rename has to reach the tab's text as well as the disk.
+        let mut app = App::bare(Some(unit2.clone()));
+        app.apply_tree_actions(vec![TreeAction::RenameTo { path: unit2.clone(), name: "dialog".into() }], &mut p);
+
+        assert!(root.join("dialog.pas").exists(), "not renamed: {:?}", app.notice().map(|(m, _)| m.to_string()));
+        let on_disk = std::fs::read_to_string(root.join("dialog.pas")).unwrap();
+        // Pascal names are case-insensitive, so `Dialog` and `dialog` are the same unit.
+        let unit_line = |s: &str| s.lines().find(|l| l.trim_start().to_ascii_lowercase().starts_with("unit ")).unwrap_or("").to_ascii_lowercase();
+        assert_eq!(unit_line(&on_disk), "unit dialog;", "the file's unit line on disk");
+        let tab = app.docs.iter().find(|d| d.path == root.join("dialog.pas")).expect("the tab follows the file");
+        assert_eq!(unit_line(&tab.text), "unit dialog;", "the open tab's unit line");
+        let lpr = std::fs::read_to_string(root.join("GuiApp1.lpr")).unwrap();
+        assert!(lpr.contains("Dialog"), "the program lists the new name: {lpr}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn deleting_a_form_file_deletes_its_unit_and_its_program_entry() {
         let base = std::env::temp_dir().join(format!("pascoda-program-lfm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -4920,7 +5330,8 @@ mod menu_tests {
         std::fs::write(dir.join("prog.lpr"), "program prog;\n\n{$mode objfpc}{$H+}\n\nuses\n  Forms;\n\nbegin\n  Application.Initialize;\n  Application.Run;\nend.\n").unwrap();
         let mut app = App::bare(Some(dir.join("prog.lpr")));
         let ctx = egui::Context::default();
-        app.run_menu_list(&ctx, vec![MenuAction::NewDataModule]);
+        let root = app.root.clone();
+        app.new_unit(&root, NewUnit::DataModule);
         let pas = dir.join("unit1.pas");
         assert!(pas.is_file(), "the unit is created: {}", app.console);
         let lfm = std::fs::read_to_string(dir.join("unit1.lfm")).unwrap();
@@ -4937,6 +5348,226 @@ mod menu_tests {
     }
 
     #[test]
+    fn new_frame_creates_the_unit_and_opens_it_but_does_not_change_the_program() {
+        let dir = std::env::temp_dir().join(format!("pascoda-new-frame-app-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = "program prog;\n\n{$mode objfpc}{$H+}\n\nuses\n  Forms;\n\nbegin\n  Application.Initialize;\n  Application.Run;\nend.\n";
+        std::fs::write(dir.join("prog.lpr"), program).unwrap();
+        let mut app = App::bare(Some(dir.join("prog.lpr")));
+        let ctx = egui::Context::default();
+        let root = app.root.clone();
+        app.new_unit(&root, NewUnit::Frame);
+        let pas = dir.join("unit1.pas");
+        assert!(pas.is_file(), "the unit is created: {}", app.console);
+        let lfm = std::fs::read_to_string(dir.join("unit1.lfm")).unwrap();
+        assert!(lfm.starts_with("object Frame1: TFrame1"), "{lfm}");
+        assert!(app.console.contains("frame"), "{}", app.console);
+        let canon = pas.canonicalize().unwrap();
+        assert!(app.docs.iter().any(|d| d.path.canonicalize().ok().as_ref() == Some(&canon)), "the unit is open");
+        assert_eq!(std::fs::read_to_string(dir.join("prog.lpr")).unwrap(), program, "a frame is not created by the program");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Lazarus project keeps its program in the project folder and its units in subfolders. Building from a
+    /// unit finds the program from the unit's folder up to the project folder.
+    #[test]
+    fn a_unit_in_a_subfolder_builds_the_programs_of_the_project_folder() {
+        let dir = std::env::temp_dir().join(format!("pascoda-build-subfolder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/deep/er")).unwrap();
+        std::fs::create_dir_all(dir.join("other")).unwrap();
+        let lpr = dir.join("app.lpr");
+        std::fs::write(&lpr, "program app;\n").unwrap();
+        for file in ["src/unit1.pas", "src/deep/er/unit2.pas", "src/notes.txt"] {
+            std::fs::write(dir.join(file), "").unwrap();
+        }
+        let unit = dir.join("src/unit1.pas");
+        assert_eq!(crate::program_for(&unit, &dir), lpr, "one program in the project folder");
+        assert_eq!(crate::program_for(&dir.join("src/deep/er/unit2.pas"), &dir), lpr, "several folders deep");
+        assert_eq!(crate::program_for(&dir.join("src/notes.txt"), &dir), lpr, "any file");
+        // The project file names the main program when there are several.
+        std::fs::write(dir.join("tool.lpr"), "program tool;\n").unwrap();
+        assert_eq!(crate::program_for(&unit, &dir), unit, "two programs and no project file: ambiguous, the file itself");
+        std::fs::write(
+            dir.join("app.lpi"),
+            "<CONFIG><ProjectOptions><Units Count=\"1\"><Unit0><Filename Value=\"app.lpr\"/><IsPartOfProject Value=\"True\"/></Unit0></Units></ProjectOptions></CONFIG>",
+        )
+        .unwrap();
+        assert_eq!(crate::program_for(&unit, &dir), lpr, "the project file wins over the ambiguity");
+        // A program in the unit's own folder is the nearest one.
+        let near = dir.join("src/near.lpr");
+        std::fs::write(&near, "program near;\n").unwrap();
+        std::fs::remove_file(dir.join("app.lpi")).unwrap();
+        std::fs::remove_file(dir.join("tool.lpr")).unwrap();
+        assert_eq!(crate::program_for(&unit, &dir), near, "the nearest program");
+        std::fs::remove_file(&near).unwrap();
+        // A file outside the opened folder only has its own folder.
+        std::fs::write(dir.join("other/loose.pas"), "").unwrap();
+        assert_eq!(crate::program_for(&dir.join("other/loose.pas"), &dir.join("src")), dir.join("other/loose.pas"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The layout of a real Lazarus project: `app.lpr` and `app.lpi` in the project folder, the form unit (which
+    /// uses `LCLType`) in `src/`. With the unit as the active file, the build is the program's, with the LCL and
+    /// the project's search path, and the program starts.
+    #[test]
+    fn a_lazarus_project_with_units_in_a_subfolder_builds_from_a_unit_and_starts() {
+        let _fpc = crate::FPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = crate::target_tmp().join("lazarus-subfolder");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("app.lpr"),
+            "program app;\n\n{$mode objfpc}{$H+}\n\nuses\n  Interfaces, // this includes the LCL widgetset\n  Forms, Unit1;\n\nbegin\n  RequireDerivedFormResource := True;\n  Application.Initialize;\n  Application.CreateForm(TForm1, Form1);\n  Application.Run;\nend.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("app.lpi"),
+            "<?xml version=\"1.0\"?>\n<CONFIG>\n  <ProjectOptions>\n    <Units Count=\"2\">\n      <Unit0><Filename Value=\"app.lpr\"/><IsPartOfProject Value=\"True\"/></Unit0>\n      <Unit1><Filename Value=\"src/unit1.pas\"/><IsPartOfProject Value=\"True\"/></Unit1>\n    </Units>\n  </ProjectOptions>\n  <CompilerOptions>\n    <SearchPaths>\n      <OtherUnitFiles Value=\"src\"/>\n    </SearchPaths>\n  </CompilerOptions>\n</CONFIG>\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/unit1.pas"),
+            "unit Unit1;\n\n{$mode objfpc}{$H+}\n\ninterface\n\nuses\n  Classes, SysUtils, Forms, Controls, Graphics, Dialogs, LCLType;\n\ntype\n  TForm1 = class(TForm)\n  end;\n\nvar\n  Form1: TForm1;\n\nimplementation\n\nconst\n  EnterKey = VK_RETURN;\n\n{$R *.lfm}\n\nend.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/unit1.lfm"),
+            "object Form1: TForm1\n  Left = 300\n  Height = 120\n  Top = 200\n  Width = 240\n  Caption = 'Form1'\nend\n",
+        )
+        .unwrap();
+        let dir = dir.canonicalize().unwrap();
+        if pascoda_fpc::lcl::Lcl::find(&dir).is_none() {
+            eprintln!("skipped: vendor/lazarus not found");
+            return;
+        }
+        let program = crate::program_for(&dir.join("src/unit1.pas"), &dir);
+        assert_eq!(program, dir.join("app.lpr"), "the unit builds the project's program");
+        let (args, _) = crate::project_args(program.parent());
+        let built = crate::build_program(&program, None, pascoda_fpc::Mode::ObjFpc, &args, None, false, &mut |_| {}).unwrap();
+        assert!(built.success, "{}", built.raw_output);
+        let mut child = std::process::Command::new(pascoda_project::executable_for(&program)).spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let status = child.try_wait().unwrap();
+        let _ = child.kill();
+        assert!(status.is_none(), "the program ended: {status:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A program that uses an LCL unit without `Interfaces` fails a plain build ("Can't find unit LCLType"); the
+    /// build is repeated with the LCL and says so. A missing unit of another kind is not retried.
+    #[test]
+    fn a_program_using_lcl_units_without_interfaces_is_built_with_the_lcl() {
+        let _fpc = crate::FPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = crate::target_tmp().join("lcl-units-without-interfaces");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tool.lpr"), "program tool;\n\n{$mode objfpc}{$H+}\n\nuses\n  LCLType;\n\nbegin\n  if VK_RETURN <> 13 then Halt(1);\nend.\n").unwrap();
+        std::fs::write(dir.join("other.lpr"), "program other;\n\nuses\n  NoSuchUnitAnywhere;\n\nbegin\nend.\n").unwrap();
+        let dir = dir.canonicalize().unwrap();
+        if pascoda_fpc::lcl::Lcl::find(&dir).is_none() {
+            eprintln!("skipped: vendor/lazarus not found");
+            return;
+        }
+        let tool = dir.join("tool.lpr");
+        let plain = pascoda_fpc::build_progress_configured(&tool, pascoda_fpc::Mode::ObjFpc, &[], None, false, &mut |_| {}).unwrap();
+        assert!(!plain.success, "a plain build cannot find LCLType");
+        assert!(plain.diagnostics.iter().any(|d| d.message.contains("Can't find unit LCLType")), "{}", plain.raw_output);
+        let built = crate::build_program(&tool, None, pascoda_fpc::Mode::ObjFpc, &[], None, false, &mut |_| {}).unwrap();
+        assert!(built.success, "{}", built.raw_output);
+        assert!(built.raw_output.starts_with("Built with the LCL: the program uses LCL units."), "{}", built.raw_output);
+        let run = std::process::Command::new(pascoda_project::executable_for(&tool)).status().unwrap();
+        assert!(run.success(), "the program runs and finds VK_RETURN = 13");
+        // another missing unit: the same error, no retry
+        let other = crate::build_program(&dir.join("other.lpr"), None, pascoda_fpc::Mode::ObjFpc, &[], None, false, &mut |_| {}).unwrap();
+        assert!(!other.success);
+        assert!(!other.raw_output.contains("Built with the LCL"), "{}", other.raw_output);
+        assert!(other.diagnostics.iter().any(|d| d.message.contains("Can't find unit NoSuchUnitAnywhere")), "{}", other.raw_output);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A project that puts an older Lazarus's `LazControls` on its unit path (CudaText brings its own copy) was made for the Lazarus
+    /// that copy came from. Built with the bundled, newer LCL it fails inside `TListFilterEdit` ("identifier not
+    /// found" for a field the old LCL had); with `lazarus` naming that Lazarus it builds. Needs an older Lazarus
+    /// source tree: `PASCODA_OLD_LAZARUS=/path/to/lazarus cargo test -p pascoda-app -- --ignored cudatext`.
+    #[test]
+    #[ignore = "needs a Lazarus tree older than the bundled one (PASCODA_OLD_LAZARUS)"]
+    fn cudatext_style_project_with_its_own_lazcontrols_builds_with_the_lazarus_it_was_made_for() {
+        let Some(old) = std::env::var_os("PASCODA_OLD_LAZARUS").map(PathBuf::from) else {
+            eprintln!("skipped: PASCODA_OLD_LAZARUS is not set");
+            return;
+        };
+        let _fpc = crate::FPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = crate::target_tmp().join("own-lazcontrols");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // the project's own copy of the package
+        let copy = dir.join("lazcontrols");
+        std::fs::create_dir_all(&copy).unwrap();
+        for e in std::fs::read_dir(old.join("components/lazcontrols")).unwrap().flatten() {
+            let p = e.path();
+            if p.is_file() {
+                std::fs::copy(&p, copy.join(p.file_name().unwrap())).unwrap();
+            }
+        }
+        std::fs::write(
+            dir.join("app.lpr"),
+            "program app;\n\n{$mode objfpc}{$H+}\n\nuses\n  Interfaces, Forms, ListFilterEdit;\n\nvar\n  Filter: TListFilterEdit;\n\nbegin\n  Application.Initialize;\nend.\n",
+        )
+        .unwrap();
+        // The copy is on the project's unit path, as "Add search path" puts it when ListFilterEdit is missing.
+        std::fs::write(dir.join("pascoda.toml"), "unit_paths = [\"lazcontrols\"]\n").unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let program = dir.join("app.lpr");
+        let (args, _) = crate::project_args(Some(&dir));
+        let bundled = crate::build_program(&program, None, pascoda_fpc::Mode::ObjFpc, &args, None, false, &mut |_| {}).unwrap();
+        assert!(!bundled.success, "the old LazControls cannot build against the bundled LCL");
+        assert!(bundled.raw_output.contains("fNeedUpdate"), "{}", bundled.raw_output);
+        let made_for = crate::build_program(&program, Some(&old), pascoda_fpc::Mode::ObjFpc, &args, None, false, &mut |_| {}).unwrap();
+        assert!(made_for.success, "{}", made_for.raw_output);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed build says so when its first error is in code of another Lazarus than the one in use: a file of a
+    /// Lazarus source tree on the unit path, or a copy of a Lazarus package inside the project.
+    #[test]
+    fn a_build_error_in_another_lazaruss_code_points_to_the_lazarus_folder_setting() {
+        let base = std::env::temp_dir().join(format!("pascoda-mismatch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let tree = base.join("old-lazarus");
+        std::fs::create_dir_all(tree.join("lcl/interfaces/cocoa")).unwrap();
+        std::fs::create_dir_all(tree.join("components/lazutils")).unwrap();
+        std::fs::create_dir_all(tree.join("components/lazcontrols")).unwrap();
+        let project = base.join("app");
+        std::fs::create_dir_all(project.join("copy")).unwrap();
+        std::fs::write(project.join("copy/Pkg.lpk"), "<CONFIG><Package><Author Value=\"Lazarus Team\"/></Package></CONFIG>").unwrap();
+        std::fs::write(project.join("copy/listfilteredit.pas"), "").unwrap();
+        std::fs::write(project.join("main.pas"), "").unwrap();
+        std::fs::write(tree.join("components/lazcontrols/listfilteredit.pas"), "").unwrap();
+        let error = |file: PathBuf| pascoda_fpc::Diagnostic {
+            file,
+            line: 159,
+            col: 5,
+            severity: pascoda_fpc::Severity::Error,
+            message: "Identifier not found \"fNeedUpdate\"".into(),
+        };
+        let bundled = base.join("bundled");
+        // a file of a Lazarus tree that is not the one in use
+        let hint = crate::lazarus_mismatch_hint(&[error(tree.join("components/lazcontrols/listfilteredit.pas"))], Some(&bundled)).unwrap();
+        assert!(hint.contains("listfilteredit.pas") && hint.contains("Lazarus folder") && hint.contains(&tree.display().to_string()), "{hint}");
+        // the same file when that tree IS the one in use: nothing to say
+        assert_eq!(crate::lazarus_mismatch_hint(&[error(tree.join("components/lazcontrols/listfilteredit.pas"))], Some(&tree)), None);
+        // a copy of a Lazarus package inside the project
+        let hint = crate::lazarus_mismatch_hint(&[error(project.join("copy/listfilteredit.pas"))], None).unwrap();
+        assert!(hint.contains("copy of a Lazarus package"), "{hint}");
+        // the project's own code, and a build with no error: nothing
+        assert_eq!(crate::lazarus_mismatch_hint(&[error(project.join("main.pas"))], None), None);
+        assert_eq!(crate::lazarus_mismatch_hint(&[], None), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn build_and_run_builds_the_program_whatever_file_is_selected() {
         let dir = std::env::temp_dir().join(format!("pascoda-build-target-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -4946,11 +5577,11 @@ mod menu_tests {
         for file in ["Pkg.lpk", "unit1.lfm", "unit1.pas", "notes.txt"] {
             std::fs::write(dir.join(file), "").unwrap();
         }
-        assert_eq!(crate::program_for(&dir.join("Pkg.lpk")), lpr, "a package builds the program");
-        assert_eq!(crate::program_for(&dir.join("unit1.lfm")), lpr, "a form file builds the program");
-        assert_eq!(crate::program_for(&dir.join("unit1.pas")), lpr, "a unit builds the program");
-        assert_eq!(crate::program_for(&dir.join("notes.txt")), lpr, "a text file builds the program");
-        assert_eq!(crate::program_for(&lpr), lpr, "a program builds itself");
+        assert_eq!(crate::program_for(&dir.join("Pkg.lpk"), &dir), lpr, "a package builds the program");
+        assert_eq!(crate::program_for(&dir.join("unit1.lfm"), &dir), lpr, "a form file builds the program");
+        assert_eq!(crate::program_for(&dir.join("unit1.pas"), &dir), lpr, "a unit builds the program");
+        assert_eq!(crate::program_for(&dir.join("notes.txt"), &dir), lpr, "a text file builds the program");
+        assert_eq!(crate::program_for(&lpr, &dir), lpr, "a program builds itself");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5018,13 +5649,17 @@ mod search_path_tests {
     /// lets the next build find the unit.
     #[test]
     fn adding_the_folder_of_a_missing_unit_makes_the_build_find_it() {
-        let root = std::env::temp_dir().join(format!("pascoda-search-path-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("libs")).unwrap();
+        // The library sits outside the project, so only a search path can make it visible. (A unit in a
+        // subfolder of the project is found without one.)
+        let base = std::env::temp_dir().join(format!("pascoda-search-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("app");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(base.join("libs")).unwrap();
         let program = root.join("app.pas");
         std::fs::write(&program, "program app;\n\nuses helper;\n\nbegin\n  WriteLn(Twice(2));\nend.\n").unwrap();
         std::fs::write(
-            root.join("libs/helper.pas"),
+            base.join("libs/helper.pas"),
             "unit helper;\n\n{$mode objfpc}\n\ninterface\n\nfunction Twice(x: Integer): Integer;\n\nimplementation\n\nfunction Twice(x: Integer): Integer;\nbegin\n  Result := 2 * x;\nend;\n\nend.\n",
         )
         .unwrap();
@@ -5043,10 +5678,10 @@ mod search_path_tests {
         assert!(before.raw_output.contains("Can't find unit helper"), "{}", before.raw_output);
 
         let mut app = App::bare(Some(program.clone()));
-        app.add_search_path(&root.join("libs"));
-        assert_eq!(pascoda_project::load_compiler(&root).unit_paths, ["libs"], "stored relative to the project");
-        app.add_search_path(&root.join("libs"));
-        assert_eq!(pascoda_project::load_compiler(&root).unit_paths, ["libs"], "not added twice");
+        app.add_search_path(&base.canonicalize().unwrap().join("libs"));
+        assert_eq!(pascoda_project::load_compiler(&root).unit_paths.len(), 1, "one folder stored");
+        app.add_search_path(&base.canonicalize().unwrap().join("libs"));
+        assert_eq!(pascoda_project::load_compiler(&root).unit_paths.len(), 1, "not added twice");
 
         let after = pascoda_fpc::build_progress_with(
             &program,
@@ -5057,6 +5692,80 @@ mod search_path_tests {
         )
         .unwrap();
         assert!(after.success, "{}", after.raw_output);
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// One line of diff output: an added (`+`) or removed (`-`) line, a file or hunk header, or other text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiffLine {
+    Added,
+    Removed,
+    Header,
+    Plain,
+}
+
+fn diff_line(line: &str) -> DiffLine {
+    if line.starts_with("+++") || line.starts_with("---") || line.starts_with("@@") {
+        DiffLine::Header
+    } else if line.starts_with('+') {
+        DiffLine::Added
+    } else if line.starts_with('-') {
+        DiffLine::Removed
+    } else {
+        DiffLine::Plain
+    }
+}
+
+/// The background of a whole diff line: green for added, red for removed, none for the rest.
+fn diff_background(kind: DiffLine, dark: bool) -> Option<egui::Color32> {
+    match (kind, dark) {
+        (DiffLine::Added, false) => Some(egui::Color32::from_rgb(0xDA, 0xFB, 0xE1)),
+        (DiffLine::Added, true) => Some(egui::Color32::from_rgb(0x23, 0x3E, 0x2B)),
+        (DiffLine::Removed, false) => Some(egui::Color32::from_rgb(0xFF, 0xEB, 0xE9)),
+        (DiffLine::Removed, true) => Some(egui::Color32::from_rgb(0x4A, 0x25, 0x27)),
+        _ => None,
+    }
+}
+
+/// The diff output for the Output tab: each line is a full-width row, green or red for added and removed
+/// lines. The headers are grey.
+fn diff_view(ui: &mut egui::Ui, text: &str, pal: &Palette) {
+    let font = egui::FontId::monospace(12.0);
+    let row_h = 16.0;
+    for line in text.lines() {
+        let kind = diff_line(line);
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), egui::Sense::hover());
+        let painter = ui.painter();
+        if let Some(bg) = diff_background(kind, pal.dark) {
+            painter.rect_filled(rect, 0.0, bg);
+        }
+        let color = if kind == DiffLine::Header { pal.text_secondary } else { pal.text };
+        painter.text(
+            egui::pos2(rect.left() + 4.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            line,
+            font.clone(),
+            color,
+        );
+    }
+}
+
+#[cfg(test)]
+mod diff_colour_tests {
+    use super::*;
+
+    #[test]
+    fn diff_lines_are_classified_and_shaded_green_or_red() {
+        assert_eq!(diff_line("+new line"), DiffLine::Added);
+        assert_eq!(diff_line("-old line"), DiffLine::Removed);
+        assert_eq!(diff_line("--- a.pas"), DiffLine::Header);
+        assert_eq!(diff_line("+++ b.pas"), DiffLine::Header);
+        assert_eq!(diff_line("@@ -1,2 +1,2 @@"), DiffLine::Header);
+        assert_eq!(diff_line(" unchanged"), DiffLine::Plain);
+        assert_eq!(diff_background(DiffLine::Added, false), Some(egui::Color32::from_rgb(0xDA, 0xFB, 0xE1)));
+        assert_eq!(diff_background(DiffLine::Removed, false), Some(egui::Color32::from_rgb(0xFF, 0xEB, 0xE9)));
+        assert_eq!(diff_background(DiffLine::Plain, false), None, "unchanged lines have no background");
+        assert_eq!(diff_background(DiffLine::Header, true), None);
     }
 }

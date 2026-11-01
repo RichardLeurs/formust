@@ -73,10 +73,11 @@ pub const CRATES: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
-/// The Free Pascal version on this machine, if the compiler is installed.
+/// The Free Pascal version on this machine, if the compiler is installed: the full one (`-iW`, so a release
+/// candidate reads `3.2.4-rc2`, not `3.2.4`).
 fn fpc_version() -> Option<String> {
     let out = Command::new(pascoda_fpc::locate_fpc()?)
-        .arg("-iV")
+        .arg("-iW")
         .output()
         .ok()?;
     let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -184,7 +185,7 @@ mod tests {
 
     #[test]
     fn credits_cover_info_dependencies_and_tools() {
-        let text = credits(Some("3.2.2"));
+        let text = credits(Some("3.2.4-rc2"));
         assert!(text.contains("A modern IDE for Pascal"));
         for (name, version, _, licence) in CRATES {
             assert!(
@@ -193,7 +194,7 @@ mod tests {
             );
         }
         assert!(
-            text.contains("Free Pascal 3.2.2")
+            text.contains("Free Pascal 3.2.4-rc2")
                 && text.contains("lldb-dap")
                 && text.contains("pasls")
         );

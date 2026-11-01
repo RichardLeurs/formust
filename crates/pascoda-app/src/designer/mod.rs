@@ -1,5 +1,6 @@
 //! The visual form designer: the state and the editing operations (no drawing; see `ui`).
 
+pub mod editors;
 pub mod geometry;
 pub mod item_editor;
 pub mod menu;
@@ -81,6 +82,19 @@ pub const PALETTE: &[Entry] = &[
     e("Additional", "TShape", "", "ExtCtrls"),
     e("Additional", "TBevel", "", "ExtCtrls"),
     e("Additional", "TSplitter", "", "ExtCtrls"),
+    e("Additional", "TCheckListBox", "", "CheckLst"),
+    e("Additional", "TStringGrid", "", "Grids"),
+    e("Additional", "TDrawGrid", "", "Grids"),
+    e("Additional", "TValueListEditor", "", "ValEdit"),
+    e("Additional", "TColorListBox", "", "ColorBox"),
+    e("Additional", "TScrollBox", "", "Forms"),
+    e("Additional", "TPaintBox", "", "ExtCtrls"),
+    e("Additional", "TControlBar", "", "ExtCtrls"),
+    e("Additional", "TFlowPanel", "", "ExtCtrls"),
+    e("Additional", "TNotebook", "", "ExtCtrls"),
+    e("Additional", "TPairSplitter", "", "PairSplitter"),
+    nv("Additional", "TTrayIcon", "ExtCtrls"),
+    nv("Additional", "TApplicationProperties", "Forms"),
     e("Common Controls", "TProgressBar", "", "ComCtrls"),
     e("Common Controls", "TTrackBar", "", "ComCtrls"),
     e("Common Controls", "TUpDown", "", "ComCtrls"),
@@ -89,6 +103,27 @@ pub const PALETTE: &[Entry] = &[
     e("Common Controls", "TTreeView", "", "ComCtrls"),
     e("Common Controls", "TToolBar", "", "ComCtrls"),
     e("Common Controls", "TStatusBar", "", "ComCtrls"),
+    e("Common Controls", "TTabControl", "", "ComCtrls"),
+    e("Common Controls", "THeaderControl", "", "ComCtrls"),
+    e("Common Controls", "TCoolBar", "", "ComCtrls"),
+    nv("Common Controls", "TPopupNotifier", "PopupNotifier"),
+    e("Misc", "TColorButton", "", "Dialogs"),
+    e("Misc", "TArrow", "", "Arrow"),
+    e("Misc", "TButtonPanel", "", "ButtonPanel"),
+    e("Misc", "TCalendar", "", "Calendar"),
+    e("Misc", "TCalcEdit", "Text", "EditBtn"),
+    e("Misc", "TDateEdit", "Text", "EditBtn"),
+    e("Misc", "TTimeEdit", "Text", "EditBtn"),
+    e("Misc", "TEditButton", "Text", "EditBtn"),
+    e("Misc", "TFileNameEdit", "Text", "EditBtn"),
+    e("Misc", "TDirectoryEdit", "Text", "EditBtn"),
+    e("Misc", "TFloatSpinEdit", "", "Spin"),
+    e("Misc", "TComboBoxEx", "", "ComboEx"),
+    e("Misc", "TCheckComboBox", "", "ComboEx"),
+    e("Misc", "TFileListBox", "", "FileCtrl"),
+    e("Misc", "TFilterComboBox", "", "FileCtrl"),
+    e("Misc", "TShellTreeView", "", "ShellCtrls"),
+    e("Misc", "TShellListView", "", "ShellCtrls"),
     nv("System", "TTimer", "ExtCtrls"),
     nv("System", "TOpenDialog", "Dialogs"),
     nv("System", "TSaveDialog", "Dialogs"),
@@ -99,6 +134,20 @@ pub const PALETTE: &[Entry] = &[
     nv("System", "TImageList", "Controls"),
     nv("System", "TMainMenu", "Menus"),
     nv("System", "TPopupMenu", "Menus"),
+    nv("System", "TIdleTimer", "ExtCtrls"),
+    nv("System", "TAsyncProcess", "AsyncProcess"),
+    nv("System", "THTMLHelpDatabase", "LazHelpHTML"),
+    nv("System", "THTMLBrowserHelpViewer", "LazHelpHTML"),
+    nv("System", "TFindDialog", "Dialogs"),
+    nv("System", "TReplaceDialog", "Dialogs"),
+    nv("System", "TOpenPictureDialog", "ExtDlgs"),
+    nv("System", "TSavePictureDialog", "ExtDlgs"),
+    nv("System", "TCalendarDialog", "ExtDlgs"),
+    nv("System", "TCalculatorDialog", "ExtDlgs"),
+    nv("System", "TTaskDialog", "Dialogs"),
+    nv("System", "TIniPropStorage", "IniPropStorage"),
+    nv("System", "TXMLPropStorage", "XMLPropStorage"),
+    nv("System", "TJSONPropStorage", "JSONPropStorage"),
     e("Data Controls", "TDBNavigator", "", "DBCtrls"),
     e("Data Controls", "TDBText", "Caption", "DBCtrls"),
     e("Data Controls", "TDBEdit", "", "DBCtrls"),
@@ -111,6 +160,9 @@ pub const PALETTE: &[Entry] = &[
     e("Data Controls", "TDBCheckBox", "Caption", "DBCtrls"),
     e("Data Controls", "TDBRadioGroup", "Caption", "DBCtrls"),
     e("Data Controls", "TDBGrid", "", "DBGrids"),
+    e("Data Controls", "TDBGroupBox", "", "DBCtrls"),
+    e("Data Controls", "TDBCalendar", "", "DBCtrls"),
+    e("Data Controls", "TDBDateEdit", "Text", "DBExtCtrls"),
     // The SQLdb components come from FPC's fcl-db, not the LCL. A project that uses them gets the
     // fcl-db folders on its build path (`packages::needed_vendored`).
     nv("Data Controls", "TSQLConnector", "sqldb"),
@@ -119,6 +171,10 @@ pub const PALETTE: &[Entry] = &[
     nv("Data Controls", "TSQLScript", "sqldb"),
     nv("Data Controls", "TDataSource", "db"),
     nv("Data Controls", "TSQLite3Connection", "sqlite3conn"),
+    // In-memory and file datasets: units of fcl-db (`BufDataset`, `memds`, `dbf`), not LCL components.
+    nv("Data Controls", "TBufDataset", "BufDataset"),
+    nv("Data Controls", "TMemDataset", "memds"),
+    nv("Data Controls", "TDbf", "dbf"),
 ];
 
 /// Components from imported packages (see `imports`), after the built-in pages. Set when the imports
@@ -244,10 +300,8 @@ fn intern(name: &str) -> &'static str {
     leaked
 }
 
-/// The project's custom components: classes declared in the project's units, except forms and
-/// frames (their base class is a form) and built-in classes. Units are read from the folder and
-/// its subfolders, as the file tree shows them.
-pub fn custom_classes(root: &Path) -> ClassUnits {
+/// The Pascal units (`.pas`, `.pp`) of the project folder and its subfolders, as the file tree shows them.
+fn pas_files(root: &Path) -> Vec<PathBuf> {
     fn collect(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         let Ok(read) = std::fs::read_dir(dir) else {
             return;
@@ -270,10 +324,18 @@ pub fn custom_classes(root: &Path) -> ClassUnits {
             }
         }
     }
-    // Forms and data modules are not placed on forms. Frames are controls, so they are placeable.
-    const FORM_BASES: &[&str] = &["tform", "tcustomform", "tdatamodule"];
     let mut files = Vec::new();
     collect(root, 0, &mut files);
+    files
+}
+
+/// The project's custom components: classes declared in the project's units, except forms and
+/// frames (their base class is a form) and built-in classes. Units are read from the folder and
+/// its subfolders, as the file tree shows them.
+pub fn custom_classes(root: &Path) -> ClassUnits {
+    // Forms and data modules are not placed on forms. Frames are controls, so they are placeable.
+    const FORM_BASES: &[&str] = &["tform", "tcustomform", "tdatamodule"];
+    let files = pas_files(root);
     let mut out = ClassUnits::new();
     for file in files {
         let Ok(text) = std::fs::read_to_string(&file) else {
@@ -346,6 +408,37 @@ fn is_datamodule(pas: &Path, class: &str) -> bool {
     based || class.to_ascii_lowercase().starts_with("tdatamodule")
 }
 
+/// Whether the class is a frame: its unit declares it `TFrame` (or `TCustomFrame`), or it is named like one.
+fn is_frame(pas: &Path, class: &str) -> bool {
+    let based = std::fs::read_to_string(pas)
+        .ok()
+        .and_then(|t| base_class(&t, class))
+        .is_some_and(|b| ["tframe", "tcustomframe"].contains(&b.to_ascii_lowercase().as_str()));
+    based || class.to_ascii_lowercase().starts_with("tframe")
+}
+
+/// The project's frames: for each class declared `class(TFrame)` in a unit of `root` that has an `.lfm`, the
+/// frame's own components, by lower-case class name. Placed on a form, a frame shows them.
+pub fn frame_layouts(root: &Path) -> HashMap<String, Component> {
+    let mut out = HashMap::new();
+    for file in pas_files(root) {
+        let Ok(text) = std::fs::read_to_string(&file) else { continue };
+        let Some(lfm) = sibling_lfm(&file) else { continue };
+        for (class, base) in pascoda_forms::sync::declared_classes(&text) {
+            if !["tframe", "tcustomframe"].contains(&base.to_ascii_lowercase().as_str()) {
+                continue;
+            }
+            let Ok(lfm_text) = std::fs::read_to_string(&lfm) else { continue };
+            if let Ok(doc) = FormDoc::parse(&lfm_text)
+                && doc.root().class.eq_ignore_ascii_case(&class)
+            {
+                out.insert(class.to_ascii_lowercase(), doc.root().clone());
+            }
+        }
+    }
+    out
+}
+
 /// The units a form needs `uses`d for the classes it contains (Controls/Forms are always there):
 /// the palette's units, and the unit of each custom class. The form's own unit is never listed.
 pub fn units_for(form: &Component, own_unit: &str, custom: &ClassUnits) -> Vec<&'static str> {
@@ -381,7 +474,7 @@ pub fn units_for(form: &Component, own_unit: &str, custom: &ClassUnits) -> Vec<&
 
 /// Containers whose children are positioned relative to them.
 pub fn is_container(class: &str) -> bool {
-    ["tpanel", "tgroupbox", "tradiogroup", "tcheckgroup"]
+    ["tpanel", "tgroupbox", "tradiogroup", "tcheckgroup", "tscrollbox", "tflowpanel", "tdbgroupbox"]
         .contains(&class.to_ascii_lowercase().as_str())
 }
 
@@ -394,7 +487,8 @@ fn text_prop(class: &str) -> &'static str {
 pub fn takes_focus(class: &str) -> bool {
     !is_nonvisual(class)
         && ![
-            "tlabel", "tspeedbutton", "timage", "tshape", "tbevel", "tdbtext", "tdbimage",
+            "tlabel", "tspeedbutton", "timage", "tshape", "tbevel", "tdbtext", "tdbimage", "tpaintbox", "tarrow",
+            "tcolorbutton",
         ]
             .contains(&class.to_ascii_lowercase().as_str())
 }
@@ -472,6 +566,22 @@ pub fn default_event(class: &str) -> &'static str {
         | "tfontdialog" => "OnClose",
         "timagelist" | "tmainmenu" => "OnChange",
         "tpopupmenu" => "OnPopup",
+        "tidletimer" => "OnTimer",
+        "tfinddialog" => "OnFind",
+        "treplacedialog" => "OnReplace",
+        "tcalendardialog" | "tcalculatordialog" | "topenpicturedialog" | "tsavepicturedialog" => "OnClose",
+        "ttaskdialog" => "OnDialogCreated",
+        "tasyncprocess" => "OnReadData",
+        "tapplicationproperties" => "OnActivate",
+        "tinipropstorage" | "txmlpropstorage" | "tjsonpropstorage" => "OnSavingProperties",
+        "tpaintbox" => "OnPaint",
+        "tnotebook" => "OnPageChanged",
+        "tcolorbutton" => "OnColorChanged",
+        "ttabcontrol" | "tcalendar" | "tdbcalendar" | "tcoolbar" | "tcomboboxex" | "tcheckcombobox" | "tfiltercombobox"
+        | "tfloatspinedit" | "tdateedit" | "ttimeedit" | "tcalcedit" | "teditbutton" | "tfilenameedit" | "tdirectoryedit"
+        | "tdbdateedit" => "OnChange",
+        // No event of a plain TNotifyEvent shape: the double click creates no handler.
+        "tpopupnotifier" | "thtmlhelpdatabase" | "thtmlbrowserhelpviewer" => "",
         _ => "OnClick",
     }
 }
@@ -550,6 +660,11 @@ pub struct Designer {
     pub custom_units: Arc<ClassUnits>,
     /// The root is a `TDataModule`: a window-less surface for non-visual components only.
     datamodule: bool,
+    /// The root is a `TFrame` descendant: designed on a plain surface with no window frame.
+    frame: bool,
+    /// The project's frames by lower-case class: each frame's own components, so a frame placed on this
+    /// form shows them (read only; the frame is edited in its own unit).
+    pub frames: Arc<HashMap<String, Component>>,
     pub doc: FormDoc,
     saved: String,
     undo: Vec<String>,
@@ -714,6 +829,17 @@ impl Designer {
         self.datamodule
     }
 
+    /// Whether the open unit is a frame: designed on a plain surface the size of the frame, with no window.
+    pub fn is_frame(&self) -> bool {
+        self.frame
+    }
+
+    /// The event a double click on the root creates a handler for: a form's `OnCreate`; a frame has no
+    /// such event, so its `OnClick`.
+    pub fn root_event(&self) -> &'static str {
+        if self.frame { "OnClick" } else { "OnCreate" }
+    }
+
     pub fn open(pas_path: &Path) -> Result<Self, DesignerError> {
         let lfm_path = sibling_lfm(pas_path).ok_or_else(|| {
             DesignerError::Io(std::io::Error::other("no .lfm file next to this unit"))
@@ -732,10 +858,13 @@ impl Designer {
         };
         let doc = FormDoc::parse(&working).map_err(DesignerError::Parse)?;
         let datamodule = is_datamodule(pas_path, &doc.root().class);
+        let frame = is_frame(pas_path, &doc.root().class);
         let mut d = Self {
             lfm_path,
             pas_path: pas_path.to_path_buf(),
             datamodule,
+            frame,
+            frames: Arc::default(),
             saved: text,
             ancestor,
             ancestor_root,
@@ -818,35 +947,79 @@ impl Designer {
         self.doc.component(&self.selected)
     }
 
-    /// The controls to draw, in z-order, with form-relative bounds.
+    /// The controls to draw, in z-order, with form-relative bounds. A placed frame is drawn as a surface and
+    /// its own components follow it, read only (they are not in this form's tree, so nothing selects them).
     pub fn specs(&self) -> Vec<native::Spec> {
+        fn caption_of(c: &Component) -> String {
+            c.prop(text_prop(&c.class)).and_then(PropValue::as_str).unwrap_or_default().to_string()
+        }
+        /// The components of the frame `frame` placed at `origin` (form coordinates), nested frames too.
+        fn frame_specs(
+            frames: &HashMap<String, Component>,
+            frame: &Component,
+            origin: (i64, i64),
+            depth: usize,
+            out: &mut Vec<native::Spec>,
+        ) {
+            fn go(
+                frames: &HashMap<String, Component>,
+                root: &Component,
+                c: &Component,
+                path: &mut Vec<usize>,
+                origin: (i64, i64),
+                depth: usize,
+                out: &mut Vec<native::Spec>,
+            ) {
+                for (i, child) in c.children.iter().enumerate() {
+                    path.push(i);
+                    if let Some(b) = geometry::absolute(root, path) {
+                        let bounds = b.offset(origin.0, origin.1);
+                        let nested = frames.get(&child.class.to_ascii_lowercase());
+                        out.push(native::Spec {
+                            name: child.name.clone(),
+                            class: if nested.is_some() { "TFrame".into() } else { child.class.clone() },
+                            caption: caption_of(child),
+                            bounds,
+                        });
+                        if let Some(inner) = nested
+                            && depth < 4
+                        {
+                            frame_specs(frames, inner, (bounds.left, bounds.top), depth + 1, out);
+                        }
+                    }
+                    go(frames, root, child, path, origin, depth, out);
+                    path.pop();
+                }
+            }
+            go(frames, frame, frame, &mut Vec::new(), origin, depth, out);
+        }
         fn walk(
             c: &Component,
             path: &mut Vec<usize>,
             form: &Component,
+            frames: &HashMap<String, Component>,
             out: &mut Vec<native::Spec>,
         ) {
             for (i, child) in c.children.iter().enumerate() {
                 path.push(i);
                 if let Some(bounds) = geometry::absolute(form, path) {
-                    let caption = child
-                        .prop(text_prop(&child.class))
-                        .and_then(PropValue::as_str)
-                        .unwrap_or_default()
-                        .to_string();
+                    let frame = frames.get(&child.class.to_ascii_lowercase());
                     out.push(native::Spec {
                         name: child.name.clone(),
-                        class: child.class.clone(),
-                        caption,
+                        class: if frame.is_some() { "TFrame".into() } else { child.class.clone() },
+                        caption: caption_of(child),
                         bounds,
                     });
+                    if let Some(frame) = frame {
+                        frame_specs(frames, frame, (bounds.left, bounds.top), 0, out);
+                    }
                 }
-                walk(child, path, form, out);
+                walk(child, path, form, frames, out);
                 path.pop();
             }
         }
         let mut out = Vec::new();
-        walk(self.doc.root(), &mut Vec::new(), self.doc.root(), &mut out);
+        walk(self.doc.root(), &mut Vec::new(), self.doc.root(), &self.frames, &mut out);
         out
     }
 
@@ -1259,7 +1432,11 @@ impl Designer {
             return self.add_nonvisual(class);
         }
         let name = self.free_name(class);
-        let (w, h) = geometry::default_size(class);
+        // A frame is as big as it was designed.
+        let (w, h) = match self.frames.get(&class.to_ascii_lowercase()) {
+            Some(frame) => geometry::form_size(frame),
+            None => geometry::default_size(class),
+        };
         let comp = Component::new(&name, class)
             .with_prop("Left", PropValue::Int(geometry::snap(x, geometry::GRID)))
             .with_prop("Height", PropValue::Int(h))
@@ -1403,6 +1580,63 @@ impl Designer {
             self.last_prop = Some(key);
         }
         Ok(())
+    }
+
+    /// Removes a property (Lazarus omits a property it does not need, such as an empty font style).
+    pub fn remove_prop(&mut self, path: &[usize], name: &str) -> Result<(), DesignerError> {
+        self.checkpoint();
+        self.doc.remove_prop(path, name)?;
+        self.last_prop = None;
+        Ok(())
+    }
+
+    /// Whether a class binds to a data source, and whether it also has a `DataField`: the DBCtrls controls
+    /// bind to a field, `TDBNavigator` and `TDBGrid` to the whole data source.
+    pub fn data_binding(class: &str) -> Option<bool> {
+        match class.to_ascii_lowercase().as_str() {
+            "tdbnavigator" | "tdbgrid" => Some(false),
+            "tdbedit" | "tdbtext" | "tdbmemo" | "tdbimage" | "tdblistbox" | "tdblookuplistbox" | "tdbcombobox"
+            | "tdblookupcombobox" | "tdbcheckbox" | "tdbradiogroup" => Some(true),
+            _ => None,
+        }
+    }
+
+    /// The names of the `TDataSource` components on the form: the choices for a control's `DataSource`.
+    pub fn data_sources(&self) -> Vec<String> {
+        self.tray()
+            .iter()
+            .filter_map(|p| self.doc.component(p))
+            .filter(|c| c.class.eq_ignore_ascii_case("TDataSource") && !c.name.is_empty())
+            .map(|c| c.name.clone())
+            .collect()
+    }
+
+    /// Binds the control at `path` to a data source, or unbinds it with `None`. One undo step.
+    pub fn set_data_source(&mut self, path: &[usize], name: Option<&str>) -> Result<(), DesignerError> {
+        let current = self.doc.component(path).and_then(|c| c.prop("DataSource")).and_then(PropValue::as_ident).map(String::from);
+        if current.as_deref() == name {
+            return Ok(());
+        }
+        self.checkpoint();
+        self.last_prop = None;
+        match name {
+            Some(n) => self.doc.set_prop(path, "DataSource", PropValue::Ident(n.to_string()))?,
+            None => self.doc.remove_prop(path, "DataSource")?,
+        }
+        Ok(())
+    }
+
+    /// Sets the field a control shows (`DataField`); an empty name removes it.
+    pub fn set_data_field(&mut self, path: &[usize], field: &str) -> Result<(), DesignerError> {
+        if field.is_empty() {
+            if self.doc.component(path).and_then(|c| c.prop("DataField")).is_some() {
+                self.checkpoint();
+                self.last_prop = None;
+                self.doc.remove_prop(path, "DataField")?;
+            }
+            return Ok(());
+        }
+        self.set_prop(path, "DataField", PropValue::Str(field.to_string()))
     }
 
     /// Deletes every selected component (one undo step) and selects the primary's parent.
@@ -1757,6 +1991,10 @@ impl Designer {
 
     /// Makes sure the selected component has a handler for `event`; returns its name.
     pub fn ensure_handler(&mut self, event: &str) -> Result<Option<String>, DesignerError> {
+        // A class with no event to bind by default (see `default_event`) gets no handler.
+        if event.is_empty() {
+            return Ok(None);
+        }
         let Some(c) = self.selected_component() else {
             return Ok(None);
         };
@@ -1765,7 +2003,7 @@ impl Designer {
         }
         let suffix = event.strip_prefix("On").unwrap_or(event);
         // Lazarus calls the form's handlers FormCreate, FormClose, ... not Form1Create.
-        let owner = if self.selected.is_empty() {
+        let owner = if self.selected.is_empty() && !self.frame {
             "Form"
         } else {
             c.name.as_str()
@@ -2260,6 +2498,8 @@ mod tests {
             saved: LFM.to_string(),
             doc,
             datamodule: false,
+            frame: false,
+            frames: Arc::default(),
             undo: vec![],
             custom_units: Arc::default(),
             redo: vec![],
@@ -3298,17 +3538,21 @@ mod tests {
             built.raw_output,
             d.doc.source()
         );
+        let log = dir.join("run.log");
         let mut app = std::process::Command::new(dir.join("hello"))
+            .stdout(std::fs::File::create(&log).unwrap())
+            .stderr(std::fs::File::create(&log).unwrap())
             .spawn()
             .unwrap();
         std::thread::sleep(std::time::Duration::from_secs(3));
-        let alive = app.try_wait().unwrap().is_none();
+        let status = app.try_wait().unwrap();
         let _ = app.kill();
         let _ = app.wait();
         assert!(
-            alive,
-            "the program exited at startup: the form failed to load\n{}",
-            d.doc.source()
+            status.is_none(),
+            "the program exited at startup ({status:?}): the form failed to load\n{}\n--- what it printed ---\n{}",
+            d.doc.source(),
+            std::fs::read_to_string(&log).unwrap_or_default()
         );
     }
 
@@ -3419,10 +3663,9 @@ mod tests {
                 8 + (i as i64 / 4) * 40,
             )
             .unwrap();
-            // Non-visual events have their own signatures; the build checks them.
-            if en.nonvisual {
-                d.ensure_handler(default_event(en.class)).unwrap();
-            }
+            // Events have their own signatures (non-visual ones especially); the build checks every
+            // class's default handler.
+            d.ensure_handler(default_event(en.class)).unwrap();
         }
         d.sync_unit(&mut unit);
         assert_eq!(d.sync_error, None);
@@ -3642,6 +3885,68 @@ mod frame_tests {
         super::tests::build_and_start(&mut d, &unit, &dir, &lcl);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A frame's own unit opens in the designer as a frame: no window around it, components dropped on it,
+    /// its handlers named after the frame (a frame has no `OnCreate`, so a double click binds `OnClick`).
+    #[test]
+    fn a_frame_unit_opens_as_a_frame_and_takes_components_and_handlers() {
+        let dir = crate::target_tmp().join("frame-own-unit");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pas = pascoda_project::new_frame_unit(&dir, &dir).unwrap();
+        let form = pascoda_project::new_form_unit(&dir, &dir).unwrap();
+        let mut d = Designer::open(&pas).unwrap();
+        assert!(d.is_frame() && !d.is_datamodule());
+        assert!(!Designer::open(&form).unwrap().is_frame(), "a form is not a frame");
+        assert_eq!(d.root_event(), "OnClick");
+        assert_eq!(Designer::open(&form).unwrap().root_event(), "OnCreate");
+        d.add_component("TButton", &[], 16, 16).unwrap();
+        d.add_component("TEdit", &[], 16, 64).unwrap();
+        d.select(vec![]);
+        assert_eq!(d.ensure_handler(d.root_event()).unwrap().as_deref(), Some("Frame1Click"));
+        let mut unit = std::fs::read_to_string(&pas).unwrap();
+        d.sync_unit(&mut unit);
+        assert_eq!(d.sync_error, None);
+        for line in ["    Button1: TButton;", "    Edit1: TEdit;", "    procedure Frame1Click(Sender: TObject);"] {
+            assert!(unit.contains(line), "{line}\n{unit}");
+        }
+        assert!(!unit.contains("\nvar\n"), "no global variable is added: {unit}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A frame placed on a form is as big as the frame was designed, is drawn as a surface, and its own
+    /// components follow it at the frame's offset; they are not part of the form, so nothing selects them.
+    #[test]
+    fn a_placed_frame_shows_its_components_inside_it() {
+        let Some((dir, _lcl)) = frame_project("frame-children") else {
+            return;
+        };
+        let layouts = frame_layouts(&dir);
+        let frame = layouts.get("tframe1").expect("the frame is read");
+        assert_eq!(frame.children.len(), 1, "its button");
+        let button = geometry::bounds(&frame.children[0]);
+        let mut d = Designer::open(&dir.join("unit1.pas")).unwrap();
+        d.custom_units = Arc::new(custom_classes(&dir));
+        d.frames = Arc::new(layouts);
+        let before = d.doc.root().children.len();
+        let path = d.add_component("TFrame1", &[], 24, 40).unwrap();
+        let placed = geometry::bounds(d.doc.component(&path).unwrap());
+        assert_eq!((placed.width, placed.height), (200, 100), "the size the frame was designed with");
+        let specs = d.specs();
+        let frame_spec = specs.iter().find(|s| s.name == "Frame11").expect("the frame itself");
+        assert_eq!(frame_spec.class, "TFrame", "drawn as a surface, not a placeholder");
+        // (the fixture's own form has a Button1 too: the frame's button is the spec right after the frame)
+        let at = specs.iter().position(|s| s.name == "Frame11").unwrap();
+        let inner = &specs[at + 1];
+        assert_eq!(inner.name, "Button1", "the frame's button follows the frame");
+        assert_eq!((inner.bounds.left, inner.bounds.top), (placed.left + button.left, placed.top + button.top));
+        assert_eq!((inner.bounds.width, inner.bounds.height), (button.width, button.height));
+        // Clicking the button hits the frame: the button is not in this form.
+        let hit = geometry::hit_test(d.doc.root(), (inner.bounds.left + 2) as f64, (inner.bounds.top + 2) as f64);
+        assert_eq!(hit, Some(path), "the frame is selected, not its button");
+        assert_eq!(d.doc.root().children.len(), before + 1, "the form gained only the frame, not its button");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -3756,9 +4061,19 @@ mod datamodule_build_tests {
         let lcl = pascoda_fpc::lcl::Lcl::find(&dir).expect("vendor/lazarus is needed");
         let built = pascoda_fpc::lcl::build_gui(&dir.join("hello.lpr"), pascoda_fpc::Mode::ObjFpc, &lcl).unwrap();
         assert!(built.success, "the project does not build:\n{}", built.raw_output);
-        let mut child = std::process::Command::new(dir.join("hello")).spawn().unwrap();
+        let log = dir.join("run.log");
+        let mut child = std::process::Command::new(dir.join("hello"))
+            .stdout(std::fs::File::create(&log).unwrap())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_secs(3));
-        assert!(child.try_wait().unwrap().is_none(), "the program ended: the data module or the form did not load");
+        let status = child.try_wait().unwrap();
+        assert!(
+            status.is_none(),
+            "the program ended ({status:?}): the data module or the form did not load\n{}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
         let _ = child.kill();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3854,6 +4169,91 @@ mod database_form_tests {
         std::thread::sleep(std::time::Duration::from_secs(3));
         assert!(child.try_wait().unwrap().is_none(), "the program ended: the grid or the connector did not load");
         let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TDBEdit and TDBNavigator (the LCL's DBCtrls) are bound to a data source of the form from the
+    /// inspector: the choices are the form's `TDataSource` components, the binding is one undo step, a
+    /// renamed data source keeps its controls and a deleted one unbinds them.
+    #[test]
+    fn data_controls_are_bound_to_a_data_source_of_the_form() {
+        let dir = database_form("database-binding");
+        let mut d = Designer::open(&dir.join("unit1.pas")).unwrap();
+        assert_eq!(Designer::data_binding("TDBEdit"), Some(true));
+        assert_eq!(Designer::data_binding("TDBNavigator"), Some(false));
+        assert_eq!(Designer::data_binding("TEdit"), None);
+        assert!(d.data_sources().is_empty());
+        let source = d.add_component("TDataSource", &[], 0, 0).unwrap();
+        let edit = d.add_component("TDBEdit", &[], 16, 16).unwrap();
+        let nav = d.add_component("TDBNavigator", &[], 16, 56).unwrap();
+        assert_eq!(d.data_sources(), ["DataSource1"]);
+        let value = |d: &Designer, p: &[usize], n: &str| d.doc.component(p).and_then(|c| c.prop(n)).cloned();
+
+        d.set_data_source(&edit, Some("DataSource1")).unwrap();
+        d.set_data_source(&nav, Some("DataSource1")).unwrap();
+        d.set_data_field(&edit, "name").unwrap();
+        assert_eq!(value(&d, &edit, "DataSource"), Some(PropValue::Ident("DataSource1".into())));
+        assert_eq!(value(&d, &edit, "DataField"), Some(PropValue::Str("name".into())));
+        let text = d.doc.source().to_string();
+        assert!(text.contains("DataSource = DataSource1") && text.contains("DataField = 'name'"), "{text}");
+
+        // one undo step each
+        d.set_data_source(&nav, None).unwrap();
+        assert_eq!(value(&d, &nav, "DataSource"), None);
+        d.undo();
+        assert_eq!(value(&d, &nav, "DataSource"), Some(PropValue::Ident("DataSource1".into())));
+        d.set_data_field(&edit, "").unwrap();
+        assert_eq!(value(&d, &edit, "DataField"), None);
+
+        // renaming the data source follows; deleting it unbinds
+        d.select(source.clone());
+        d.rename_selected("Customers").unwrap();
+        assert_eq!(value(&d, &edit, "DataSource"), Some(PropValue::Ident("Customers".into())));
+        d.select(vec![d.doc.root().children.iter().position(|c| c.name == "Customers").unwrap()]);
+        d.delete_selected().unwrap();
+        assert!(!d.doc.source().contains("DataSource ="), "{}", d.doc.source());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A form with a TDBEdit and a TDBNavigator bound to a SQLite query through a data source, built with
+    /// the LCL: the program starts and stays up (the controls load and attach to the open dataset).
+    #[test]
+    fn bound_data_controls_build_and_the_program_starts() {
+        let _fpc = crate::FPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = database_form("database-controls-build");
+        std::fs::write(
+            dir.join("unit1.pas"),
+            "unit unit1;\n\n{$mode objfpc}{$H+}\n\ninterface\n\nuses\n  Classes, SysUtils, Forms, Controls, Graphics, Dialogs, StdCtrls, DBCtrls, DB, sqldb, sqlite3conn;\n\ntype\n  TForm1 = class(TForm)\n    DBEdit1: TDBEdit;\n    DBNavigator1: TDBNavigator;\n    DataSource1: TDataSource;\n    SQLQuery1: TSQLQuery;\n    SQLTransaction1: TSQLTransaction;\n    SQLConnector1: TSQLConnector;\n  end;\n\nvar\n  Form1: TForm1;\n\nimplementation\n\n{$R *.lfm}\n\nend.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("unit1.lfm"),
+            "object Form1: TForm1\n  Left = 300\n  Height = 160\n  Top = 200\n  Width = 400\n  Caption = 'Form1'\n  object DBEdit1: TDBEdit\n    Left = 16\n    Height = 23\n    Top = 16\n    Width = 200\n    DataField = 'name'\n    DataSource = DataSource1\n  end\n  object DBNavigator1: TDBNavigator\n    Left = 16\n    Height = 25\n    Top = 56\n    Width = 241\n    DataSource = DataSource1\n  end\n  object SQLConnector1: TSQLConnector\n    Connected = True\n    ConnectorType = 'SQLite3'\n    DatabaseName = ':memory:'\n    Transaction = SQLTransaction1\n    Left = 40\n    Top = 100\n  end\n  object SQLTransaction1: TSQLTransaction\n    Active = True\n    Database = SQLConnector1\n    Left = 96\n    Top = 100\n  end\n  object SQLQuery1: TSQLQuery\n    Active = True\n    Database = SQLConnector1\n    Transaction = SQLTransaction1\n    SQL.Strings = (\n      'select 1 as id, ''ada'' as name'\n    )\n    Left = 152\n    Top = 100\n  end\n  object DataSource1: TDataSource\n    DataSet = SQLQuery1\n    Left = 208\n    Top = 100\n  end\nend\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("hello.lpr"),
+            "program hello;\n\n{$mode objfpc}{$H+}\n\nuses\n  Interfaces, Forms, unit1;\n\nbegin\n  Application.Initialize;\n  Application.CreateForm(TForm1, Form1);\n  Application.Run;\nend.\n",
+        )
+        .unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let lcl = pascoda_fpc::lcl::Lcl::find(&dir).expect("vendor/lazarus is needed");
+        let built = pascoda_fpc::lcl::build_gui(&dir.join("hello.lpr"), pascoda_fpc::Mode::ObjFpc, &lcl).unwrap();
+        assert!(built.success, "the project does not build:\n{}", built.raw_output);
+        let log = dir.join("run.log");
+        let mut child = std::process::Command::new(dir.join("hello"))
+            .stdout(std::fs::File::create(&log).unwrap())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let status = child.try_wait().unwrap();
+        let _ = child.kill();
+        assert!(
+            status.is_none(),
+            "the program ended ({status:?}): the controls or the dataset did not load\n{}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

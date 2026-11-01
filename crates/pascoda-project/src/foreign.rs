@@ -36,6 +36,8 @@ pub struct Foreign {
     pub mode: Option<Mode>,
     /// Switches passed on as written (`-O2`, `-Cr`, `-gh`).
     pub switches: Vec<String>,
+    /// The packages the project requires (`RequiredPackages` of an `.lpi`), by name: LCL, LazControls, ...
+    pub required: Vec<String>,
     /// Entries that were left out, as written: macros, Windows-only defines, and options that
     /// Pascoda sets itself (`-M` modes, `-FU` output folders).
     pub skipped: Vec<String>,
@@ -57,6 +59,7 @@ impl Foreign {
             unit_output: None,
             mode: None,
             switches: Vec::new(),
+            required: Vec::new(),
             skipped: Vec::new(),
         }
     }
@@ -193,6 +196,20 @@ pub fn parse_lpi(xml: &str, file: &Path) -> Result<Foreign, String> {
         .find(|n| n.has_tag_name("Unit0") && n.parent().is_some_and(|p| p.has_tag_name("Units")));
     if let Some(name) = main.and_then(|u| child_value(u, "Filename")) {
         f.main = resolve(dir, name, &mut f.skipped);
+    }
+    // <RequiredPackages><Item1><PackageName Value="LazControls"/></Item1>...
+    if let Some(required) = doc.descendants().find(|n| n.has_tag_name("RequiredPackages")) {
+        for name in required
+            .descendants()
+            .filter(|n| n.has_tag_name("PackageName"))
+            .filter_map(|n| n.attribute("Value"))
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
+            if !f.required.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+                f.required.push(name.to_string());
+            }
+        }
     }
     if let Some(paths) = doc.descendants().find(|n| n.has_tag_name("SearchPaths")) {
         if let Some(list) = child_value(paths, "OtherUnitFiles") {

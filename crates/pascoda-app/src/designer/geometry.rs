@@ -97,6 +97,24 @@ pub fn default_size(class: &str) -> (i64, i64) {
         "ttreeview" => (100, 100),
         "ttoolbar" => (100, 26),
         "tstatusbar" => (100, 23),
+        // The rest of the LCL's palette. Sizes the LCL sets (the edit buttons 80 + 23, the calendar, the pair
+        // splitter, the arrow) are exact; the others follow the base class the LCL gives them.
+        "teditbutton" | "tdateedit" | "ttimeedit" | "tcalcedit" | "tfilenameedit" | "tdirectoryedit"
+        | "tdbdateedit" => (103, 23),
+        "tcalendar" | "tdbcalendar" => (220, 190),
+        "tpairsplitter" => (90, 90),
+        "tarrow" => (20, 20),
+        "tcolorbutton" => (75, 25),
+        "tfloatspinedit" => (50, 23),
+        "tcomboboxex" | "tcheckcombobox" | "tfiltercombobox" => (100, 23),
+        "tchecklistbox" | "tcolorlistbox" | "tfilelistbox" => (100, 50),
+        "tstringgrid" | "tdrawgrid" | "tvaluelisteditor" | "tshelltreeview" => (100, 100),
+        "tshelllistview" => (250, 150),
+        "tscrollbox" | "tflowpanel" | "tcontrolbar" | "tdbgroupbox" => (185, 105),
+        "ttabcontrol" | "tnotebook" => (200, 150),
+        "tcoolbar" => (100, 30),
+        "tpaintbox" => (75, 50),
+        "tbuttonpanel" => (200, 50),
         _ => (80, 25),
     }
 }

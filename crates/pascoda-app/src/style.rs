@@ -129,6 +129,7 @@ pub enum Icon {
     StepOver,
     StepInto,
     StepOut,
+    RunToCursor,
     Files,
     Stack,
     Filter,
@@ -232,6 +233,13 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             line(p(0.0, 0.3), p(0.0, -0.8));
             line(p(-0.4, -0.4), p(0.0, -0.8));
             line(p(0.4, -0.4), p(0.0, -0.8));
+        }
+        Icon::RunToCursor => {
+            // A line (the caret's line) with an arrow coming down onto it.
+            line(p(-0.8, 0.7), p(0.8, 0.7));
+            line(p(0.0, -0.8), p(0.0, 0.35));
+            line(p(-0.4, 0.0), p(0.0, 0.35));
+            line(p(0.4, 0.0), p(0.0, 0.35));
         }
         Icon::Files => {
             let page = Rect::from_min_max(p(-0.6, -0.85), p(0.6, 0.85));
@@ -399,9 +407,11 @@ pub fn dialog<R>(
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) {
     let pal = Palette::of(ctx);
+    // A little lighter than the window behind it, so the dialog lifts off the page.
+    let fill = if pal.dark { rgb(0x26, 0x26, 0x2B) } else { Color32::WHITE }; //rgb(0x26, 0x26, 0x2B), rgb(0x2E, 0x2E, 0x33)
     let frame = egui::Frame::new()
-        .fill(pal.chrome)
-        .stroke(Stroke::new(1.0, pal.separator))
+        .fill(fill)
+        .stroke(Stroke::new(1.0, if pal.dark { rgb(0x4A, 0x4A, 0x50) } else { pal.separator }))
         .corner_radius(10)
         .inner_margin(egui::Margin::same(18))
         .shadow(egui::epaint::Shadow {
@@ -410,20 +420,86 @@ pub fn dialog<R>(
             spread: 0,
             color: Color32::from_black_alpha(if pal.dark { 140 } else { 55 }),
         });
-    egui::Window::new(title.unwrap_or(id))
-        .title_bar(false)
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
+    // Modal: a backdrop covers the app and the widgets behind it neither click nor take keys.
+    egui::Modal::new(egui::Id::NULL.with(("dialog", id)))
         .frame(frame)
+        .backdrop_color(Color32::from_black_alpha(if pal.dark { 110 } else { 50 }))
         .show(ctx, |ui| {
             ui.set_width(width);
+            // Input fields sit darker than the dialog around them.
+            ui.visuals_mut().extreme_bg_color = if pal.dark { rgb(0x1B, 0x1B, 0x1F) } else { rgb(0xEE, 0xEE, 0xF0) };
             if let Some(t) = title {
                 ui.label(egui::RichText::new(t).size(15.0).strong().color(pal.text));
                 ui.add_space(10.0);
+                // A rule under the title, edge to edge of the dialog (through the 18 px margin).
+                let (x, y) = (ui.max_rect(), ui.cursor().top());
+                let line = if pal.dark { rgb(0x4A, 0x4A, 0x50) } else { pal.separator };
+                ui.painter().hline(x.left() - 18.0..=x.right() + 18.0, y, Stroke::new(1.0, line));
+                ui.add_space(12.0);
             }
             add(ui)
         });
+}
+
+/// A dialog button drawn like a macOS push button: `fill`/`hover` behind `fg` text.
+fn push_button(ui: &mut egui::Ui, text: &str, enabled: bool, fill: [Color32; 3], stroke: Color32, fg: Color32, bold: bool) -> egui::Response {
+    ui.scope(|ui| {
+        let w = &mut ui.visuals_mut().widgets;
+        for (state, f) in [(&mut w.inactive, fill[0]), (&mut w.hovered, fill[1]), (&mut w.active, fill[2])] {
+            state.weak_bg_fill = f;
+            state.bg_fill = f;
+            state.bg_stroke = Stroke::new(1.0, stroke);
+            state.fg_stroke = Stroke::new(1.0, fg);
+            state.corner_radius = egui::CornerRadius::same(6);
+        }
+        let mut label = egui::RichText::new(text).color(fg);
+        if bold {
+            label = label.strong();
+        }
+        ui.add_enabled(enabled, egui::Button::new(label).min_size(vec2(72.0, 24.0)))
+    })
+    .inner
+}
+
+/// A row of dialog buttons against the right edge. Add the main button first: it ends up rightmost,
+/// the others to its left, as in a macOS dialog.
+pub fn buttons<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.horizontal(|ui| ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add).inner).inner
+}
+
+/// The main button of a dialog (Save, Export, Done): macOS blue with white text.
+pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    primary_button_enabled(ui, true, text)
+}
+
+pub fn primary_button_enabled(ui: &mut egui::Ui, enabled: bool, text: &str) -> egui::Response {
+    let pal = Palette::of(ui.ctx());
+    let a = pal.accent;
+    let (hover, active) = if pal.dark {
+        (rgb(0x3D, 0x95, 0xFF), rgb(0x00, 0x6F, 0xE0))
+    } else {
+        (rgb(0x2F, 0x8C, 0xFF), rgb(0x00, 0x62, 0xD6))
+    };
+    let fg = if enabled { Color32::WHITE } else { Color32::from_white_alpha(170) };
+    push_button(ui, text, enabled, [a, hover, active], a, fg, true)
+}
+
+/// A button that destroys something (Move to Trash): macOS red with white text, the same size as the others.
+pub fn destructive_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let red = rgb(0xFF, 0x3B, 0x30);
+    let (hover, active) = (rgb(0xFF, 0x5E, 0x55), rgb(0xD7, 0x00, 0x15));
+    push_button(ui, text, true, [red, hover, active], red, Color32::WHITE, true)
+}
+
+/// The other buttons of a dialog (Cancel, Close): dark grey in dark mode, white with a hairline in light mode.
+pub fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let pal = Palette::of(ui.ctx());
+    let (fill, stroke) = if pal.dark {
+        ([rgb(0x5A, 0x5A, 0x5E), rgb(0x68, 0x68, 0x6C), rgb(0x4A, 0x4A, 0x4E)], rgb(0x6E, 0x6E, 0x72))
+    } else {
+        ([rgb(0xFF, 0xFF, 0xFF), rgb(0xF2, 0xF2, 0xF4), rgb(0xE4, 0xE4, 0xE7)], rgb(0xC9, 0xC9, 0xCE))
+    };
+    push_button(ui, text, true, fill, stroke, pal.text, false)
 }
 
 pub fn pill<R>(ui: &mut egui::Ui, pal: &Palette, add: impl FnOnce(&mut egui::Ui) -> R) -> R {

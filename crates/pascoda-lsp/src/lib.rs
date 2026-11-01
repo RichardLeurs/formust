@@ -20,11 +20,16 @@ pub struct Config {
     pub lazarus_src: PathBuf,
 }
 
+/// Where the `pasls` of a Mac of CPU `arch` is, relative to the `vendor` folder (`pasls/dist/aarch64-darwin/pasls`).
+pub fn pasls_dist(arch: &str) -> String {
+    format!("pasls/dist/{arch}-darwin/pasls")
+}
+
 impl Config {
-    /// Looks for `vendor/pasls/dist/aarch64-darwin/pasls` in the folders the builds search too
+    /// Looks for this Mac's `vendor/pasls/dist/<cpu>-darwin/pasls` in the folders the builds search too
     /// (`pascoda_fpc::lcl::search_dirs`): `start` and its parents, `$PASCODA_HOME`, the app bundle's
-    /// `Resources`, the user's `Application Support/Pascoda` folder, and (debug builds only) the
-    /// source tree this crate was built from.
+    /// `Resources`, the user's `Application Support/Pascoda` folder, and last the source tree this
+    /// crate was built from.
     pub fn find(start: &Path) -> Option<Self> {
         let dirs = pascoda_fpc::lcl::search_dirs(start);
         // `pasls` needs the compiler's path (`PP`); wherever fpc is installed, not only Homebrew.
@@ -35,7 +40,7 @@ impl Config {
     fn find_in<'a>(dirs: impl Iterator<Item = &'a Path>, fpc: &Path) -> Option<Self> {
         dirs.into_iter().find_map(|dir| {
             let vendor = dir.join("vendor");
-            let pasls = vendor.join("pasls/dist/aarch64-darwin/pasls");
+            let pasls = vendor.join(pasls_dist(std::env::consts::ARCH));
             (pasls.exists() && fpc.exists()).then(|| Self {
                 pasls,
                 fpc: fpc.to_path_buf(),
@@ -227,7 +232,7 @@ impl Client {
             .env("LAZARUSDIR", &config.lazarus_src)
             .env("PP", &config.fpc)
             .env("FPCTARGET", "darwin")
-            .env("FPCTARGETCPU", "aarch64")
+            .env("FPCTARGETCPU", std::env::consts::ARCH)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -583,6 +588,19 @@ impl Client {
         }
     }
 
+    /// Formats the file at `path` with the server's JCF (Jedi Code Format), using its default settings.
+    /// The server rewrites the file ON DISK and sends no edits, so the text open in an editor must be
+    /// saved first and read again afterwards; the server's own copy is stale until the next `sync`.
+    pub fn format_file(&mut self, path: &Path) -> Result<(), String> {
+        // Arguments: the file and a settings file (none: the defaults).
+        self.request(
+            "workspace/executeCommand",
+            json!({"command": "pasls.formatCode", "arguments": [uri(path), ""]}),
+        )?;
+        self.texts.remove(path);
+        Ok(())
+    }
+
     pub fn stop(&mut self) {
         let _ = self.request("shutdown", Value::Null);
         let _ = self.notify("exit", Value::Null);
@@ -660,7 +678,7 @@ mod tests {
     #[test]
     fn find_in_checks_each_directory_in_order() {
         let tmp = std::env::temp_dir().join(format!("pascoda-lsp-find-{}", std::process::id()));
-        let bin = tmp.join("home/vendor/pasls/dist/aarch64-darwin");
+        let bin = tmp.join("home/vendor").join(pasls_dist(std::env::consts::ARCH)).parent().unwrap().to_path_buf();
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(bin.join("pasls"), "").unwrap();
         let fpc = tmp.join("fpc");

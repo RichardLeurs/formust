@@ -5,6 +5,7 @@ pub mod imports;
 pub mod lpk;
 pub mod packages;
 pub mod program;
+pub mod tools;
 
 use pascoda_fpc::Mode;
 use std::path::{Path, PathBuf};
@@ -279,6 +280,29 @@ pub fn save_output(root: &Path, output: &str) -> std::io::Result<()> {
     set_key(root, "output", output.trim())
 }
 
+/// The `lazarus` key of `pascoda.toml`: the Lazarus source folder whose LCL builds this project, for a project made
+/// with another Lazarus than the one Pascoda ships. A relative path is from the project's folder. `None` when it is
+/// not set (the bundled Lazarus is used).
+pub fn load_lazarus(root: &Path) -> Option<PathBuf> {
+    let v = get_key(root, "lazarus")?;
+    let v = v.trim();
+    if v.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(v);
+    Some(if p.is_absolute() { p } else { root.join(p) })
+}
+
+/// The `lazarus` key as written (what the Project Options window shows).
+pub fn load_lazarus_text(root: &Path) -> String {
+    get_key(root, "lazarus").map(|s| s.trim().to_string()).unwrap_or_default()
+}
+
+/// Sets the `lazarus` key (an empty value removes it), keeping the other lines.
+pub fn save_lazarus(root: &Path, folder: &str) -> std::io::Result<()> {
+    set_key(root, "lazarus", folder.trim())
+}
+
 /// The executable a build of `source` writes and the app runs: the `output` of `pascoda.toml` in
 /// the source's folder when it is set, else what the project file says, else the source's name
 /// without its extension (`foreign::executable_of`).
@@ -364,6 +388,12 @@ pub struct ExportSettings {
     pub version: String,
     /// A `.icns` or `.png`, absolute or relative to the project folder.
     pub icon: String,
+    /// `arm64` or `universal` (Apple Silicon and Intel); windows; empty = `arm64`. Stored as `export_arch`.
+    pub arch: String,
+    /// The oldest macOS, like `14.0`; empty = the default. Stored as `min_macos`.
+    pub min_macos: String,
+    /// The oldest Windows, like `6.1` (Windows 7) or `10.0`; empty = the compiler's. Stored as `min_windows`.
+    pub min_windows: String,
 }
 
 pub fn load_export(root: &Path) -> ExportSettings {
@@ -373,6 +403,9 @@ pub fn load_export(root: &Path) -> ExportSettings {
         bundle_id: g("bundle_id"),
         version: g("version"),
         icon: g("icon"),
+        arch: g("export_arch"),
+        min_macos: g("min_macos"),
+        min_windows: g("min_windows"),
     }
 }
 
@@ -380,7 +413,10 @@ pub fn save_export(root: &Path, s: &ExportSettings) -> std::io::Result<()> {
     set_key(root, "app_name", s.app_name.trim())?;
     set_key(root, "bundle_id", s.bundle_id.trim())?;
     set_key(root, "version", s.version.trim())?;
-    set_key(root, "icon", s.icon.trim())
+    set_key(root, "icon", s.icon.trim())?;
+    set_key(root, "min_macos", s.min_macos.trim())?;
+    set_key(root, "min_windows", s.min_windows.trim())?;
+    set_key(root, "export_arch", s.arch.trim())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -560,6 +596,30 @@ fn unit_numbers_in(root: &Path) -> std::collections::HashSet<u32> {
     out
 }
 
+/// Creates the next frame pair in `dir`: `unitN.pas` (a unit for `TFrameN`) and `unitN.lfm` (its frame),
+/// numbered like the forms. A frame has no global variable and is not created by the program: forms
+/// place it. Returns the unit file.
+pub fn new_frame_unit(dir: &Path, root: &Path) -> std::io::Result<PathBuf> {
+    let taken = unit_numbers_in(root);
+    let n = (1..)
+        .find(|n| !taken.contains(n) && !dir.join(format!("unit{n}.pas")).exists() && !dir.join(format!("unit{n}.lfm")).exists())
+        .expect("a free number exists");
+    let pas = dir.join(format!("unit{n}.pas"));
+    std::fs::write(&pas, frame_unit_source(n))?;
+    std::fs::write(dir.join(format!("unit{n}.lfm")), frame_lfm_source(n))?;
+    Ok(pas)
+}
+
+fn frame_unit_source(n: u32) -> String {
+    format!(
+        "unit Unit{n};\n\n{{$mode objfpc}}{{$H+}}\n\ninterface\n\nuses\n  Classes, SysUtils, Forms, Controls, Graphics, Dialogs, StdCtrls;\n\ntype\n  TFrame{n} = class(TFrame)\n  end;\n\nimplementation\n\n{{$R *.lfm}}\n\nend.\n"
+    )
+}
+
+fn frame_lfm_source(n: u32) -> String {
+    format!("object Frame{n}: TFrame{n}\n  Left = 0\n  Height = 240\n  Top = 0\n  Width = 320\n  ClientHeight = 240\n  ClientWidth = 320\nend\n")
+}
+
 fn form_unit_source(n: u32) -> String {
     format!(
         "unit Unit{n};\n\n{{$mode objfpc}}{{$H+}}\n\ninterface\n\nuses\n  Classes, SysUtils, Forms, Controls, Graphics, Dialogs, StdCtrls;\n\ntype\n  TForm{n} = class(TForm)\n  end;\n\nvar\n  Form{n}: TForm{n};\n\nimplementation\n\n{{$R *.lfm}}\n\nend.\n"
@@ -597,6 +657,24 @@ const UNIT1_LFM: &str = "object Form1: TForm1\n  Left = 300\n  Height = 300\n  T
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_frame_is_a_unit_for_a_tframe_descendant_with_no_global_variable() {
+        let d = std::env::temp_dir().join(format!("pascoda-new-frame-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let form = new_form_unit(&d, &d).unwrap();
+        let frame = new_frame_unit(&d, &d).unwrap();
+        assert_eq!(frame, d.join("unit2.pas"), "numbered after the form");
+        let pas = std::fs::read_to_string(&frame).unwrap();
+        assert!(pas.contains("TFrame2 = class(TFrame)") && pas.contains("{$R *.lfm}"), "{pas}");
+        assert!(!pas.contains("var\n"), "a frame has no global variable: {pas}");
+        let lfm = std::fs::read_to_string(d.join("unit2.lfm")).unwrap();
+        assert!(lfm.starts_with("object Frame2: TFrame2\n") && lfm.contains("ClientWidth = 320"), "{lfm}");
+        assert_ne!(form, frame);
+        assert_eq!(new_frame_unit(&d, &d).unwrap(), d.join("unit3.pas"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn new_form_units_take_the_next_free_number() {
@@ -787,6 +865,24 @@ mod export_tests {
     use super::*;
 
     #[test]
+    fn the_lazarus_folder_is_kept_in_pascoda_toml_and_a_relative_one_is_from_the_project() {
+        let d = std::env::temp_dir().join(format!("pascoda-lazarus-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(load_lazarus(&d), None);
+        save_mode(&d, Mode::Delphi).unwrap();
+        save_lazarus(&d, "  /opt/lazarus ").unwrap();
+        assert_eq!(load_lazarus(&d), Some(PathBuf::from("/opt/lazarus")));
+        save_lazarus(&d, "../lazarus").unwrap();
+        assert_eq!(load_lazarus(&d), Some(d.join("../lazarus")));
+        assert_eq!(load_mode(&d), Mode::Delphi, "the other lines stay");
+        save_lazarus(&d, "").unwrap();
+        assert_eq!(load_lazarus(&d), None);
+        assert_eq!(std::fs::read_to_string(d.join(SETTINGS_FILE)).unwrap(), "mode = \"delphi\"\n");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn export_settings_round_trip_beside_the_mode() {
         let d = std::env::temp_dir().join(format!("pascoda-exp-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
@@ -797,6 +893,9 @@ mod export_tests {
             bundle_id: "com.example.notes".into(),
             version: "1.2".into(),
             icon: "art/icon.png".into(),
+            arch: "universal".into(),
+            min_macos: "13.0".into(),
+            min_windows: "6.1".into(),
         };
         save_export(&d, &s).unwrap();
         assert_eq!(load_export(&d), s);

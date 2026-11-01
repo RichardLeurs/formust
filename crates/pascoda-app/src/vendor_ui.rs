@@ -87,11 +87,11 @@ impl App {
             }
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                if ui.button("Close").clicked() {
+                if crate::style::secondary_button(ui, "Close").clicked() {
                     close = true;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add_enabled(command.is_some(), egui::Button::new("Install in Terminal")).clicked() {
+                    if crate::style::primary_button_enabled(ui, command.is_some(), "Install in Terminal").clicked() {
                         install = true;
                     }
                 });

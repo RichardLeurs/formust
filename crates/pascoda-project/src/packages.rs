@@ -136,6 +136,9 @@ pub struct Resolution {
     /// The packages resolved, by name.
     pub packages: Vec<String>,
     pub missing: Vec<String>,
+    /// What the build did that the user should know: a Lazarus package the project carries a copy of was taken from
+    /// the Lazarus in use instead.
+    pub notes: Vec<String>,
 }
 
 /// Resolves the requirements of the packages in `folder`, and of the packages they require in turn.
@@ -159,6 +162,16 @@ pub fn resolve_with(folder: &Path, imported: &[PathBuf]) -> Resolution {
             queue.extend(p.requires);
         }
     }
+    // The packages the project itself requires (`RequiredPackages` of its `.lpi`).
+    if let Some(project) = crate::foreign::find(folder).and_then(|f| crate::foreign::read(&f).ok()) {
+        queue.extend(project.required);
+    }
+    let lazarus = lazarus_in_use(folder);
+    let lazarus_packages: std::cell::OnceCell<BTreeMap<String, PathBuf>> = std::cell::OnceCell::new();
+    let from_lazarus = |key: &str| -> Option<PathBuf> {
+        let dir = lazarus.as_ref()?;
+        lazarus_packages.get_or_init(|| index(&dir.join("components"))).get(key).cloned()
+    };
     // A project that names a vendored library (database components, FPCUnit tests) needs its units on
     // the path, whether or not a package asks for them.
     for key in needed_vendored(folder) {
@@ -184,17 +197,47 @@ pub fn resolve_with(folder: &Path, imported: &[PathBuf]) -> Resolution {
         if !seen.insert(key.clone()) || BUILT_IN.iter().any(|b| b.eq_ignore_ascii_case(&name)) {
             continue;
         }
-        let Some(file) = known.get(&key) else {
+        // A copy of one of Lazarus's own packages in the project was made for the Lazarus it came from; the LCL in use
+        // comes from another one, and the two can disagree (a renamed field). The Lazarus in use has its own copy, which
+        // matches its LCL: that one is taken.
+        let in_project = known.get(&key).cloned();
+        let file = match in_project {
+            Some(f) if is_lazarus_copy(&f) && !lazarus.as_ref().is_some_and(|l| f.starts_with(l)) => match from_lazarus(&key) {
+                Some(own) => {
+                    out.notes.push(format!(
+                        "{name}: the Lazarus in use has its own, so it is used instead of the copy in {} (made for another Lazarus)",
+                        f.parent().unwrap_or(&f).display()
+                    ));
+                    Some(own)
+                }
+                None => Some(f),
+            },
+            Some(f) => Some(f),
+            None => None,
+        };
+        let Some(file) = file else {
             let dirs = vendored(folder, &key);
-            if dirs.is_empty() {
-                out.missing.push(name);
-            } else {
+            if !dirs.is_empty() {
                 out.packages.push(name.clone());
                 out.unit_paths.extend(dirs);
+                continue;
             }
+            // Lazarus's own packages (LazControls, ...) come from the Lazarus in use, next to its LCL.
+            let Some(own) = from_lazarus(&key) else {
+                out.missing.push(name);
+                continue;
+            };
+            let Some(p) = read(&own) else { continue };
+            out.packages.push(p.name.clone());
+            out.unit_paths.extend(p.unit_paths.iter().cloned());
+            if let Some(dir) = own.parent() {
+                out.unit_paths.push(dir.to_path_buf());
+            }
+            out.include_paths.extend(p.include_paths.iter().cloned());
+            queue.extend(p.requires);
             continue;
         };
-        let Some(p) = read(file) else { continue };
+        let Some(p) = read(&file) else { continue };
         out.packages.push(p.name.clone());
         if let Some(dir) = file.parent() {
             out.unit_paths.push(dir.to_path_buf());
@@ -212,12 +255,23 @@ pub fn resolve_with(folder: &Path, imported: &[PathBuf]) -> Resolution {
     out
 }
 
+/// The Lazarus source tree whose LCL builds the project in `folder`: the one its `pascoda.toml` names, a tree it lies in,
+/// else the vendored one (see `pascoda_fpc::lcl::Lcl::find_in`).
+fn lazarus_in_use(folder: &Path) -> Option<PathBuf> {
+    pascoda_fpc::lcl::Lcl::find_in(folder, crate::load_lazarus(folder).as_deref()).map(|l| l.lazarus_dir)
+}
+
+/// Whether the package file is one of Lazarus's own (its author is the Lazarus Team).
+fn is_lazarus_copy(file: &Path) -> bool {
+    std::fs::read_to_string(file).is_ok_and(|t| t.contains("Author Value=\"Lazarus Team\""))
+}
+
 /// The vendored libraries a project needs, found by the names its Pascal units, programs and forms
 /// use (`fcl-db` for database components; FPCUnit with the libraries its console runner uses).
 pub fn needed_vendored(folder: &Path) -> Vec<&'static str> {
     const NEEDS: &[(&[&str], &[&str])] = &[
         (
-            &["tdbgrid", "dbgrids", "dbctrls", "tdatasource", "tdataset", "tbufdataset", "tsqlconnector", "tsqlite3connection", "tsqlquery"],
+            &["tdbgrid", "dbgrids", "dbctrls", "tdatasource", "tdataset", "tbufdataset", "tmemdataset", "tdbf", "tsqlconnector", "tsqlite3connection", "tsqlquery"],
             &["fcl-db"],
         ),
         (&["fpcunit", "consoletestrunner"], &["fcl-fpcunit", "fcl-base", "fcl-xml"]),
@@ -386,6 +440,18 @@ mod database_path_tests {
     }
 
     #[test]
+    fn the_in_memory_and_file_datasets_need_the_database_units() {
+        let dir = std::env::temp_dir().join(format!("pascoda-dataset-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for class in ["TBufDataset", "TMemDataset", "TDbf"] {
+            std::fs::write(dir.join("unit1.lfm"), format!("object Form1: TForm1\n  object Data1: {class}\n  end\nend\n")).unwrap();
+            assert!(mentions_database(&dir), "{class} should bring in fcl-db");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_project_that_names_fpcunit_gets_the_test_libraries() {
         let dir = std::env::temp_dir().join(format!("pascoda-fpcunit-path-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -414,6 +480,109 @@ mod database_path_tests {
         }
         assert!(resolve_with(&db, &[]).unit_paths.iter().any(|d| d.ends_with("sqldb/sqlite")));
         assert!(!resolve_with(&plain, &[]).unit_paths.iter().any(|d| d.ends_with("sqldb/sqlite")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod required_packages_tests {
+    use super::*;
+
+    fn lpk(name: &str, author: &str, requires: &[&str]) -> String {
+        let reqs: String = requires
+            .iter()
+            .enumerate()
+            .map(|(i, r)| format!("<Item{}><PackageName Value=\"{r}\"/></Item{}>", i + 1, i + 1))
+            .collect();
+        format!(
+            "<?xml version=\"1.0\"?>\n<CONFIG><Package Version=\"5\"><Name Value=\"{name}\"/><Author Value=\"{author}\"/><RequiredPkgs Count=\"{}\">{reqs}</RequiredPkgs></Package></CONFIG>\n",
+            requires.len()
+        )
+    }
+
+    /// A scratch project (`app`, with an `.lpi` that requires `required`) next to a fake Lazarus source tree
+    /// (`laz`) that has a `LazControls` package, and the project's `pascoda.toml` naming that tree.
+    fn setup(name: &str, required: &[&str]) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("pascoda-required-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let laz = base.join("laz");
+        for d in ["lcl/interfaces/cocoa", "components/lazutils", "components/lazcontrols"] {
+            std::fs::create_dir_all(laz.join(d)).unwrap();
+        }
+        std::fs::write(laz.join("components/lazcontrols/lazcontrols.lpk"), lpk("LazControls", "Lazarus Team", &["LCL", "LazUtils"])).unwrap();
+        let app = base.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        let items: String = required
+            .iter()
+            .enumerate()
+            .map(|(i, r)| format!("<Item{}><PackageName Value=\"{r}\"/></Item{}>", i + 1, i + 1))
+            .collect();
+        std::fs::write(
+            app.join("app.lpi"),
+            format!("<CONFIG><ProjectOptions><Units Count=\"1\"><Unit0><Filename Value=\"app.lpr\"/></Unit0></Units></ProjectOptions><RequiredPackages Count=\"{}\">{items}</RequiredPackages></CONFIG>", required.len()),
+        )
+        .unwrap();
+        std::fs::write(app.join("app.lpr"), "program app;\nbegin end.\n").unwrap();
+        std::fs::write(app.join("pascoda.toml"), format!("lazarus = \"{}\"\n", laz.display())).unwrap();
+        (base, app)
+    }
+
+    #[test]
+    fn the_required_packages_of_the_lpi_are_followed_and_lazaruss_own_come_from_the_lazarus_in_use() {
+        let (base, app) = setup("own", &["LCL", "LazControls", "SomeoneElsesPackage"]);
+        let r = resolve_with(&app, &[]);
+        assert!(r.packages.contains(&"LazControls".to_string()), "{r:?}");
+        assert!(r.unit_paths.contains(&base.join("laz/components/lazcontrols")), "{:?}", r.unit_paths);
+        assert_eq!(r.missing, ["SomeoneElsesPackage"], "a package nobody has is reported");
+        assert!(r.notes.is_empty(), "{:?}", r.notes);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_copy_of_a_lazarus_package_in_the_project_gives_way_to_the_lazarus_in_use() {
+        let (base, app) = setup("copy", &["LazControls"]);
+        std::fs::create_dir_all(app.join("lazcontrols")).unwrap();
+        std::fs::write(app.join("lazcontrols/lazcontrols.lpk"), lpk("LazControls", "Lazarus Team", &[])).unwrap();
+        let r = resolve_with(&app, &[]);
+        assert!(r.unit_paths.contains(&base.join("laz/components/lazcontrols")), "{:?}", r.unit_paths);
+        assert!(!r.unit_paths.contains(&app.join("lazcontrols")), "the old copy is not on the path: {:?}", r.unit_paths);
+        assert!(r.notes.iter().any(|n| n.contains("LazControls") && n.contains("another Lazarus")), "{:?}", r.notes);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_package_of_the_project_is_found_by_the_lpi_and_a_foreign_copy_is_kept() {
+        let (base, app) = setup("mine", &["Mine", "LazControls"]);
+        std::fs::create_dir_all(app.join("mine")).unwrap();
+        std::fs::write(app.join("mine/mine.lpk"), lpk("Mine", "Me", &[])).unwrap();
+        // a copy of LazControls that is not Lazarus's own (another author) is the project's own package
+        std::fs::create_dir_all(app.join("lazcontrols")).unwrap();
+        std::fs::write(app.join("lazcontrols/lazcontrols.lpk"), lpk("LazControls", "Somebody", &[])).unwrap();
+        let r = resolve_with(&app, &[]);
+        assert!(r.unit_paths.contains(&app.join("mine")), "{:?}", r.unit_paths);
+        assert!(r.unit_paths.contains(&app.join("lazcontrols")), "the project's own package wins: {:?}", r.unit_paths);
+        assert!(!r.unit_paths.contains(&base.join("laz/components/lazcontrols")));
+        assert!(r.missing.is_empty() && r.notes.is_empty(), "{r:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_vendored_lazarus_provides_lazcontrols_when_the_project_names_none() {
+        let base = std::env::temp_dir().join(format!("pascoda-required-vendored-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join("app.lpi"),
+            "<CONFIG><ProjectOptions><Units Count=\"1\"><Unit0><Filename Value=\"app.lpr\"/></Unit0></Units></ProjectOptions><RequiredPackages Count=\"1\"><Item1><PackageName Value=\"LazControls\"/></Item1></RequiredPackages></CONFIG>",
+        )
+        .unwrap();
+        let Some(lcl) = pascoda_fpc::lcl::Lcl::find(&base) else {
+            eprintln!("skipped: no vendor/lazarus");
+            return;
+        };
+        let r = resolve_with(&base, &[]);
+        assert!(r.unit_paths.contains(&lcl.lazarus_dir.join("components/lazcontrols")), "{:?}", r.unit_paths);
+        assert!(r.missing.is_empty(), "{:?}", r.missing);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

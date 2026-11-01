@@ -67,13 +67,14 @@ impl LiveCheck {
         path: PathBuf,
         text: String,
         mode: pascoda_fpc::Mode,
+        lazarus: Option<PathBuf>,
     ) {
         self.checked = Some(key(&path, &text));
         let (tx, rx) = channel();
         self.running = Some(rx);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let lcl = pascoda_fpc::lcl::Lcl::find(&path).filter(|l| !l.needs_build());
+            let lcl = pascoda_fpc::lcl::Lcl::find_in(&path, lazarus.as_deref()).filter(|l| !l.needs_build());
             let mut result = pascoda_fpc::check::check_text(&path, &text, mode, lcl.as_ref());
             if lcl.is_none()
                 && let Ok(d) = &mut result

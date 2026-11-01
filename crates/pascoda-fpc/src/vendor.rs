@@ -22,7 +22,7 @@ pub enum Part {
 
 /// Lazarus commit and FPC tag the IDE was tested with.
 pub const LAZARUS_COMMIT: &str = "2dbcbed8";
-pub const FPC_TAG: &str = "release_3_2_2";
+pub const FPC_TAG: &str = "release_3_2_4_rc2";
 /// The language server revision the IDE was tested with.
 pub const PASLS_COMMIT: &str = "818f633";
 
@@ -55,7 +55,8 @@ impl Part {
             Part::Fpc => fpc_found,
             Part::Lazarus => has(&["lazarus/lcl/interfaces/cocoa"]),
             Part::FpcSources => has(&["fpcsrc/rtl", "fpcsrc/packages/fcl-db/src", "fpcsrc/packages/fcl-fpcunit/src"]),
-            Part::Pasls => has(&["pasls/dist/aarch64-darwin/pasls"]),
+            // This Mac's own pasls: the bundle ships one per CPU.
+            Part::Pasls => has(&[&format!("pasls/dist/{}-darwin/pasls", std::env::consts::ARCH)]),
         }
     }
 }
@@ -156,7 +157,7 @@ mod tests {
         let a = scratch("a");
         let b = scratch("b");
         tree(&a, &["lazarus/lcl/interfaces/cocoa"]);
-        tree(&b, &["fpcsrc/rtl", "fpcsrc/packages/fcl-db/src", "fpcsrc/packages/fcl-fpcunit/src", "pasls/dist/aarch64-darwin/pasls"]);
+        tree(&b, &["fpcsrc/rtl", "fpcsrc/packages/fcl-db/src", "fpcsrc/packages/fcl-fpcunit/src", "pasls/dist/aarch64-darwin/pasls", "pasls/dist/x86_64-darwin/pasls"]);
         let dirs = [a.clone(), b.clone()];
         assert!(missing_in(&dirs, true).is_empty(), "{:?}", missing_in(&dirs, true));
         assert_eq!(missing_in(&[a.clone()], true), [Part::FpcSources, Part::Pasls]);

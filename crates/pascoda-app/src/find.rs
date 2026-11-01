@@ -9,6 +9,37 @@ use std::path::PathBuf;
 pub struct Options {
     pub case: bool,
     pub word: bool,
+    /// The query is a regular expression (the `regex` crate's syntax, `$1` in the replacement).
+    pub regex: bool,
+}
+
+/// The regular expression of `query` for `o`, when it is one: a regex query compiles its pattern (an
+/// invalid one matches nothing), and the other modes match the text literally.
+fn compile(query: &str, o: Options) -> Option<regex::Regex> {
+    if query.is_empty() {
+        return None;
+    }
+    let body = if o.regex { query.to_string() } else { regex::escape(query) };
+    let body = if o.word { format!(r"\b(?:{body})\b") } else { body };
+    let pattern = if o.case { body } else { format!("(?i){body}") };
+    regex::Regex::new(&pattern).ok()
+}
+
+/// The character ranges of the non-empty matches of `re` in `text`.
+fn regex_ranges(text: &str, re: &regex::Regex) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let (mut at_byte, mut at_char) = (0usize, 0usize);
+    for m in re.find_iter(text) {
+        if m.is_empty() {
+            continue;
+        }
+        at_char += text[at_byte..m.start()].chars().count();
+        let len = text[m.start()..m.end()].chars().count();
+        out.push(at_char..at_char + len);
+        at_char += len;
+        at_byte = m.end();
+    }
+    out
 }
 
 fn same(a: char, b: char, o: Options) -> bool {
@@ -26,6 +57,9 @@ fn is_word(c: char) -> bool {
 /// The character ranges of every match of `query` in `text`, in order and without overlap. An empty
 /// query matches nothing.
 pub fn matches(text: &str, query: &str, o: Options) -> Vec<Range<usize>> {
+    if o.regex {
+        return compile(query, o).map_or_else(Vec::new, |re| regex_ranges(text, &re));
+    }
     let t: Vec<char> = text.chars().collect();
     let q: Vec<char> = query.chars().collect();
     if q.is_empty() || q.len() > t.len() {
@@ -63,6 +97,24 @@ pub fn step(found: &[Range<usize>], from: usize, forward: bool) -> Option<usize>
 
 /// `text` with every match replaced by `with`, and how many were replaced.
 pub fn replace_all(text: &str, query: &str, with: &str, o: Options) -> (String, usize) {
+    if o.regex {
+        let Some(re) = compile(query, o) else { return (text.to_string(), 0) };
+        let mut out = String::with_capacity(text.len());
+        let mut at = 0;
+        let mut n = 0;
+        for caps in re.captures_iter(text) {
+            let m = caps.get(0).expect("group 0 always matches");
+            if m.is_empty() {
+                continue;
+            }
+            out.push_str(&text[at..m.start()]);
+            caps.expand(with, &mut out);
+            at = m.end();
+            n += 1;
+        }
+        out.push_str(&text[at..]);
+        return (out, n);
+    }
     let found = matches(text, query, o);
     if found.is_empty() {
         return (text.to_string(), 0);
@@ -96,6 +148,19 @@ pub fn replace_one(text: &str, query: &str, o: Options, current: Option<usize>, 
         .filter(|&i| i < found.len())
         .or_else(|| step(&found, caret, true))?;
     let r = found[i].clone();
+    // In regex mode the replacement may name captures ($1), expanded for this match.
+    let with = match (o.regex, compile(query, o)) {
+        (true, Some(re)) => {
+            let start = text.char_indices().nth(r.start).map_or(0, |(b, _)| b);
+            let mut out = String::new();
+            if let Some(caps) = re.captures_at(text, start).filter(|c| c.get(0).is_some_and(|m| m.start() == start)) {
+                caps.expand(with, &mut out);
+            }
+            out
+        }
+        _ => with.to_string(),
+    };
+    let with = with.as_str();
     let new = replace_at(text, r.clone(), with);
     let end = r.start + with.chars().count();
     let next = matches(&new, query, o);
@@ -311,6 +376,16 @@ pub struct ProjectBar {
     /// A search has run, so "no results" is true and not just "nothing typed yet".
     pub searched: bool,
     pub note: String,
+    /// A search is running on its worker thread; the results come when it ends.
+    pub searching: bool,
+}
+
+/// One file changed by Replace All in Project, with its text before and after, for undo.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Change {
+    pub path: PathBuf,
+    pub before: String,
+    pub after: String,
 }
 
 /// The most matches the project search lists.
@@ -383,9 +458,24 @@ pub fn parse_position(input: &str, lines: u32) -> Result<(u32, u32), String> {
 mod tests {
     use super::*;
 
-    const CASE: Options = Options { case: true, word: false };
-    const ANY: Options = Options { case: false, word: false };
-    const WORD: Options = Options { case: false, word: true };
+    const CASE: Options = Options { case: true, word: false, regex: false };
+    const ANY: Options = Options { case: false, word: false, regex: false };
+    const WORD: Options = Options { case: false, word: true, regex: false };
+    const RE: Options = Options { case: false, word: false, regex: true };
+
+    #[test]
+    fn regex_mode_matches_patterns_and_expands_captures() {
+        assert_eq!(matches("a1 b22 c", r"\d+", RE), vec![1..2, 4..6]);
+        assert_eq!(matches("Total TOTAL", "total", RE), vec![0..5, 6..11], "case-insensitive by default");
+        assert_eq!(matches("Total TOTAL", "total", Options { case: true, ..RE }), Vec::<Range<usize>>::new());
+        assert_eq!(matches("x", "(unclosed", RE), Vec::<Range<usize>>::new(), "an invalid pattern matches nothing");
+        assert_eq!(matches("héllo wörld", "w.r", RE), vec![6..9], "character positions, not bytes");
+        assert_eq!(matches("tot total", "tot", Options { word: true, ..RE }), vec![0..3]);
+        assert_eq!(replace_all("foo=1, bar=22", r"(\w+)=(\d+)", "$2:$1", RE), ("1:foo, 22:bar".to_string(), 2));
+        assert_eq!(replace_all("a.b", ".", "-", Options { regex: false, ..RE }), ("a.b".replace('.', "-"), 1), "a literal dot in the plain mode");
+        let one = replace_one("k=7 k=8", r"k=(\d)", RE, None, 0, "v$1").unwrap();
+        assert_eq!(one.text, "v7 k=8", "the first match, with its capture expanded");
+    }
 
     #[test]
     fn finds_every_match_without_overlap_and_respects_case() {

@@ -270,9 +270,11 @@ fn native_frame(class: &str, b: Bounds) -> NSRect {
 }
 
 fn make_control(mtm: MainThreadMarker, class: &str, caption: &str) -> (Control, Retained<NSView>) {
+    // A TDBText has no text of its own (it shows a field's value at run time): show a placeholder.
+    let caption = if caption.is_empty() && class.eq_ignore_ascii_case("TDBText") { "(field value)" } else { caption };
     let title = NSString::from_str(caption);
     match class.to_ascii_lowercase().as_str() {
-        "tbutton" | "tbitbtn" | "ttogglebox" | "tspeedbutton" => {
+        "tbutton" | "tbitbtn" | "ttogglebox" | "tspeedbutton" | "tcolorbutton" => {
             // Same recipe as LCL-Cocoa's TCocoaWSButtonUtil.allocButton.
             let b = NSButton::initWithFrame(NSButton::alloc(mtm), NSRect::ZERO);
             b.setBezelStyle(NSBezelStyle::Push);
@@ -288,11 +290,11 @@ fn make_control(mtm: MainThreadMarker, class: &str, caption: &str) -> (Control, 
         // LCL-Cocoa builds check boxes and radio buttons like push buttons (alloc/init, title,
         // button type) rather than with AppKit's convenience constructors; measurements show
         // the two differ in size, so follow LCL (see `TCocoaWSButtonUtil.allocButton`).
-        "tcheckbox" | "tradiobutton" => {
+        "tcheckbox" | "tradiobutton" | "tdbcheckbox" => {
             let b = NSButton::initWithFrame(NSButton::alloc(mtm), NSRect::ZERO);
             b.setTitle(&title);
             b.setFont(Some(&NSFont::systemFontOfSize(12.0)));
-            b.setButtonType(if class.eq_ignore_ascii_case("TCheckBox") {
+            b.setButtonType(if !class.eq_ignore_ascii_case("TRadioButton") {
                 NSButtonType::Switch
             } else {
                 NSButtonType::Radio
@@ -300,18 +302,21 @@ fn make_control(mtm: MainThreadMarker, class: &str, caption: &str) -> (Control, 
             let v = Retained::into_super(Retained::into_super(b.clone()));
             (Control::Button(b), v)
         }
-        "tedit" => {
+        "tedit" | "tdbedit" => {
             let t = NSTextField::textFieldWithString(&title, mtm);
             let v = Retained::into_super(Retained::into_super(t.clone()));
             (Control::Text(t), v)
         }
-        "tlabel" => {
+        "tlabel" | "tdbtext" => {
             let t = NSTextField::labelWithString(&title, mtm);
             let v = Retained::into_super(Retained::into_super(t.clone()));
             (Control::Text(t), v)
         }
-        "tcombobox" | "tlabelededit" | "tmaskedit" | "tspinedit" => {
-            let t = if class.eq_ignore_ascii_case("TComboBox") {
+        "tcombobox" | "tdbcombobox" | "tdblookupcombobox" | "tcomboboxex" | "tcheckcombobox" | "tfiltercombobox"
+        | "tlabelededit" | "tmaskedit" | "tspinedit" | "tfloatspinedit" | "teditbutton" | "tdateedit" | "ttimeedit"
+        | "tcalcedit" | "tfilenameedit" | "tdirectoryedit" | "tdbdateedit" => {
+            let lower = class.to_ascii_lowercase();
+            let t = if lower.ends_with("combobox") || matches!(lower.as_str(), "tcomboboxex" | "tcheckcombobox") {
                 Retained::into_super(NSComboBox::initWithFrame(
                     NSComboBox::alloc(mtm),
                     NSRect::ZERO,
@@ -333,15 +338,19 @@ fn make_control(mtm: MainThreadMarker, class: &str, caption: &str) -> (Control, 
             (Control::Text(t), v)
         }
         // A titled frame, as Mac apps draw group boxes.
-        "tgroupbox" | "tradiogroup" | "tcheckgroup" => {
+        "tgroupbox" | "tradiogroup" | "tcheckgroup" | "tdbradiogroup" | "tdbgroupbox" => {
             let b = NSBox::new(mtm);
             b.setTitle(&title);
             let v = Retained::into_super(b.clone());
             (Control::Box(b), v)
         }
         // Surfaces: panels, text areas, lists, images and the like are an outlined plain box.
-        "tpanel" | "tmemo" | "tlistbox" | "tlistview" | "ttreeview" | "timage" | "tshape"
-        | "tbevel" | "tsplitter" | "ttoolbar" | "tstatusbar" => {
+        "tframe" | "tpanel" | "tmemo" | "tlistbox" | "tlistview" | "ttreeview" | "timage" | "tshape"
+        | "tbevel" | "tsplitter" | "ttoolbar" | "tstatusbar" | "tdbmemo" | "tdblistbox"
+        | "tdblookuplistbox" | "tdbimage" | "tdbgrid" | "tstringgrid" | "tdrawgrid" | "tvaluelisteditor"
+        | "tchecklistbox" | "tcolorlistbox" | "tfilelistbox" | "tshelllistview" | "tshelltreeview" | "tscrollbox"
+        | "tflowpanel" | "tcontrolbar" | "tcoolbar" | "theadercontrol" | "tpaintbox" | "tpairsplitter"
+        | "tbuttonpanel" | "tcalendar" | "tdbcalendar" => {
             let b = NSBox::new(mtm);
             b.setBoxType(NSBoxType::Custom);
             b.setTitlePosition(NSTitlePosition::NoTitle);
@@ -352,10 +361,36 @@ fn make_control(mtm: MainThreadMarker, class: &str, caption: &str) -> (Control, 
             });
             b.setBorderColor(&NSColor::separatorColor());
             b.setFillColor(&*match class.to_ascii_lowercase().as_str() {
-                "tmemo" | "tlistbox" | "tlistview" | "ttreeview" => NSColor::textBackgroundColor(),
+                "tmemo" | "tlistbox" | "tlistview" | "ttreeview" | "tdbmemo" | "tdblistbox"
+                | "tdblookuplistbox" | "tdbgrid" | "tstringgrid" | "tdrawgrid" | "tvaluelisteditor" | "tchecklistbox"
+                | "tcolorlistbox" | "tfilelistbox" | "tshelllistview" | "tshelltreeview" | "tcalendar"
+                | "tdbcalendar" => NSColor::textBackgroundColor(),
                 "ttoolbar" | "tstatusbar" | "tsplitter" => NSColor::windowBackgroundColor(),
                 _ => NSColor::clearColor(),
             });
+            let v = Retained::into_super(b.clone());
+            (Control::Box(b), v)
+        }
+        "tarrow" => {
+            let t = NSTextField::labelWithString(&NSString::from_str("\u{25B6}"), mtm);
+            t.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            let v = Retained::into_super(Retained::into_super(t.clone()));
+            (Control::Text(t), v)
+        }
+        // The navigator's ten buttons (first, prior, next, last, insert, delete, edit, post, cancel,
+        // refresh) as one outlined strip with their glyphs; the running program shows real buttons.
+        "tdbnavigator" => {
+            let b = NSBox::new(mtm);
+            b.setBoxType(NSBoxType::Custom);
+            b.setTitlePosition(NSTitlePosition::NoTitle);
+            b.setBorderWidth(1.0);
+            b.setCornerRadius(3.0);
+            b.setBorderColor(&NSColor::separatorColor());
+            b.setFillColor(&NSColor::clearColor());
+            let glyphs = NSString::from_str("\u{23EE}  \u{25C0}  \u{25B6}  \u{23ED}  +  \u{2212}  \u{270E}  \u{2713}  \u{2715}  \u{21BB}");
+            let label = NSTextField::labelWithString(&glyphs, mtm);
+            label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            b.setContentView(Some(&label));
             let v = Retained::into_super(b.clone());
             (Control::Box(b), v)
         }
@@ -391,7 +426,7 @@ fn make_control(mtm: MainThreadMarker, class: &str, caption: &str) -> (Control, 
                 Retained::into_super(Retained::into_super(st)),
             )
         }
-        "tpagecontrol" => {
+        "tpagecontrol" | "ttabcontrol" | "tnotebook" => {
             let tv = NSTabView::new(mtm);
             (Control::Plain, Retained::into_super(tv))
         }

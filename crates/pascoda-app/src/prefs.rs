@@ -19,10 +19,14 @@ pub struct Prefs {
     pub line_numbers: bool,
     /// Long lines wrap onto more rows instead of scrolling sideways.
     pub word_wrap: bool,
+    /// Cmd+S also formats a Pascal file (Edit > Format Code does it any time).
+    pub format_on_save: bool,
     /// Index into `theme::EDITOR_FONTS`.
     pub font: usize,
     /// The editor background per appearance (`[dark]`); `None` keeps the palette's.
     pub background: [Option<[u8; 3]>; 2],
+    /// The current-line highlight per appearance (`[dark]`); `None` keeps the palette's.
+    pub current_line: [Option<[u8; 3]>; 2],
     /// Colour overrides for the code tokens: `[dark][token]`, in the order of `highlight::TOKENS`.
     /// `None` keeps the palette's colour.
     pub colors: [[Option<[u8; 3]>; TOKEN_COUNT]; 2],
@@ -33,7 +37,7 @@ pub const TOKEN_COUNT: usize = 8;
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { font_size: BASE_FONT, tab_width: 4, line_numbers: true, word_wrap: false, font: 0, background: [None; 2], colors: [[None; TOKEN_COUNT]; 2] }
+        Self { font_size: BASE_FONT, tab_width: 4, line_numbers: true, word_wrap: false, format_on_save: false, font: 0, background: [None; 2], current_line: [None; 2], colors: [[None; TOKEN_COUNT]; 2] }
     }
 }
 
@@ -46,8 +50,10 @@ impl Prefs {
             tab_width: if TAB_WIDTHS.contains(&self.tab_width) { self.tab_width } else { Prefs::default().tab_width },
             line_numbers: self.line_numbers,
             word_wrap: self.word_wrap,
+            format_on_save: self.format_on_save,
             font: self.font.min(crate::theme::EDITOR_FONTS.len() - 1),
             background: self.background,
+            current_line: self.current_line,
             colors: self.colors,
         }
     }
@@ -61,14 +67,20 @@ impl Prefs {
     /// The `key=value` text of the preferences file.
     pub fn to_text(&self) -> String {
         let mut text = format!(
-            "font_size={}\ntab_width={}\nline_numbers={}\nword_wrap={}\n",
-            self.font_size, self.tab_width, self.line_numbers, self.word_wrap
+            "font_size={}\ntab_width={}\nline_numbers={}\nword_wrap={}\nformat_on_save={}\n",
+            self.font_size, self.tab_width, self.line_numbers, self.word_wrap, self.format_on_save
         );
         text.push_str(&format!("font={}\n", crate::theme::EDITOR_FONTS[self.font].0));
         for (dark, bg) in self.background.iter().enumerate() {
             if let Some([r, g, b]) = bg {
                 let mode = if dark == 1 { "dark" } else { "light" };
                 text.push_str(&format!("background.{mode}=#{r:02x}{g:02x}{b:02x}\n"));
+            }
+        }
+        for (dark, line) in self.current_line.iter().enumerate() {
+            if let Some([r, g, b]) = line {
+                let mode = if dark == 1 { "dark" } else { "light" };
+                text.push_str(&format!("current_line.{mode}=#{r:02x}{g:02x}{b:02x}\n"));
             }
         }
         for (dark, row) in self.colors.iter().enumerate() {
@@ -112,9 +124,16 @@ impl Prefs {
                 }
                 "background.light" => p.background[0] = parse_hex(value),
                 "background.dark" => p.background[1] = parse_hex(value),
+                "current_line.light" => p.current_line[0] = parse_hex(value),
+                "current_line.dark" => p.current_line[1] = parse_hex(value),
                 "word_wrap" => {
                     if let Ok(v) = value.parse::<bool>() {
                         p.word_wrap = v;
+                    }
+                }
+                "format_on_save" => {
+                    if let Ok(v) = value.parse::<bool>() {
+                        p.format_on_save = v;
                     }
                 }
                 other => {
@@ -140,6 +159,11 @@ impl Prefs {
     /// Sets or clears (`None`) the editor background for one appearance.
     pub fn set_background(&mut self, dark: bool, color: Option<[u8; 3]>) {
         self.background[dark as usize] = color;
+    }
+
+    /// Sets or clears (`None`) the current-line highlight for one appearance.
+    pub fn set_current_line(&mut self, dark: bool, color: Option<[u8; 3]>) {
+        self.current_line[dark as usize] = color;
     }
 
     /// Sets or clears (`None`) one token colour for one appearance.
@@ -173,8 +197,10 @@ impl Prefs {
         TAB_WIDTH.store(self.tab_width, Ordering::Relaxed);
         LINE_NUMBERS.store(self.line_numbers, Ordering::Relaxed);
         WORD_WRAP.store(self.word_wrap, Ordering::Relaxed);
+        FORMAT_ON_SAVE.store(self.format_on_save, Ordering::Relaxed);
         FONT.store(self.font, Ordering::Relaxed);
         *BACKGROUND.lock().unwrap_or_else(|e| e.into_inner()) = self.background;
+        *CURRENT_LINE.lock().unwrap_or_else(|e| e.into_inner()) = self.current_line;
         *CODE_COLORS.lock().unwrap_or_else(|e| e.into_inner()) = self.colors;
     }
 }
@@ -184,13 +210,20 @@ static FONT_BITS: AtomicU32 = AtomicU32::new(0);
 static TAB_WIDTH: AtomicU8 = AtomicU8::new(4);
 static LINE_NUMBERS: AtomicBool = AtomicBool::new(true);
 static WORD_WRAP: AtomicBool = AtomicBool::new(false);
+static FORMAT_ON_SAVE: AtomicBool = AtomicBool::new(false);
 static FONT: AtomicUsize = AtomicUsize::new(0);
 
 static BACKGROUND: Mutex<[Option<[u8; 3]>; 2]> = Mutex::new([None; 2]);
+static CURRENT_LINE: Mutex<[Option<[u8; 3]>; 2]> = Mutex::new([None; 2]);
 
 /// The editor background the user chose for this appearance, if any.
 pub fn editor_background(dark: bool) -> Option<[u8; 3]> {
     BACKGROUND.lock().unwrap_or_else(|e| e.into_inner())[dark as usize]
+}
+
+/// The current-line highlight the user chose for this appearance, if any.
+pub fn current_line_color(dark: bool) -> Option<[u8; 3]> {
+    CURRENT_LINE.lock().unwrap_or_else(|e| e.into_inner())[dark as usize]
 }
 
 /// Index of the editor font (into `theme::EDITOR_FONTS`) in use.
@@ -201,6 +234,11 @@ pub fn font_index() -> usize {
 /// Whether long lines wrap in the editor.
 pub fn word_wrap() -> bool {
     WORD_WRAP.load(Ordering::Relaxed)
+}
+
+/// Whether saving a Pascal file also formats it.
+pub fn format_on_save() -> bool {
+    FORMAT_ON_SAVE.load(Ordering::Relaxed)
 }
 static CODE_COLORS: Mutex<[[Option<[u8; 3]>; TOKEN_COUNT]; 2]> = Mutex::new([[None; TOKEN_COUNT]; 2]);
 
@@ -270,6 +308,15 @@ pub(crate) mod tests {
     pub static APPLY: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
     #[test]
+    fn format_on_save_is_off_until_chosen_and_is_remembered() {
+        assert!(!Prefs::default().format_on_save, "off by default: formatting rewrites a file");
+        let p = Prefs { format_on_save: true, ..Prefs::default() };
+        assert!(Prefs::parse(&p.to_text()).format_on_save);
+        assert!(!Prefs::parse("format_on_save=maybe\n").format_on_save);
+        assert!(p.checked().format_on_save);
+    }
+
+    #[test]
     fn the_line_height_follows_the_font_size() {
         assert_eq!(Prefs::default().line_height(), 18.0);
         assert_eq!(Prefs { font_size: 16.0, ..Prefs::default() }.line_height(), 22.0);
@@ -318,15 +365,19 @@ pub(crate) mod tests {
         let _guard = APPLY.write().unwrap_or_else(|e| e.into_inner());
         let mut p = Prefs { font: 2, ..Prefs::default() };
         p.set_background(true, Some([0x10, 0x20, 0x30]));
+        p.set_current_line(false, Some([0xEE, 0xF4, 0xFF]));
         let text = p.to_text();
         assert!(text.contains("font=Courier\n"), "{text}");
         assert!(text.contains("background.dark=#102030\n"), "{text}");
+        assert!(text.contains("current_line.light=#eef4ff\n"), "{text}");
         assert_eq!(Prefs::parse(&text), p);
         assert_eq!(Prefs::parse("background.light=#zzzzzz\n").background, [None; 2]);
         p.apply();
         assert_eq!(font_index(), 2);
         assert_eq!(editor_background(true), Some([0x10, 0x20, 0x30]));
         assert_eq!(editor_background(false), None);
+        assert_eq!(current_line_color(false), Some([0xEE, 0xF4, 0xFF]));
+        assert_eq!(current_line_color(true), None);
         Prefs::default().apply();
         assert_eq!(font_index(), 0);
         assert_eq!(editor_background(true), None);

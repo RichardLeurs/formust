@@ -19,19 +19,25 @@ pub const AUTO_ZONE: f32 = 24.0;
 /// Fastest auto-scroll, points per frame.
 pub const AUTO_MAX: f32 = 24.0;
 
-/// Size of everything that scrolls for a form of `form` client size.
-pub fn content_size(form: (i64, i64)) -> Vec2 {
+/// Size of everything that scrolls for a form of `form` client size with a title bar of `title` points (a frame has none).
+pub fn content_size_with(form: (i64, i64), title: f32) -> Vec2 {
     vec2(
         form.0 as f32 + 2.0 * MARGIN,
-        form.1 as f32 + TITLE_BAR + 2.0 * MARGIN,
+        form.1 as f32 + title + 2.0 * MARGIN,
     )
 }
 
 /// Splits the free area `avail` into the visible canvas and the strips for a horizontal and a
 /// vertical scroll bar (each `None` when that axis fits). A bar on one axis takes space from
-/// the other, which may then need a bar too.
+/// the other, which may then need a bar too. A form window's title bar is assumed (the tests use this).
+#[cfg(test)]
 pub fn split(avail: Rect, form: (i64, i64)) -> (Rect, Option<Rect>, Option<Rect>) {
-    let content = content_size(form);
+    split_with(avail, form, TITLE_BAR)
+}
+
+/// [`split`] for a window with a title bar of `title` points.
+pub fn split_with(avail: Rect, form: (i64, i64), title: f32) -> (Rect, Option<Rect>, Option<Rect>) {
+    let content = content_size_with(form, title);
     let mut need_v = content.y > avail.height();
     let need_h = content.x > avail.width() - if need_v { BAR } else { 0.0 };
     if need_h && !need_v {
@@ -60,22 +66,31 @@ pub struct View {
     pub form: (i64, i64),
     /// How far the content is scrolled; always within `0..=max_scroll()`.
     pub scroll: Vec2,
+    /// Height of the title bar above the client area: [`TITLE_BAR`] for a form, 0 for a frame.
+    pub title: f32,
 }
 
 impl View {
-    /// A view with `scroll` clamped to what the content allows.
+    /// A view with `scroll` clamped to what the content allows (a form window; the tests use this).
+    #[cfg(test)]
     pub fn new(area: Rect, form: (i64, i64), scroll: Vec2) -> Self {
+        Self::with_title(area, form, scroll, TITLE_BAR)
+    }
+
+    /// [`View::new`] for a window with a title bar of `title` points (0 for a frame).
+    pub fn with_title(area: Rect, form: (i64, i64), scroll: Vec2, title: f32) -> Self {
         let mut v = Self {
             area,
             form,
             scroll: Vec2::ZERO,
+            title,
         };
         v.scroll = v.clamp(scroll);
         v
     }
 
     pub fn content(&self) -> Vec2 {
-        content_size(self.form)
+        content_size_with(self.form, self.title)
     }
 
     /// The largest scroll offset per axis (0 where the content fits).
@@ -109,7 +124,7 @@ impl View {
             // Centred, like Xcode; never closer to the left edge than the margin.
             (self.area.center().x - w / 2.0).max(self.area.left() + MARGIN)
         };
-        pos2(x, self.area.top() + MARGIN + TITLE_BAR - self.scroll.y)
+        pos2(x, self.area.top() + MARGIN + self.title - self.scroll.y)
     }
 
     /// The form's client area on screen (may reach outside `area`).
@@ -120,7 +135,7 @@ impl View {
     /// Client area plus the title bar above it.
     pub fn window(&self) -> Rect {
         let c = self.client();
-        Rect::from_min_max(c.min - vec2(0.0, TITLE_BAR), c.max)
+        Rect::from_min_max(c.min - vec2(0.0, self.title), c.max)
     }
 
     /// A screen point in form coordinates.
@@ -230,6 +245,22 @@ mod tests {
 
     fn area(w: f32, h: f32) -> Rect {
         Rect::from_min_size(pos2(100.0, 50.0), vec2(w, h))
+    }
+
+    #[test]
+    fn a_frame_has_no_title_bar_so_its_client_area_starts_at_the_margin() {
+        let area = Rect::from_min_size(pos2(100.0, 50.0), vec2(600.0, 400.0));
+        let form = View::new(area, (200, 100), Vec2::ZERO);
+        let frame = View::with_title(area, (200, 100), Vec2::ZERO, 0.0);
+        assert_eq!(form.origin().y, 50.0 + MARGIN + TITLE_BAR);
+        assert_eq!(frame.origin().y, 50.0 + MARGIN);
+        assert_eq!(frame.window(), frame.client(), "no bar above the client area");
+        assert_eq!(frame.content().y, 100.0 + 2.0 * MARGIN);
+        // a tall frame scrolls only by its own height
+        let tall = View::with_title(area, (200, 500), Vec2::ZERO, 0.0);
+        assert_eq!(tall.max_scroll().y, 500.0 + 2.0 * MARGIN - 400.0);
+        let (visible, _, bar) = split_with(area, (200, 500), 0.0);
+        assert!(bar.is_some() && visible.width() < area.width());
     }
 
     #[test]

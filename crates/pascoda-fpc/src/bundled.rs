@@ -1,7 +1,7 @@
 //! The Free Pascal compiler that ships inside Pascoda.app.
 //!
-//! `packaging/fpc-bundle.sh` copies the compiler (`ppca64`, as `bin/fpc`) and the units Pascoda needs
-//! into `vendor/fpc` (a source checkout) or `Contents/Resources/vendor/fpc` (the app). It is found like
+//! `packaging/fpc-build.sh` builds the compiler (`ppca64`, as `bin/fpc`), the Intel cross compiler
+//! (`bin/ppcrossx64`) and the units Pascoda needs for both CPUs into `vendor/fpc` (a source checkout) or `Contents/Resources/vendor/fpc` (the app). It is found like
 //! the other vendored tools (`lcl::fixed_dirs`) and wins over an `fpc` on the `PATH`, so the compiler
 //! is the tested one; `PASCODA_FPC` still overrides it.
 //!
@@ -11,19 +11,27 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// Written by `fpc-bundle.sh` at the root of the bundled compiler; its text is the compiler version.
+/// Written by `fpc-build.sh` at the root of the bundled compiler; its text is the compiler version.
 pub const MARKER: &str = ".pascoda-fpc";
 
-/// Whether `prefix` is a compiler laid out by `fpc-bundle.sh`.
+/// Whether `prefix` is a compiler laid out by `fpc-build.sh`.
 pub fn is_bundle(prefix: &Path) -> bool {
     prefix.join(MARKER).is_file() && prefix.join("bin/fpc").is_file()
 }
 
-/// The bundled compiler's folder, if there is one.
+/// The bundled compiler folder for a Mac of CPU `arch`: `vendor/fpc` on Apple Silicon (the arm64 compiler and
+/// the Intel cross compiler), `vendor/fpc-intel` on Intel (the compiler that runs there, built by
+/// `packaging/fpc-intel-build.sh`).
+pub fn prefix_name_for(arch: &str) -> &'static str {
+    if arch == "x86_64" { "vendor/fpc-intel" } else { "vendor/fpc" }
+}
+
+/// The bundled compiler's folder, if there is one, for this Mac's CPU.
 pub fn prefix() -> Option<PathBuf> {
+    let name = prefix_name_for(std::env::consts::ARCH);
     crate::lcl::fixed_dirs()
         .iter()
-        .map(|d| d.join("vendor/fpc"))
+        .map(|d| d.join(name))
         .find(|p| is_bundle(p))
 }
 
@@ -32,7 +40,34 @@ pub fn fpc() -> Option<PathBuf> {
     prefix().map(|p| p.join("bin/fpc"))
 }
 
-/// The compiler version a bundle was made from (`3.2.2`).
+/// Whether `prefix` has the cross compiler (`bin/ppcrossx64`) and the units of `target`.
+pub fn has_target(prefix: &Path, target: crate::Target) -> bool {
+    let Some(v) = version(prefix) else { return false };
+    let units = prefix.join("lib/fpc").join(v).join("units").join(target.triple()).join("rtl");
+    if target.is_native() {
+        return prefix.join("bin/fpc").is_file() && units.is_dir();
+    }
+    prefix.join("bin/ppcrossx64").is_file() && units.is_dir()
+}
+
+/// Whether `prefix` has the cross compiler for Intel and the units it needs.
+pub fn has_intel(prefix: &Path) -> bool {
+    has_target(prefix, crate::Target::MacX86_64)
+}
+
+/// The bundled cross compiler for Intel Macs (`bin/ppcrossx64`), when it and its units are there.
+pub fn cross_fpc() -> Option<PathBuf> {
+    cross_fpc_for(crate::Target::MacX86_64)
+}
+
+/// The bundled compiler that makes code for `target` (the native one for Apple Silicon), when it and
+/// the target's units are there. The Intel and Windows targets share `bin/ppcrossx64`.
+pub fn cross_fpc_for(target: crate::Target) -> Option<PathBuf> {
+    let p = prefix().filter(|p| has_target(p, target))?;
+    Some(p.join(if target.is_native() { "bin/fpc" } else { "bin/ppcrossx64" }))
+}
+
+/// The compiler version a bundle was made from (`3.2.4`).
 pub fn version(prefix: &Path) -> Option<String> {
     let v = std::fs::read_to_string(prefix.join(MARKER)).ok()?;
     let v = v.trim();
@@ -105,7 +140,7 @@ fn tools_in(dev: &Path) -> Tools {
 }
 
 /// The developer tools the linker uses. The Command Line Tools come first when they are installed:
-/// their `ld` honours `-ld_classic`, which the LCL build needs (fpc 3.2.2's Objective-C method lists
+/// their `ld` honours `-ld_classic`, which the LCL build needs (fpc 3.2's Objective-C method lists
 /// are rejected by the current linker), and the Xcode linker that `xcode-select` may point at does not.
 /// Without them, Xcode's tools are used.
 pub fn tools() -> Tools {
@@ -135,6 +170,8 @@ pub fn config_text(prefix: &Path, version: &str, tools: &Tools) -> String {
     );
     t.push_str(&format!("-Fu{}/$fpctarget/*\n", units.display()));
     t.push_str(&format!("-Fu{}/$fpctarget/rtl\n", units.display()));
+    // Only for a macOS target: a Windows program is linked by FPC itself and needs none of it.
+    t.push_str("#ifdef darwin\n");
     if let Some(sdk) = &tools.sdk {
         // The SDK is also given to the linker as its root: the `ld` of Xcode, unlike the Command Line
         // Tools' one, does not find the frameworks (CoreFoundation, Cocoa) by itself.
@@ -146,7 +183,13 @@ pub fn config_text(prefix: &Path, version: &str, tools: &Tools) -> String {
     }
     if let Some(bin) = &tools.bin {
         t.push_str(&format!("-FD{}\n", bin.display()));
+        // The Command Line Tools' linker needs the classic one: the current ld64 rejects Free Pascal's
+        // objects ("pointer not aligned in FPC_THREADVARTABLES"). Xcode's linker does not know the flag.
+        if bin.starts_with("/Library/Developer/CommandLineTools") {
+            t.push_str("-k-ld_classic\n");
+        }
     }
+    t.push_str("#endif\n");
     t
 }
 
@@ -189,6 +232,12 @@ pub fn config_file(prefix: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn each_cpu_has_its_own_bundled_compiler_folder() {
+        assert_eq!(prefix_name_for("aarch64"), "vendor/fpc");
+        assert_eq!(prefix_name_for("x86_64"), "vendor/fpc-intel");
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("pascoda-bundled-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -206,9 +255,9 @@ mod tests {
     fn a_bundle_needs_its_marker_and_its_compiler() {
         let d = scratch("marker");
         assert!(!is_bundle(&d));
-        fake_bundle(&d, "3.2.2");
+        fake_bundle(&d, "3.2.4");
         assert!(is_bundle(&d));
-        assert_eq!(version(&d).as_deref(), Some("3.2.2"));
+        assert_eq!(version(&d).as_deref(), Some("3.2.4"));
         std::fs::remove_file(d.join("bin/fpc")).unwrap();
         assert!(!is_bundle(&d), "a marker without the compiler is not a bundle");
         let _ = std::fs::remove_dir_all(&d);
@@ -218,31 +267,37 @@ mod tests {
     fn the_config_names_the_bundles_units_and_the_sdk() {
         let text = config_text(
             Path::new("/Apps/Pascoda.app/Contents/Resources/vendor/fpc"),
-            "3.2.2",
+            "3.2.4",
             &Tools {
                 sdk: Some("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk".into()),
                 bin: Some("/Library/Developer/CommandLineTools/usr/bin".into()),
                 clang_rt: Some("/Library/Developer/CommandLineTools/usr/lib/clang/17/lib/darwin".into()),
             },
         );
-        assert!(text.contains("-Fu/Apps/Pascoda.app/Contents/Resources/vendor/fpc/lib/fpc/3.2.2/units/$fpctarget/*\n"));
+        assert!(text.contains("-Fu/Apps/Pascoda.app/Contents/Resources/vendor/fpc/lib/fpc/3.2.4/units/$fpctarget/*\n"));
         assert!(text.contains("units/$fpctarget/rtl\n"));
         assert!(text.contains("-XR/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk\n"), "the linker's SDK root");
         assert!(text.contains("-Fl/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib\n"));
         assert!(text.contains("-Fl/Library/Developer/CommandLineTools/usr/lib/clang/17/lib/darwin\n"), "Cocoa units link libclang_rt");
         assert!(text.contains("-FD/Library/Developer/CommandLineTools/usr/bin\n"));
+        assert!(text.contains("-k-ld_classic\n"), "the Command Line Tools' classic linker");
+        let xcode = config_text(Path::new("/x"), "3.2.4", &Tools {
+            bin: Some("/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin".into()),
+            ..Tools::default()
+        });
+        assert!(!xcode.contains("-k-ld_classic"), "Xcode's linker does not take the flag");
         assert!(text.contains("#ifdef darwin\n-ap\n#endif"), "the switches of the sample file are kept");
         // Without developer tools there are no tool lines.
-        let none = config_text(Path::new("/x"), "3.2.2", &Tools::default());
+        let none = config_text(Path::new("/x"), "3.2.4", &Tools::default());
         assert!(!none.contains("-Fl") && !none.contains("-FD"));
     }
 
-    /// With a bundled compiler present (`packaging/fpc-bundle.sh vendor/fpc`), it is the one used, and it
+    /// With a bundled compiler present (`packaging/fpc-build.sh`), it is the one used, and it
     /// compiles, links and runs a program with the configuration written for it. Skipped without one.
     #[test]
     fn the_bundled_compiler_is_chosen_and_builds_a_program() {
         let Some(fpc) = fpc() else {
-            eprintln!("skipped: no vendor/fpc (packaging/fpc-bundle.sh vendor/fpc)");
+            eprintln!("skipped: no vendor/fpc (packaging/fpc-build.sh)");
             return;
         };
         if std::env::var_os("PASCODA_FPC").is_some() {
@@ -283,8 +338,8 @@ mod tests {
         let cache = scratch("cache");
         let a = scratch("a");
         let b = scratch("b");
-        fake_bundle(&a, "3.2.2");
-        fake_bundle(&b, "3.2.2");
+        fake_bundle(&a, "3.2.4");
+        fake_bundle(&b, "3.2.4");
         let fa = write_config(&a, &cache, &Tools::default()).unwrap();
         let fb = write_config(&b, &cache, &Tools::default()).unwrap();
         assert_ne!(fa, fb, "each place has its own file");
@@ -299,6 +354,23 @@ mod tests {
         assert!(std::fs::read_to_string(&fa).unwrap().contains("-Fu"));
         for d in [cache, a, b] {
             let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn the_checkout_is_searched_in_every_build_profile() {
+        // A release build run from a checkout (not a .app) must find vendor/fpc, or the Intel
+        // compiler looks missing. The source tree is the last of the fixed folders.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = root.canonicalize().unwrap();
+        assert!(
+            crate::lcl::fixed_dirs().iter().filter_map(|d| d.canonicalize().ok()).any(|d| d == root),
+            "{:?}",
+            crate::lcl::fixed_dirs()
+        );
+        // and when the checkout has a built compiler, it is found with its Intel part
+        if is_bundle(&root.join("vendor/fpc")) && has_intel(&root.join("vendor/fpc")) {
+            assert!(cross_fpc().is_some());
         }
     }
 }

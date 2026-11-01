@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 pub enum Req {
+    /// Format the file on disk (the server rewrites it; see `Client::format_file`).
+    Format {
+        path: PathBuf,
+    },
     Complete {
         path: PathBuf,
         text: String,
@@ -74,6 +78,9 @@ pub enum Resp {
     },
     /// The replacements of a rename, per file.
     Rename(Vec<FileEdit>),
+    /// The server has formatted `path` on disk, or says why not. Apart from `Error`, which stops the
+    /// language server, because a file that cannot be formatted is not a reason to switch it off.
+    Formatted { error: Option<String> },
     Error(String),
 }
 
@@ -151,6 +158,9 @@ pub fn spawn(root: &Path, ctx: egui::Context) -> Option<Handle> {
                     .sync(&path, &text)
                     .and_then(|_| client.document_symbols(&path))
                     .map(|symbols| Resp::Symbols { path, key, symbols }),
+                Req::Format { path } => Ok(Resp::Formatted {
+                    error: client.format_file(&path).err(),
+                }),
                 Req::Rename {
                     path,
                     text,

@@ -13,6 +13,7 @@ eframe = "0.37.0"
 muda = "0.21.2"
 rfd = "0.17.2"
 serde_json = "1.0.154"
+regex = "1.13"
 pascoda-forms = { version = "0.1.0", path = "../pascoda-forms" }
 objc2 = "0.6.5"
 objc2-app-kit = "0.3.2"

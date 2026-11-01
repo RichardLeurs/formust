@@ -37,7 +37,7 @@ fn render(app: App, dark: bool, size: (f32, f32), name: &str) -> PathBuf {
 fn editing_app() -> App {
     let mut app = App::bare(Some(fixture()));
     app.docs[0].breakpoints.insert(8);
-    app.console = "Free Pascal Compiler version 3.2.2 for AArch64\nCompiling debug.pas\nLinking debug\n11 lines compiled, 0.3 sec\n".into();
+    app.console = "Free Pascal Compiler version 3.2.4 for AArch64\nCompiling debug.pas\nLinking debug\n11 lines compiled, 0.3 sec\n".into();
     app.lsp_ready = true;
     app
 }
@@ -345,6 +345,7 @@ fn renders_the_project_options_window() {
         args: "--in\nreport.txt".into(),
         workdir: "data".into(),
         configuration: pascoda_project::Configuration::Release,
+        lazarus: "../lazarus".into(),
         project_file: Some(project_options::FileView {
             file_name: "notes.lpi".into(),
             rows: vec![
@@ -377,6 +378,7 @@ fn renders_the_project_options_window_dark() {
         args: String::new(),
         workdir: String::new(),
         configuration: pascoda_project::Configuration::Debug,
+        lazarus: String::new(),
         project_file: None,
         error: String::new(),
     };
@@ -550,6 +552,7 @@ fn renders_the_find_bar_and_the_project_search() {
     app.show_navigator = true;
     app.project_bar.query = "Write".into();
     app.run_project_search();
+        app.finish_project_search();
     app.project_bar.with = "Print".into();
     render(app, false, (1100.0, 640.0), "ui-project-search");
 }
@@ -640,6 +643,31 @@ fn renders_the_form_designer() {
     d.select(timer);
     let a = render(app, false, (1368.0, 800.0), "ui-form-light");
     println!("{}", a.display());
+}
+
+/// A frame's own unit: a plain surface the size of the frame, no window and no title bar around it.
+#[test]
+fn renders_a_frame_designer() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let dir = crate::target_tmp().join("render-frame");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pas = pascoda_project::new_frame_unit(&dir, &dir).unwrap();
+    let mut app = App::bare(Some(pas));
+    app.lsp_ready = true;
+    app.show_form();
+    let d = &mut app.designers[0];
+    assert!(d.is_frame());
+    d.add_component("TButton", &[], 24, 24).unwrap();
+    d.add_component("TEdit", &[], 24, 72).unwrap();
+    for dark in [false, true] {
+        let mut a = App::bare(Some(dir.join("unit1.pas")));
+        a.lsp_ready = true;
+        a.show_form();
+        a.designers[0].add_component("TButton", &[], 24, 24).unwrap();
+        render(a, dark, (1368.0, 800.0), if dark { "ui-frame-dark" } else { "ui-frame-light" });
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A multi-selection: outlines on all, handles on the primary (drawn by egui here; in the app
@@ -1637,6 +1665,335 @@ fn the_edit_switch_and_the_save_first_button_work_with_clicks() {
 
 /// Typing into the terminal tab reaches a real shell and nothing else: Tab stays in the
 /// terminal, Ctrl+C interrupts, Cmd+K clears, and the editor's text is untouched.
+/// Dragging a file row onto a folder row moves the file, through the real pointer events.
+#[test]
+fn dragging_a_file_onto_a_folder_moves_it() {
+    let base = std::env::temp_dir().join(format!("pascoda-drag-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("sub")).unwrap();
+    std::fs::write(base.join("debug.pas"), "program debug;\nbegin\nend.\n").unwrap();
+    std::fs::write(base.join("notes.txt"), "hello\n").unwrap();
+    // notes.txt is the open tab, so the move has to carry the tab along as well.
+    let app = App::bare(Some(base.join("notes.txt")));
+    let root = app.root.clone();
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1368.0, 800.0))
+        .with_pixels_per_point(1.0)
+        .with_context_setup(theme::apply)
+        .build_ui_state(|ui, app: &mut App| app.draw(ui, None), app);
+    h.run_steps(3);
+    let from = h.get_by_label("notes.txt").rect().center();
+    let to = h.get_by_label("sub").rect().center();
+    h.hover_at(from);
+    h.run_steps(2);
+    h.drag_at(from);
+    h.run_steps(2);
+    for i in 1..=6 {
+        h.hover_at(from + (to - from) * (i as f32 / 6.0));
+        h.run_steps(2);
+    }
+    h.drop_at(to);
+    h.run_steps(4);
+    let moved = root.join("sub").join("notes.txt").exists();
+    let notice = h.state().notice().map(|(m, _)| m.to_string());
+    let tab = h.state().docs[0].path.to_string_lossy().into_owned();
+    let banners = h.state().external.banners.len();
+    let _ = std::fs::remove_dir_all(&base);
+    assert!(moved, "the file should move into sub; note: {notice:?}");
+    assert_eq!(tab, root.join("sub").join("notes.txt").to_string_lossy(), "the open tab follows the file");
+    assert_eq!(banners, 0, "no read error for the tab");
+}
+
+/// The Move to Trash prompt: Cancel and Move to Trash are the same height, Cancel on the left, Trash red.
+#[test]
+fn renders_the_move_to_trash_prompt() {
+    let mut app = editing_app();
+    app.tree_delete = Some(fixture());
+    let path = render(app, false, (1368.0, 800.0), "ui-delete-prompt");
+    assert!(path.exists());
+}
+
+/// Edit > Set Bookmark takes the next free number; Previous and Next walk the bookmarks and wrap around.
+#[test]
+fn the_edit_menu_sets_and_steps_through_bookmarks() {
+    let mut app = editing_app();
+    let ctx = egui::Context::default();
+    caret_at_line_start(&ctx, &app, 3);
+    app.run_menu_list(&ctx, vec![MenuAction::SetBookmark]);
+    caret_at_line_start(&ctx, &app, 8);
+    app.run_menu_list(&ctx, vec![MenuAction::SetBookmark]);
+    assert_eq!(app.bookmarks.get(0).map(|(_, l)| l), Some(3), "the first free number");
+    assert_eq!(app.bookmarks.get(1).map(|(_, l)| l), Some(8), "the next free number");
+
+    let line = |app: &App, ctx: &egui::Context| {
+        let index = app.cursor_index(ctx).expect("a caret");
+        line_col(&app.docs[0].text, index).0 + 1
+    };
+    caret_at_line_start(&ctx, &app, 5);
+    app.run_menu_list(&ctx, vec![MenuAction::NextBookmark]);
+    assert_eq!(line(&app, &ctx), 8, "next goes to the bookmark after the caret");
+    app.run_menu_list(&ctx, vec![MenuAction::NextBookmark]);
+    assert_eq!(line(&app, &ctx), 3, "next wraps to the first");
+    app.run_menu_list(&ctx, vec![MenuAction::PreviousBookmark]);
+    assert_eq!(line(&app, &ctx), 8, "previous wraps to the last");
+    app.run_menu_list(&ctx, vec![MenuAction::PreviousBookmark]);
+    assert_eq!(line(&app, &ctx), 3, "previous goes back");
+
+    // Unset clears the bookmark on the caret's line; a line without one is left alone.
+    caret_at_line_start(&ctx, &app, 2);
+    app.run_menu_list(&ctx, vec![MenuAction::UnsetBookmark]);
+    assert_eq!(app.bookmarks.get(0).map(|(_, l)| l), Some(3), "no bookmark on line 2: nothing changes");
+    caret_at_line_start(&ctx, &app, 3);
+    app.run_menu_list(&ctx, vec![MenuAction::UnsetBookmark]);
+    assert_eq!(app.bookmarks.get(0), None, "line 3's bookmark is removed");
+    assert_eq!(app.bookmarks.get(1).map(|(_, l)| l), Some(8), "the others stay");
+}
+
+/// Clicking a bookmark's green chip in the gutter unsets it; clicking the line's number leaves it.
+#[test]
+fn clicking_a_bookmark_chip_unsets_it() {
+    let mut app = editing_app();
+    let path = app.docs[0].path.clone();
+    app.bookmarks.toggle(2, &path, 8);
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1368.0, 800.0))
+        .with_pixels_per_point(1.0)
+        .with_context_setup(theme::apply)
+        .build_ui_state(|ui, app: &mut App| app.draw(ui, None), app);
+    h.run_steps(3);
+    let gutter = h.get_by_label("Line numbers").rect();
+    // Line 8 is the eighth row of 18 points (the default line height).
+    let row_y = gutter.top() + 7.0 * 18.0 + 9.0;
+    let click = |h: &mut Harness<'_, App>, p: egui::Pos2| {
+        h.hover_at(p);
+        h.run_steps(2);
+        h.drag_at(p);
+        h.run_steps(2);
+        h.drop_at(p);
+        h.run_steps(3);
+    };
+    // Right of the chip, on the number: nothing happens to the bookmark.
+    click(&mut h, egui::pos2(gutter.right() - 12.0, row_y));
+    assert_eq!(h.state().bookmarks.get(2).map(|(_, l)| l), Some(8), "clicking the number leaves it");
+    // On the chip: it is unset.
+    click(&mut h, egui::pos2(gutter.left() + 6.0, row_y));
+    assert_eq!(h.state().bookmarks.get(2), None, "clicking the chip unsets the bookmark");
+}
+
+/// The Lazarus tools: Make Resource String edits the active unit at the caret; Check LFM reports a
+/// form's errors into the console; Quick Syntax Check starts fpc on the active file.
+#[test]
+fn the_lazarus_tools_act_on_the_active_file() {
+    let base = std::env::temp_dir().join(format!("pascoda-laz-tools-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let unit = base.join("unit1.pas");
+    let src = "unit unit1;\n\ninterface\n\nimplementation\n\nprocedure P;\nbegin\n  ShowMessage('Hello, world');\nend;\n\nend.\n";
+    std::fs::write(&unit, src).unwrap();
+    let mut app = App::bare(Some(unit.clone()));
+    let ctx = egui::Context::default();
+    let at = src.find("world").unwrap();
+    let doc_id = app.docs[0].editor_id;
+    let mut state = egui::TextEdit::load_state(&ctx, doc_id).unwrap_or_default();
+    state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(at))));
+    state.store(&ctx, doc_id);
+    app.run_laz_tool(&ctx, LazTool::MakeResourceString);
+    let out = app.docs[0].text.clone();
+    assert!(out.contains("rsHelloWorld = 'Hello, world';"), "{out}");
+    assert!(out.contains("ShowMessage(rsHelloWorld)"), "{out}");
+    assert!(app.docs[0].dirty(), "the change is unsaved, like typing");
+
+    // Check LFM on a form with a broken line reports where it is.
+    let form = base.join("form1.lfm");
+    std::fs::write(&form, "object Form1: TForm1\n  Caption = \n").unwrap();
+    let mut app = App::bare(Some(form.clone()));
+    app.run_laz_tool(&ctx, LazTool::CheckLfm);
+    assert!(app.console.starts_with("Check LFM: form1.lfm:"), "{}", app.console);
+    std::fs::write(&form, "object Form1: TForm1\n  Caption = 'ok'\nend\n").unwrap();
+    let mut app = App::bare(Some(form.clone()));
+    app.run_laz_tool(&ctx, LazTool::CheckLfm);
+    assert_eq!(app.console, "Check LFM: form1.lfm is a valid form\n");
+
+    // Quick Syntax Check needs a Pascal file, and starts fpc on the file otherwise.
+    let mut app = App::bare(Some(base.join("notes.txt")));
+    std::fs::write(base.join("notes.txt"), "x\n").unwrap();
+    app.run_laz_tool(&ctx, LazTool::QuickSyntaxCheck);
+    assert!(app.notice().is_some_and(|(m, _)| m.contains("Pascal file")), "{:?}", app.notice().map(|(m, _)| m.to_string()));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Quick Syntax Check on a unit that uses the LCL (Forms) reports no false errors, and a real error is
+/// listed in Problems.
+#[test]
+fn quick_syntax_check_understands_units_that_use_the_lcl() {
+    let base = std::env::temp_dir().join(format!("pascoda-quick-check-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let ok = base.join("okunit.pas");
+    std::fs::write(&ok, "unit okunit;\n\n{$mode objfpc}{$H+}\n\ninterface\n\nuses Forms, Controls;\n\ntype\n  TThing = class(TControl)\n  end;\n\nimplementation\n\nend.\n").unwrap();
+    let ctx = egui::Context::default();
+    let mut app = App::bare(Some(ok.clone()));
+    app.run_laz_tool(&ctx, LazTool::QuickSyntaxCheck);
+    for _ in 0..1200 {
+        app.poll_syntax_check();
+        if app.syntax_rx.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(app.syntax_rx.is_none(), "the check finished");
+    assert!(
+        !app.diagnostics.iter().any(|d| d.message.contains("Forms") || d.message.contains("Can't find unit")),
+        "no false errors for LCL units: {:?}",
+        app.diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+    );
+    assert!(app.console.starts_with("Quick Syntax Check: "), "{}", app.console);
+
+    let bad = base.join("badunit.pas");
+    std::fs::write(&bad, "unit badunit;\n\ninterface\n\nimplementation\n\nprocedure P;\nbegin\n  Undeclared := 1;\nend;\n\nend.\n").unwrap();
+    let mut app = App::bare(Some(bad.clone()));
+    app.run_laz_tool(&ctx, LazTool::QuickSyntaxCheck);
+    for _ in 0..1200 {
+        app.poll_syntax_check();
+        if app.syntax_rx.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(app.diagnostics.iter().any(|d| d.message.contains("Undeclared")), "a real error is listed: {}", app.console);
+    assert!(app.console.contains("errors"), "{}", app.console);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Ctrl+Shift+3 sets bookmark 3 at the caret's line; Ctrl+3 from elsewhere jumps back to it.
+#[test]
+fn bookmarks_are_set_from_the_keyboard_and_jumped_to() {
+    use egui::{Event, Key, Modifiers};
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1368.0, 800.0))
+        .with_pixels_per_point(1.0)
+        .with_context_setup(theme::apply)
+        .build_ui_state(|ui, app: &mut App| app.draw(ui, None), editing_app());
+    h.run_steps(3);
+    let key = |h: &Harness<'_, App>, k: Key, m: Modifiers| {
+        h.event_modifiers(Event::Key { key: k, physical_key: Some(k), pressed: true, repeat: false, modifiers: m }, m);
+    };
+    let path = h.state().docs[0].path.clone();
+    caret_at_line_start(&h.ctx, h.state(), 8);
+    h.run_steps(2);
+    key(&h, Key::Num3, Modifiers::CTRL | Modifiers::SHIFT);
+    h.run_steps(2);
+    assert_eq!(h.state().bookmarks.get(3), Some((path.as_path(), 8)), "set on the caret's line");
+
+    // Move the caret away, then jump back with Ctrl+3.
+    caret_at_line_start(&h.ctx, h.state(), 2);
+    h.run_steps(2);
+    key(&h, Key::Num3, Modifiers::CTRL);
+    h.run_steps(3);
+    let index = h.state().cursor_index(&h.ctx).expect("a caret");
+    let (line, _) = line_col(&h.state().docs[0].text, index);
+    assert_eq!(line + 1, 8, "the caret moved to the bookmark's line");
+
+    let image = h.render().expect("offscreen render");
+    image.save(out_dir().join("ui-bookmarks.png")).unwrap();
+}
+
+/// A TOML file in the editor is coloured as configuration (keys, strings, comments), not as Pascal.
+#[test]
+fn renders_a_toml_file_with_its_own_highlighting() {
+    let toml = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/gui-demo/pascoda.toml");
+    let app = App::bare(Some(toml));
+    let path = render(app, false, (1368.0, 800.0), "ui-highlight-toml");
+    assert!(path.exists());
+}
+
+/// Dropping an item onto a file row (between the files of a folder) moves it into that file's folder.
+#[test]
+fn dropping_onto_a_file_moves_it_into_that_files_folder() {
+    let base = std::env::temp_dir().join(format!("pascoda-drop-file-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("sub")).unwrap();
+    std::fs::write(base.join("debug.pas"), "program debug;\nbegin\nend.\n").unwrap();
+    std::fs::write(base.join("notes.txt"), "hello\n").unwrap();
+    std::fs::write(base.join("sub").join("inner.txt"), "inner\n").unwrap();
+    let app = App::bare(Some(base.join("debug.pas")));
+    let root = app.root.clone();
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1368.0, 800.0))
+        .with_pixels_per_point(1.0)
+        .with_context_setup(theme::apply)
+        .build_ui_state(|ui, app: &mut App| app.draw(ui, None), app);
+    h.run_steps(3);
+    // Expand sub, so its files are rows.
+    h.get_by_label("sub").click();
+    h.run_steps(3);
+    let from = h.get_by_label("notes.txt").rect().center();
+    let to = h.get_by_label("inner.txt").rect().center();
+    h.hover_at(from);
+    h.run_steps(2);
+    h.drag_at(from);
+    h.run_steps(2);
+    for i in 1..=6 {
+        h.hover_at(from + (to - from) * (i as f32 / 6.0));
+        h.run_steps(2);
+    }
+    // Still dragging, over inner.txt: the frame shows where the item would land.
+    let image = h.render().expect("offscreen render");
+    image.save(out_dir().join("ui-drop-file-hover.png")).unwrap();
+    h.drop_at(to);
+    h.run_steps(4);
+    let moved = root.join("sub").join("notes.txt").exists();
+    let _ = std::fs::remove_dir_all(&base);
+    assert!(moved, "dropping onto inner.txt should move notes.txt into sub");
+}
+
+/// Puts the editor's caret at the start of 1-based `line` (what a click there leaves behind).
+fn caret_at_line_start(ctx: &egui::Context, app: &App, line: usize) {
+    let doc = &app.docs[0];
+    let at: usize = doc.text.split_inclusive('\n').take(line - 1).map(|l| l.chars().count()).sum();
+    let mut state = egui::TextEdit::load_state(ctx, doc.editor_id).unwrap_or_default();
+    state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(at))));
+    state.store(ctx, doc.editor_id);
+}
+
+#[test]
+fn the_run_to_cursor_button_runs_to_the_caret_line() {
+    let mut app = debugging_app();
+    let (cmds, rx) = std::sync::mpsc::channel();
+    app.session = Some(debugger::Handle { cmds, events: std::sync::mpsc::channel().1 });
+    let path = app.docs[0].path.clone();
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1368.0, 800.0))
+        .with_pixels_per_point(1.0)
+        .with_context_setup(theme::apply)
+        .build_ui_state(|ui, app: &mut App| app.draw(ui, None), app);
+    h.run_steps(3);
+    caret_at_line_start(&h.ctx, h.state(), 9);
+    h.run_steps(2);
+    h.get_by_label("Run to Cursor").click();
+    h.run_steps(2);
+    match rx.try_recv() {
+        Ok(debugger::Cmd::RunTo(p, 9)) if p == path => {}
+        other => panic!("expected RunTo(line 9), got {:?}", other.map(|_| "a command")),
+    }
+    assert!(h.state().paused.is_none(), "running on clears the stop");
+}
+
+#[test]
+fn f4_runs_to_the_caret_line_through_the_menu_action() {
+    let mut app = debugging_app();
+    let (cmds, rx) = std::sync::mpsc::channel();
+    app.session = Some(debugger::Handle { cmds, events: std::sync::mpsc::channel().1 });
+    let path = app.docs[0].path.clone();
+    let ctx = egui::Context::default();
+    caret_at_line_start(&ctx, &app, 9);
+    app.run_menu_list(&ctx, vec![MenuAction::RunToCursor]);
+    match rx.try_recv() {
+        Ok(debugger::Cmd::RunTo(p, 9)) if p == path => {}
+        other => panic!("expected RunTo(line 9), got {:?}", other.map(|_| "a command")),
+    }
+}
+
 #[test]
 fn the_terminal_tab_takes_the_keyboard() {
     let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
@@ -1939,6 +2296,26 @@ fn renders_and_drives_the_export_dialog() {
     ));
     render(app, false, (900.0, 560.0), "ui-export-console");
 
+    // universal chosen, and the Intel compiler missing (the choice is disabled, with the reason)
+    for (name, intel) in [("ui-export-universal", true), ("ui-export-no-intel", false)] {
+        let mut app = editing_app();
+        let settings = ExportSettings {
+            arch: "universal".into(),
+            ..Default::default()
+        };
+        app.export_dialog = Some(export_dialog::ExportDialog::with_targets(settings, "debug", true, intel, true));
+        render(app, false, (900.0, 560.0), name);
+    }
+
+    // Windows chosen: no bundle identifier or version, the summary names the exe and the zip
+    let mut app = editing_app();
+    let settings = ExportSettings {
+        arch: "windows".into(),
+        ..Default::default()
+    };
+    app.export_dialog = Some(export_dialog::ExportDialog::with_targets(settings, "debug", true, true, true));
+    render(app, false, (900.0, 560.0), "ui-export-windows");
+
     // typing a bad identifier shows the sentence and keeps the dialog open
     let mut app = editing_app();
     app.export_dialog = Some(export_dialog::ExportDialog::new(
@@ -2085,6 +2462,7 @@ fn the_toolbar_shows_export_progress() {
         app.exporting = Some(Exporting {
             rx,
             out: std::path::PathBuf::from("/tmp"),
+            arch: pascoda_fpc::Arch::Arm64,
         });
         app.build_progress = Some(pascoda_fpc::Progress {
             label: "Creating the disk image".into(),
@@ -2105,6 +2483,7 @@ fn the_toolbar_shows_export_progress() {
     app.exporting = Some(Exporting {
         rx,
         out: std::path::PathBuf::from("/tmp"),
+        arch: pascoda_fpc::Arch::Arm64,
     });
     let (text, _) = app.activity(&style::Palette::LIGHT);
     assert_eq!(text, "Exporting...");
@@ -2322,4 +2701,79 @@ fn the_vendor_window_types_its_command_in_the_terminal_without_running_it() {
     h.run_steps(2);
     let text = screen(&h);
     assert_eq!(text.matches("$ ").count(), 1, "the command waits for Enter:\n{text}");
+}
+
+#[test]
+fn every_dialog_counts_as_open_so_the_native_designer_views_are_hidden() {
+    use pascoda_project::ExportSettings;
+    let mut app = editing_app();
+    assert!(!app.dialog_open());
+    app.export_dialog = Some(export_dialog::ExportDialog::new(ExportSettings::default(), "p", true));
+    assert!(app.dialog_open(), "export");
+    app.export_dialog = None;
+    app.go_to.open = true;
+    assert!(app.dialog_open(), "go to line");
+    app.go_to.open = false;
+    app.rename.open = true;
+    assert!(app.dialog_open(), "rename");
+    app.rename.open = false;
+    app.preferences_open = true;
+    assert!(app.dialog_open(), "preferences");
+    app.preferences_open = false;
+    app.import_packages_open = true;
+    assert!(app.dialog_open(), "packages");
+    app.import_packages_open = false;
+    assert!(!app.dialog_open());
+}
+
+#[test]
+fn renders_the_configure_tools_window_and_add_adds_a_tool() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let tool = pascoda_project::tools::Tool {
+        name: "Echo".into(),
+        command: "/bin/echo".into(),
+        args: "$(File)".into(),
+        workdir: String::new(),
+    };
+    let mut app = editing_app();
+    app.tools_editor = Some(crate::tools_editor::Editor::new(vec![tool.clone()]));
+    let png = render(app, false, (1100.0, 640.0), "ui-tools-editor");
+    assert!(png.exists());
+
+    let mut app = editing_app();
+    app.tools_editor = Some(crate::tools_editor::Editor::new(vec![tool]));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1100.0, 640.0))
+        .with_pixels_per_point(1.0)
+        .with_context_setup(theme::apply)
+        .build_ui_state(|ui, app: &mut App| app.draw(ui, None), app);
+    harness.run_steps(3);
+    harness.get_by_label("Add").click();
+    harness.run_steps(3);
+    let editor = harness.state().tools_editor.as_ref().expect("the window stays open");
+    assert_eq!(editor.tools.len(), 2, "Add adds a tool");
+    assert_eq!(editor.selected, 1, "and selects it");
+}
+
+#[test]
+fn the_terminal_pane_opens_a_new_shell_and_switches_between_shells() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = editing_app();
+    app.bottom.tab = bottom::BottomTab::Terminal;
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1000.0, 600.0))
+        .with_pixels_per_point(1.0)
+        .with_context_setup(theme::apply)
+        .build_ui_state(|ui, app: &mut App| app.draw(ui, None), app);
+    h.run_steps(3);
+    assert_eq!(h.state().bottom.shells(), [(1, true)], "the first shell");
+
+    h.get_by_label("+ New Shell").click();
+    h.run_steps(3);
+    assert_eq!(h.state().bottom.shells(), [(1, false), (2, true)], "a second shell is shown");
+    assert!(h.state().bottom.terminal.is_some(), "and started");
+
+    h.get_by_label("Shell 1").click();
+    h.run_steps(3);
+    assert_eq!(h.state().bottom.shells(), [(1, true), (2, false)], "back to the first");
 }

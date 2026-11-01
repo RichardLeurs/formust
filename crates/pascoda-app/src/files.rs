@@ -290,7 +290,8 @@ fn same_item(a: &Path, b: &Path) -> bool {
 
 /// Where `path` ends up when `from` is moved to `to`, if it is `from` or inside it.
 pub fn moved(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
-    path.strip_prefix(from).ok().map(|rest| to.join(rest))
+    // `join("")` would add a trailing slash, which makes a file read as a folder (ENOTDIR).
+    path.strip_prefix(from).ok().map(|rest| if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) })
 }
 
 #[cfg(test)]
@@ -518,6 +519,8 @@ mod tests {
         let to = Path::new("/p/new");
         assert_eq!(moved(Path::new("/p/sub/a.pas"), from, to), Some(PathBuf::from("/p/new/a.pas")));
         assert_eq!(moved(from, from, to), Some(PathBuf::from("/p/new")));
+        // `Path` equality ignores a trailing slash, so compare the text too: "/p/new/" is a folder path.
+        assert_eq!(moved(from, from, to).unwrap().to_string_lossy(), "/p/new");
         assert_eq!(moved(Path::new("/p/subway.pas"), from, to), None);
     }
 }

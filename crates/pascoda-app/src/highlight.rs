@@ -214,15 +214,277 @@ fn tokenize(text: &str) -> Vec<(Kind, usize, usize)> {
     out
 }
 
+/// The highlighter for a file, picked by its extension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Language {
+    Pascal,
+    /// Lazarus `.lfm` and Delphi `.dfm` form text.
+    Form,
+    /// XML (`.xml`, `.plist`) and the XML project files of Lazarus and Delphi (`.lpi`, `.lpk`, `.dproj`).
+    Markup,
+    Json,
+    /// `.ini`, `.toml`, `.cfg`.
+    Config,
+    Yaml,
+    Shell,
+    Markdown,
+    /// Anything without colours (`.txt` and the rest).
+    Text,
+}
+
+/// The language of a file, from its extension (case does not matter).
+pub fn language_for(path: &std::path::Path) -> Language {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "pas" | "pp" | "lpr" | "dpr" | "dpk" | "inc" => Language::Pascal,
+        "lfm" | "dfm" => Language::Form,
+        "xml" | "lpi" | "lpk" | "dproj" | "plist" => Language::Markup,
+        "json" => Language::Json,
+        "ini" | "toml" | "cfg" => Language::Config,
+        "yml" | "yaml" => Language::Yaml,
+        "sh" => Language::Shell,
+        "md" | "markdown" => Language::Markdown,
+        _ => Language::Text,
+    }
+}
+
+/// The tokens of `text` for `lang`: contiguous spans that cover the whole text.
+pub fn tokenize_for(lang: Language, text: &str) -> Vec<(Kind, usize, usize)> {
+    match lang {
+        Language::Pascal => tokenize(text),
+        Language::Form => scan(text, form_token),
+        Language::Markup => scan(text, markup_token),
+        Language::Json => scan(text, json_token),
+        Language::Config => scan(text, config_token),
+        Language::Yaml => scan(text, yaml_token),
+        Language::Shell => scan(text, shell_token),
+        Language::Markdown => scan(text, markdown_token),
+        Language::Text => scan(text, |_, _| None),
+    }
+}
+
 /// `line_height` spaces the lines out the way Xcode does (about 1.5 times the font size).
 pub fn layout(text: &str, pal: &Palette, font: FontId, line_height: f32) -> LayoutJob {
+    layout_for(Language::Pascal, text, pal, font, line_height)
+}
+
+/// [`layout`] for a file of language `lang`.
+pub fn layout_for(lang: Language, text: &str, pal: &Palette, font: FontId, line_height: f32) -> LayoutJob {
     let mut job = LayoutJob::default();
-    for (kind, s, e) in tokenize(text) {
+    for (kind, s, e) in tokenize_for(lang, text) {
         let mut format = TextFormat::simple(font.clone(), color(kind, pal));
         format.line_height = Some(line_height);
         job.append(&text[s..e], 0.0, format);
     }
     job
+}
+
+/// Walks `text`: at each position `token` may return a token (its kind and length in bytes); anything else
+/// is plain text, and plain runs are merged. The spans cover the whole text.
+fn scan(text: &str, mut token: impl FnMut(&str, usize) -> Option<(Kind, usize)>) -> Vec<(Kind, usize, usize)> {
+    let mut out: Vec<(Kind, usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if let Some((kind, len)) = token(text, i).filter(|(_, n)| *n > 0 && i + *n <= text.len()) {
+            out.push((kind, i, i + len));
+            i += len;
+            continue;
+        }
+        let w = text[i..].chars().next().map_or(1, char::len_utf8);
+        match out.last_mut() {
+            Some(last) if last.0 == Kind::Plain && last.2 == i => last.2 = i + w,
+            _ => out.push((Kind::Plain, i, i + w)),
+        }
+        i += w;
+    }
+    out
+}
+
+fn is_ident(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Whether a word starts at `i` (not in the middle of one).
+fn word_start(text: &str, i: usize) -> bool {
+    i == 0 || !is_ident(text.as_bytes()[i - 1])
+}
+
+/// The length of the identifier-like word at `i` (letters, digits, `_`).
+fn word_len(text: &str, i: usize) -> usize {
+    text.as_bytes()[i..].iter().take_while(|b| is_ident(**b)).count()
+}
+
+/// The end of the line that holds `i` (its `\n`, or the end of the text).
+fn line_end(text: &str, i: usize) -> usize {
+    text[i..].find('\n').map_or(text.len(), |k| i + k)
+}
+
+fn line_start(text: &str, i: usize) -> bool {
+    i == 0 || text.as_bytes()[i - 1] == b'\n'
+}
+
+/// A quoted run starting at `i` with quote `q`, up to its closing quote on the same line (or the line's end).
+fn quoted(text: &str, i: usize, q: u8) -> usize {
+    let bytes = text.as_bytes();
+    let end = line_end(text, i);
+    (i + 1..end).find(|&j| bytes[j] == q).map_or(end - i, |j| j + 1 - i)
+}
+
+/// Whether the next non-blank character after `i + len` is `sep` (a key before `=` or `:`).
+fn followed_by(text: &str, i: usize, len: usize, sep: u8) -> bool {
+    text.as_bytes()[i + len..].iter().find(|b| **b != b' ' && **b != b'\t').is_some_and(|b| *b == sep)
+}
+
+/// A keyword-like word at `i` (whole words only): its length, when it is one of `words`.
+fn word_in(text: &str, i: usize, words: &[&str]) -> Option<usize> {
+    if !word_start(text, i) {
+        return None;
+    }
+    let n = word_len(text, i);
+    let word = text[i..i + n].to_ascii_lowercase();
+    (n > 0 && words.contains(&word.as_str())).then_some(n)
+}
+
+fn is_number_at(text: &str, i: usize) -> Option<usize> {
+    let n = word_len(text, i);
+    (n > 0 && word_start(text, i) && text.as_bytes()[i].is_ascii_digit()).then_some(n)
+}
+
+/// `object`, `inherited` and friends, strings (with `#nn` character codes), numbers, and class names.
+fn form_token(text: &str, i: usize) -> Option<(Kind, usize)> {
+    match text.as_bytes()[i] {
+        b'\'' => Some((Kind::String, quoted(text, i, b'\''))),
+        b'#' => {
+            let n = text.as_bytes()[i + 1..].iter().take_while(|b| b.is_ascii_digit()).count();
+            (n > 0).then_some((Kind::String, 1 + n))
+        }
+        _ => {
+            if let Some(n) = word_in(text, i, &["object", "inherited", "inline", "end"]) {
+                return Some((Kind::Keyword, n));
+            }
+            if let Some(n) = is_number_at(text, i) {
+                return Some((Kind::Number, n));
+            }
+            if word_start(text, i) && text.is_char_boundary(i) {
+                let n = word_len(text, i);
+                if n > 0 && looks_like_type(&text[i..i + n]) {
+                    return Some((Kind::UserType, n));
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Tags (`<name`, `</name`), attribute values and comments.
+fn markup_token(text: &str, i: usize) -> Option<(Kind, usize)> {
+    let rest = &text[i..];
+    if rest.starts_with("<!--") {
+        let end = rest.find("-->").map_or(text.len(), |k| i + k + 3);
+        return Some((Kind::Comment, end - i));
+    }
+    let b = text.as_bytes();
+    match b[i] {
+        b'<' => {
+            let start = if b.get(i + 1) == Some(&b'/') { i + 2 } else { i + 1 };
+            let n = b[start.min(b.len())..]
+                .iter()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(**c, b'-' | b'_' | b':' | b'.'))
+                .count();
+            (n > 0).then_some((Kind::Keyword, start + n - i))
+        }
+        b'"' => Some((Kind::String, quoted(text, i, b'"'))),
+        _ => None,
+    }
+}
+
+/// Strings and numbers, `true`/`false`/`null`, and the keys (a string or a word before `:`).
+fn json_token(text: &str, i: usize) -> Option<(Kind, usize)> {
+    match text.as_bytes()[i] {
+        b'"' => Some((Kind::String, quoted(text, i, b'"'))),
+        b'-' | b'0'..=b'9' => {
+            let n = text.as_bytes()[i..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit() || matches!(**b, b'-' | b'+' | b'.' | b'e' | b'E'))
+                .count();
+            (n > 0 && (text.as_bytes()[i] != b'-' || text.as_bytes().get(i + 1).is_some_and(u8::is_ascii_digit)))
+                .then_some((Kind::Number, n))
+        }
+        _ => word_in(text, i, &["true", "false", "null"]).map(|n| (Kind::Keyword, n)),
+    }
+}
+
+/// `[section]` headers, `#` and `;` comments, quoted values, numbers, booleans and keys (a word before `=`).
+fn config_token(text: &str, i: usize) -> Option<(Kind, usize)> {
+    match text.as_bytes()[i] {
+        b'#' | b';' => Some((Kind::Comment, line_end(text, i) - i)),
+        b'[' if line_start(text, i) => {
+            let end = line_end(text, i);
+            let close = text[i..end].find(']').map_or(end - i, |k| k + 1);
+            Some((Kind::Keyword, close))
+        }
+        b'"' | b'\'' => Some((Kind::String, quoted(text, i, text.as_bytes()[i]))),
+        _ => {
+            if let Some(n) = word_in(text, i, &["true", "false", "yes", "no", "on", "off"]) {
+                return Some((Kind::Keyword, n));
+            }
+            if let Some(n) = is_number_at(text, i) {
+                return Some((Kind::Number, n));
+            }
+            let n = word_len(text, i);
+            (n > 0 && word_start(text, i) && followed_by(text, i, n, b'=')).then_some((Kind::Call, n))
+        }
+    }
+}
+
+/// `#` comments, quoted strings, numbers, booleans and keys (a word before `:`).
+fn yaml_token(text: &str, i: usize) -> Option<(Kind, usize)> {
+    match text.as_bytes()[i] {
+        b'#' => Some((Kind::Comment, line_end(text, i) - i)),
+        b'"' | b'\'' => Some((Kind::String, quoted(text, i, text.as_bytes()[i]))),
+        _ => {
+            if let Some(n) = word_in(text, i, &["true", "false", "null", "yes", "no", "on", "off"]) {
+                return Some((Kind::Keyword, n));
+            }
+            if let Some(n) = is_number_at(text, i) {
+                return Some((Kind::Number, n));
+            }
+            let n = word_len(text, i);
+            (n > 0 && word_start(text, i) && followed_by(text, i, n, b':')).then_some((Kind::Call, n))
+        }
+    }
+}
+
+/// `#` comments, quoted strings, `$variables`, and the shell's keywords.
+fn shell_token(text: &str, i: usize) -> Option<(Kind, usize)> {
+    match text.as_bytes()[i] {
+        b'#' => Some((Kind::Comment, line_end(text, i) - i)),
+        b'"' | b'\'' => Some((Kind::String, quoted(text, i, text.as_bytes()[i]))),
+        b'$' => {
+            let n = word_len(text, i + 1);
+            (n > 0).then_some((Kind::BuiltinType, 1 + n))
+        }
+        _ => {
+            if let Some(n) = word_in(
+                text,
+                i,
+                &["if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac", "in", "function", "return", "exit", "export", "local"],
+            ) {
+                return Some((Kind::Keyword, n));
+            }
+            is_number_at(text, i).map(|n| (Kind::Number, n))
+        }
+    }
+}
+
+/// Headings (a line starting with `#`), inline code and fenced code lines.
+fn markdown_token(text: &str, i: usize) -> Option<(Kind, usize)> {
+    match text.as_bytes()[i] {
+        b'#' if line_start(text, i) => Some((Kind::Keyword, line_end(text, i) - i)),
+        b'`' if text[i..].starts_with("```") && line_start(text, i) => Some((Kind::String, line_end(text, i) - i)),
+        b'`' => Some((Kind::String, quoted(text, i, b'`'))),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -273,6 +535,112 @@ mod tests {
         assert!(got.contains(&(Kind::Call, "Foo")));
         assert!(!got.iter().any(|(_, w)| *w == "x" || *w == "y" || *w == "z"));
         assert!(!looks_like_type("Tab") && !looks_like_type("T") && looks_like_type("TX"));
+    }
+
+    fn kinds_for(lang: Language, src: &str) -> Vec<(Kind, &str)> {
+        tokenize_for(lang, src)
+            .into_iter()
+            .map(|(k, s, e)| (k, &src[s..e]))
+            .filter(|(k, _)| *k != Kind::Plain)
+            .collect()
+    }
+
+    #[test]
+    fn a_file_is_highlighted_by_its_extension() {
+        use std::path::Path;
+        assert_eq!(language_for(Path::new("unit1.pas")), Language::Pascal);
+        assert_eq!(language_for(Path::new("notes.lpr")), Language::Pascal);
+        assert_eq!(language_for(Path::new("MainForm.LFM")), Language::Form);
+        assert_eq!(language_for(Path::new("app.lpi")), Language::Markup);
+        assert_eq!(language_for(Path::new("pascoda.toml")), Language::Config);
+        assert_eq!(language_for(Path::new("build.sh")), Language::Shell);
+        assert_eq!(language_for(Path::new("README.md")), Language::Markdown);
+        assert_eq!(language_for(Path::new("notes.txt")), Language::Text);
+        assert_eq!(language_for(Path::new("LICENSE")), Language::Text);
+    }
+
+    #[test]
+    fn every_language_covers_the_whole_text_with_unicode_and_unterminated_runs() {
+        let samples = [
+            "unit é; {\u{1F600}} 'open",
+            "object Form1: TForm1\n  Caption = 'Hi é'#13#10\n  Left = 10\nend\n",
+            "<?xml version=\"1.0\"?>\n<!-- c é -->\n<Project><Item a=\"1\"/></Project>",
+            "{\"a\": [1, -2.5e3, true, null], \"é\": \"x\n",
+            "[core]\n# note é\nname = \"x\"\nflag = yes\n",
+            "key: value # c\n- 'quoted'\nnum: 12\n",
+            "#!/bin/sh\nif [ \"$HOME\" ]; then echo 'é'; fi # c\n",
+            "# Title é\nText `code` and\n```\nfenced\n```\n",
+            "plain é text\n",
+        ];
+        for lang in [
+            Language::Pascal,
+            Language::Form,
+            Language::Markup,
+            Language::Json,
+            Language::Config,
+            Language::Yaml,
+            Language::Shell,
+            Language::Markdown,
+            Language::Text,
+        ] {
+            for src in samples {
+                let spans = tokenize_for(lang, src);
+                let mut at = 0;
+                for (_, s, e) in &spans {
+                    assert_eq!(*s, at, "{lang:?}: spans must be contiguous");
+                    assert!(e > s);
+                    at = *e;
+                }
+                assert_eq!(at, src.len(), "{lang:?}: spans must cover the text");
+            }
+        }
+    }
+
+    #[test]
+    fn each_language_colours_its_own_tokens() {
+        assert_eq!(
+            kinds_for(Language::Json, "{\"a\": [1, true, null]}"),
+            vec![(Kind::String, "\"a\""), (Kind::Number, "1"), (Kind::Keyword, "true"), (Kind::Keyword, "null")]
+        );
+        assert_eq!(
+            kinds_for(Language::Config, "[core]\n# note\nname = \"x\"\nflag = yes\n"),
+            vec![(Kind::Keyword, "[core]"), (Kind::Comment, "# note"), (Kind::Call, "name"), (Kind::String, "\"x\""), (Kind::Call, "flag"), (Kind::Keyword, "yes")]
+        );
+        assert_eq!(
+            kinds_for(Language::Yaml, "key: 12 # c\n"),
+            vec![(Kind::Call, "key"), (Kind::Number, "12"), (Kind::Comment, "# c")]
+        );
+        assert_eq!(
+            kinds_for(Language::Shell, "if [ \"$HOME\" ]; then echo 'x'; fi # c"),
+            vec![
+                (Kind::Keyword, "if"),
+                (Kind::String, "\"$HOME\""),
+                (Kind::Keyword, "then"),
+                (Kind::String, "'x'"),
+                (Kind::Keyword, "fi"),
+                (Kind::Comment, "# c"),
+            ]
+        );
+        assert_eq!(
+            kinds_for(Language::Markup, "<Project a=\"1\"/><!-- c -->"),
+            vec![(Kind::Keyword, "<Project"), (Kind::String, "\"1\""), (Kind::Comment, "<!-- c -->")]
+        );
+        assert_eq!(
+            kinds_for(Language::Form, "object Form1: TForm1\n  Caption = 'Hi'#13\n  Left = 10\nend\n"),
+            vec![
+                (Kind::Keyword, "object"),
+                (Kind::UserType, "TForm1"),
+                (Kind::String, "'Hi'"),
+                (Kind::String, "#13"),
+                (Kind::Number, "10"),
+                (Kind::Keyword, "end"),
+            ]
+        );
+        assert_eq!(
+            kinds_for(Language::Markdown, "# Title\ntext `code`\n"),
+            vec![(Kind::Keyword, "# Title"), (Kind::String, "`code`")]
+        );
+        assert!(kinds_for(Language::Text, "if then 'x' # 1").is_empty(), "plain text has no colours");
     }
 
     #[test]

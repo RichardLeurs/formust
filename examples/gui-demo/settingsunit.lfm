@@ -52,7 +52,7 @@ object SettingsForm: TSettingsForm
   end
   object OKButton: TBitBtn
     Anchors = [akRight, akBottom]
-    Left = 160
+    Left = 152
     Height = 30
     Top = 218
     Width = 75

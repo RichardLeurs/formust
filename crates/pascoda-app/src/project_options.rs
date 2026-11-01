@@ -87,6 +87,8 @@ pub struct Editor {
     pub workdir: String,
     /// The build configuration Run builds (Debug builds the debug configuration either way).
     pub configuration: pascoda_project::Configuration,
+    /// The `lazarus` key: the Lazarus source folder whose LCL builds the project. Empty: the bundled Lazarus.
+    pub lazarus: String,
 }
 
 impl Editor {
@@ -108,6 +110,7 @@ impl Editor {
             configuration: pascoda_project::load_configuration(root),
             args: text(&pascoda_project::load_run(root).args),
             workdir: pascoda_project::load_run(root).workdir,
+            lazarus: pascoda_project::load_lazarus_text(root),
         }
     }
 
@@ -138,6 +141,16 @@ impl Editor {
                 out.push(format!("“{s}” is not a switch a project may pass, so the build ignores it"));
             }
         }
+        let lazarus = self.lazarus.trim();
+        if !lazarus.is_empty() {
+            let folder = std::path::Path::new(lazarus);
+            let folder = if folder.is_absolute() { folder.to_path_buf() } else { root.join(folder) };
+            if !pascoda_fpc::lcl::is_lazarus_tree(&folder) {
+                out.push(format!(
+                    "“{lazarus}” is not a Lazarus source folder (it needs lcl/ and components/lazutils/), so the bundled Lazarus is used"
+                ));
+            }
+        }
         let workdir = self.workdir.trim();
         if !workdir.is_empty() && !root.join(workdir.replace('\\', "/")).is_dir() {
             out.push(format!("The working folder “{workdir}” does not exist, so the program would not start"));
@@ -154,6 +167,7 @@ impl Editor {
         pascoda_project::save_compiler(root, &self.settings()).map_err(|e| e.to_string())?;
         pascoda_project::save_output(root, &self.output).map_err(|e| e.to_string())?;
         pascoda_project::save_configuration(root, self.configuration).map_err(|e| e.to_string())?;
+        pascoda_project::save_lazarus(root, &self.lazarus).map_err(|e| e.to_string())?;
         pascoda_project::save_run(
             root,
             &pascoda_project::RunSettings { args: lines(&self.args), workdir: self.workdir.trim().to_string() },
@@ -219,6 +233,27 @@ mod tests {
         let missing = Editor { workdir: "nope".into(), ..Editor::default() };
         assert!(missing.warnings(&root).iter().any(|w| w.contains("working folder “nope”")));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_lazarus_folder_is_saved_and_a_folder_that_is_no_lazarus_is_warned_about() {
+        let root = tmp("lazarus-folder");
+        let mut e = Editor::load(&root, String::new());
+        assert_eq!(e.lazarus, "");
+        assert!(e.warnings(&root).is_empty());
+        e.lazarus = "nowhere".into();
+        let w = e.warnings(&root);
+        assert!(w.iter().any(|w| w.contains("not a Lazarus source folder")), "{w:?}");
+        std::fs::create_dir_all(root.join("laz/lcl/interfaces/cocoa")).unwrap();
+        std::fs::create_dir_all(root.join("laz/components/lazutils")).unwrap();
+        e.lazarus = "laz".into();
+        assert!(e.warnings(&root).is_empty(), "a relative folder is from the project: {:?}", e.warnings(&root));
+        e.save(&root).unwrap();
+        assert_eq!(Editor::load(&root, String::new()).lazarus, "laz");
+        assert_eq!(pascoda_project::load_lazarus(&root), Some(root.join("laz")));
+        e.lazarus.clear();
+        e.save(&root).unwrap();
+        assert_eq!(pascoda_project::load_lazarus(&root), None, "emptied: back to the bundled Lazarus");
     }
 
     #[test]

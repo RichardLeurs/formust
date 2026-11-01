@@ -2,6 +2,9 @@
 # needs Pascal sources for aarch64-darwin: no other targets, no data files, docs or examples.
 # Packages below are left out: none is needed for the LCL and the notes example. univint and
 # cocoaint stay: CodeTools needs univint to resolve the Cocoa types the examples use.
+# The compiler and utils are only there for packaging/fpc-build.sh.
+/compiler/
+/utils/
 /rtl/java/
 /rtl/embedded/
 /rtl/android/

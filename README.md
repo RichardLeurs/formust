@@ -4,12 +4,12 @@ A modern Pascal IDE with coding agents for macOS.
 
 ![Pascoda: the code editor, the AI assistant pane with a local Ollama model, and the terminal](pascoda.png)
 
-A modern IDE for Pascal (macOS ARM for now), written in Rust. It wraps the Free Pascal compiler and aims at apps with a macOS-native look and feel.
+A modern IDE for Pascal on macOS (Universal), written in Rust. It wraps the Free Pascal compiler and builds app for macOS (ARM & Universal).
 
 Supports coding agents (OpenAI API and compatible, OpenAI Codex CLI, Claude Console API, Claude Code CLI for now). 
 Connect local LLM-models using oMLX and Ollama. OpenAI Codex CLI and Claude Code CLI (and other CLI's) run in the Pascoda terminal inside the IDE.
 
-> ** Status: early work in progress. The Pascoda IDE app builds and compiles Pascal code and builds .app and .dmg ** 
+> ** Status: early work in progress. The Pascoda IDE app runs Pascal code and builds .app and .dmg files ** 
 
 ## Specs
 
@@ -18,22 +18,26 @@ Connect local LLM-models using oMLX and Ollama. OpenAI Codex CLI and Claude Code
 | Debugger | working | lldb through `lldb-dap`: breakpoints, step, call stack, variables; Pascal sets are not shown |
 | Code completion | working | `pasls`: Ctrl+Space and as-you-type completion, hover, F12 and Cmd-click go-to-definition, parameter hints, outline, find references and rename; the project's required packages are on its search path (a changed project file needs a restart) |
 | Build and run | working | console and GUI programs, progress bar, Problems pane, export to `.app` and `.dmg` |
-| Project files | working | `.lpi` and `.dproj` give the main program, search paths, defines, target and switches; `.lpk` and `.dpk` packages are read and their folders join the builds; `.dfm` opens in the designer; Project Options edits mode, defines, paths, run arguments and Debug or Release |
-| Form designer | working | native controls, palette, menus, action lists, anchors; the project's own components appear on a "Project" palette page |
+| Project files | working | `.lpi` and `.dproj` give the main program, search paths, defines, target and switches; `.lpk` and `.dpk` packages are read and their folders join the builds; `.dfm` opens in the designer; Project Options edits mode, defines, paths, run arguments, Debug or Release and the Lazarus folder whose LCL builds the project; a unit in a subfolder builds the project's program; the `.lpi` `RequiredPackages` are followed (from imports, the project or the Lazarus in use) and a package not found is a Problems-pane warning |
+| Form designer | working | native controls, a palette of 115 components on six pages, menus, action lists, anchors, frames (File > New Frame); the project's own components appear on a "Project" palette page |
 | File tree | working | new file, new folder, rename, move by drag and drop, delete to the Trash |
 | Terminal | working | a real login shell in the bottom pane |
 | AI assistant | working | Claude Console API, Claude Code CLI, OpenAI API, Codex CLI, and OpenAI-compatible servers (oMLX, Ollama, Open WebUI, any other); keys in the Keychain |
-| Packaging | partly | `Pascoda.app` and `Pascoda.dmg` build and ship the language server, the LCL and the FPC sources; the notarization path has not been run |
+| Packaging | partly | `packaging/bundle.sh` builds three apps with a disk image each (Apple Silicon, Intel, universal) that ship the language server, the LCL, the FPC sources and the compilers; none was run on an Intel Mac; the notarization path has not been run |
 
 ### Spec progress
 
-`docs/specs.md` is the checklist of what the IDE should do: 53 of its 77 items are done and tested (an item is ticked only when the code does what it says and a test covers it). Most of the open ones are small or later work:
+`docs/specs.md` is the checklist of what the IDE should do: 65 of its 87 items are done and tested (an item is ticked only when the code does what it says and a test covers it). Most of the open ones are small or later work:
 
-- **Medium (P2):** frames (`TFrame`) in the designer is partly done; property editors for fonts, colours and collections; code formatting (`pasls` format or Jcf); trying a real Lazarus project; in-memory and file datasets (TBufDataset, TMemDataset, TDbf) with data-aware controls.
+- **Medium (P2):** trying a real Lazarus project (first findings with CudaText: item 71).
 - **Later (P3):** bookmarks, snippets, keyboard shortcut customisation, threads, disassembly and memory views, a Tools menu, F1 help lookup, profiling, project groups, designer zoom, localisation of forms.
 - **Much later (P4):** code folding, Git in the IDE, a notarized release, iOS and iPadOS, trying a real Delphi project, an IDE plugin system, a Universal (Intel) export.
 
-Done recently: Find and replace, rename symbol, the Tests pane (FPCUnit), watches, conditional breakpoints, Project Options, Debug and Release builds, inherited forms, data modules, the OpenAI-compatible providers, the missing-tools window that installs the language server, the LCL or the FPC sources from the Terminal, and Free Pascal itself, which now ships inside the app.
+Done recently: Format Code (Ctrl+Cmd+I, and on save), Find and replace, rename symbol, the Tests pane (FPCUnit), watches, conditional breakpoints, Project Options, Debug and Release builds, inherited forms, data modules, the OpenAI-compatible providers, the missing-tools window that installs the language server, the LCL or the FPC sources from the Terminal, and Free Pascal itself, which now ships inside the app.
+
+## Documentation
+
+The documentation site is in `vitepress/` (`cd vitepress && npm install && npm run docs:dev`). `docs/specs.md` is the full checklist. The `docs-writer` agent (`.claude/agents/docs-writer.md`) updates the README, the specs and the site after a change.
 
 ## Requirements
 
@@ -42,30 +46,29 @@ You need an Apple Silicon Mac with macOS 14 Sonoma or later (generated apps targ
 | Tool | Used for | Notes |
 |---|---|---|
 | Rust (stable, tested with 1.98) | building the IDE | edition 2024 features are used |
-| Free Pascal 3.2.2 (`fpc`) | compiling Pascal | shipped in `Pascoda.app`; to run from a checkout, `brew install fpc` then `packaging/fpc-bundle.sh vendor/fpc` (an `fpc` on the `PATH` is used when there is no `vendor/fpc`; `PASCODA_FPC` overrides both) |
+| Free Pascal 3.2.4-rc2 (`fpc`) | compiling Pascal | shipped in the `Pascoda-*.app` bundles (a release candidate, tag `release_3_2_4_rc2`; there is no final 3.2.4 tag); to run from a checkout, `brew install fpc` (only to start the build) then `packaging/fpc-build.sh` (an `fpc` on the `PATH` is used when there is no `vendor/fpc`; `PASCODA_FPC` overrides both) |
 | Xcode (Command Line Tools at minimum) | linker, `codesign`, `lldb-dap` | the debugger adapter `lldb-dap` ships only inside Xcode |
 
 ### Vendored sources (in `vendor/`, not committed)
 
 | Folder | What | Source | Used for |
 |---|---|---|---|
-| `vendor/fpc` | the Free Pascal compiler (`bin/fpc`) and its precompiled units, with licences and a source offer | copied from an installed Free Pascal 3.2.2 by `packaging/fpc-bundle.sh` | compiling Pascal; wins over an `fpc` on the `PATH` |
+| `vendor/fpc` | the Free Pascal compilers (`bin/fpc` for arm64, `bin/ppcrossx64` for Intel) and their precompiled units for both CPUs, with licences and a source offer | built from `vendor/fpcsrc` by `packaging/fpc-build.sh` | compiling Pascal; wins over an `fpc` on the `PATH` |
 | `vendor/pasls` | Pascal language server | github.com/genericptr/pascal-language-server | completion, go-to-definition |
 | `vendor/lazarus` | Lazarus source tree (tested at commit `2dbcbed8`) | gitlab.com/freepascal.org/lazarus/lazarus | `pasls` CodeTools backend and the LCL for GUI apps |
-| `vendor/fpcsrc` | FPC 3.2.2 `rtl` and `packages` (tag `release_3_2_2`) | gitlab.com/freepascal.org/fpc/source | lets the language server read standard units, and the database and FPCUnit sources |
+| `vendor/fpcsrc` | FPC 3.2.4-rc2 `compiler`, `rtl`, `packages` and `utils` (tag `release_3_2_4_rc2`) | gitlab.com/freepascal.org/fpc/source | builds `vendor/fpc`; lets the language server read standard units, and the database and FPCUnit sources |
 
-Set them up from the project root. Install Free Pascal first (`brew install fpc`), because `pasls` is built with it
-and `vendor/fpc` is copied from it:
+Set them up from the project root. Install Free Pascal first (`brew install fpc`): it starts the build of `vendor/fpc`, which `pasls` is then built with:
 
 ```sh
 mkdir -p vendor && cd vendor
 git clone --depth 1 --recurse-submodules https://github.com/genericptr/pascal-language-server.git pasls
 git clone --depth 1 --filter=blob:none https://gitlab.com/freepascal.org/lazarus/lazarus.git lazarus
-git clone --depth 1 --branch release_3_2_2 --filter=blob:none --sparse \
+git clone --depth 1 --branch release_3_2_4_rc2 --filter=blob:none --sparse \
   https://gitlab.com/freepascal.org/fpc/source.git fpcsrc
-(cd fpcsrc && git sparse-checkout set rtl packages)
+(cd fpcsrc && git sparse-checkout set compiler rtl packages utils)
 (cd pasls/src && LAZARUSDIR="$PWD/../../lazarus" bash build_fpc.sh)
-cd .. && packaging/fpc-bundle.sh vendor/fpc     # after the clones: it takes the licence texts from them
+cd .. && packaging/fpc-build.sh                 # about 5 minutes: arm64 and Intel compilers into vendor/fpc
 ```
 
 The language server binary ends up in `vendor/pasls/dist/aarch64-darwin/pasls`. Without it the
@@ -74,8 +77,8 @@ built. Without `vendor/fpc` the IDE uses the `fpc` on your `PATH` (or `PASCODA_F
 works with only `brew install fpc`; `vendor/fpc` makes it use the same compiler and units as the shipped app.
 
 The built app does not need this step: `packaging/bundle.sh` ships the needed parts of `vendor/`
-inside `Pascoda.app` (about 300 MB, 134 MB of it the Free Pascal compiler and its units, copied from the
-installed `fpc` by `packaging/fpc-bundle.sh`). Only the Command Line Tools (linker and macOS SDK) must be
+inside each app (sizes in the table under Packaging; the Apple Silicon app holds the Free Pascal compilers and units for arm64, Intel and Windows,
+copied from `vendor/fpc`, which `packaging/fpc-build.sh` builds). Only the Command Line Tools (linker and macOS SDK) must be
 installed on the Mac.
 
 A copy that lacks them (a checkout without `vendor/`, a damaged app) opens a "Some tools are missing"
@@ -97,16 +100,28 @@ seconds, so they need the tools above. The first GUI build compiles the LCL into
 ## Packaging
 
 ```sh
-packaging/bundle.sh [output-dir]     # Pascoda.app, default dir ~/Library/Caches/Pascoda/dist
-packaging/make-dmg.sh [output-dir]   # runs bundle.sh, then builds Pascoda.dmg (app + Applications shortcut)
+packaging/bundle.sh [output-dir]     # three apps and three disk images, default dir ~/Downloads/Pascoda
+ARCHES="aarch64-darwin universal-darwin" packaging/bundle.sh   # only the listed builds (default: all three)
+NO_DMG=1 packaging/bundle.sh         # apps only, no disk images
 ```
 
-Builds `Pascoda.app` (release build, `packaging/Pascoda.icns`, `Info.plist` with version,
+`bundle.sh` makes one app and one disk image (app + Applications shortcut) per build:
+
+| Build | Files | Holds | dmg | app |
+|---|---|---|---|---|
+| Apple Silicon | `Pascoda-aarch64-darwin.app` / `.dmg` | arm64 executable, `vendor/fpc` (arm64 compiler, Intel cross compiler, Windows units), arm64 `pasls` | about 431 MB | about 970 MB |
+| Intel | `Pascoda-x86_64-darwin.app` / `.dmg` | x86_64 executable, `vendor/fpc-intel` (the compiler that runs on Intel), x86_64 `pasls`; no Windows export (the Intel compiler cannot build Windows programs, the app falls back) | about 189 MB | about 343 MB |
+| Universal | `Pascoda-universal-darwin.app` / `.dmg` | both executables joined with `lipo`, both compilers, both `pasls` | about 524 MB | about 1.1 GB |
+
+A bundle is replaced only when the same build is made again; other files in the output folder (including an older
+`Pascoda.app`) are not deleted. `packaging/make-dmg.sh` still expects the old single `Pascoda.app` and has not been
+updated for these names.
+
+Each build (release build, `packaging/Pascoda.icns`, `Info.plist` with version,
 copyright and minimum macOS taken from the sources) and signs it ad hoc, which runs on this Mac only.
 The bundle carries the toolchain sources it needs (`Contents/Resources/vendor`: the LCL, CodeTools,
-FPC sources, the `pasls` binary and the Free Pascal compiler with its units, about 300 MB), so it does not
-depend on this checkout. `packaging/bundle.sh` copies the compiler from the `fpc` installed on the build Mac
-(`packaging/fpc-bundle.sh`). The Mac that runs the app needs the Command Line Tools (the linker and the macOS
+FPC sources, the `pasls` binary and the Free Pascal compilers with their units), so it does not
+depend on this checkout. `packaging/bundle.sh` copies the compilers from `vendor/fpc` (`packaging/fpc-build.sh`) and, for the Intel and universal builds, `vendor/fpc-intel` (`packaging/fpc-intel-build.sh`). The three apps were built and checked (executable architecture, signature, disk image checksums); none was started on an Intel Mac. The Mac that runs the app needs the Command Line Tools (the linker and the macOS
 SDK) and Xcode's `lldb-dap` for debugging.
 `packaging/make-icon.sh` regenerates the icons (`make-icon.swift`, no dependencies): `Pascoda.icns` is
 the P whose counter is a run triangle (used by the bundle), `Pascoda-classic.icns` is the plain P.
@@ -170,6 +185,7 @@ Demo projects in `examples/` (open the main file and use Build & Run; the Tests 
 **Editor**
 - Tabs, file tree, line numbers, Pascal highlighting. Compiler errors and warnings are underlined.
 - Hover, completion as you type (Ctrl+Space) and go-to-definition (F12), through the language server `pasls`.
+- Format Code (Edit > Format Code, Ctrl+Cmd+I) formats the Pascal file with the language server's JCF; Preferences has **Format on save** (off by default). The server's default settings are used: a space before the `;` of a parameter list and blank lines between sections come from them.
 - Preferences (Cmd+,): font (SF Mono, Menlo or Courier) and size, Tab width, line numbers, word wrap, and colours for each code token and the background, set separately for light and dark. Saved in `~/Library/Application Support/Pascoda/preferences`.
 - Files changed by other programs (`claude`, git, an editor in the terminal) show up. Clean tabs reload silently. A tab with unsaved edits shows a banner with **Reload** or **Keep mine**.
 - Closing a changed tab asks Save, Don't Save or Cancel. The last session's tabs and project come back at launch, and File > Open Recent lists recent projects and files.
@@ -188,11 +204,12 @@ Demo projects in `examples/` (open the main file and use Build & Run; the Tests 
 - Cmd+C, Cmd+V and Cmd+K work as in Terminal, and Ctrl+C interrupts. Menu shortcuts keep working.
 
 **Form designer** (`File > New GUI Application`, then the `Form` toggle)
-- Native macOS controls. The palette has 61 Lazarus components on five pages (Standard, Additional, Common Controls, System, Data Controls), and a tray for non-visual ones (timers, dialogs, menus, action lists, and the SQLdb database components).
+- Native macOS controls. The palette has 115 components on six pages (Standard, Additional, Common Controls, Misc, System, Data Controls); every class the LCL registers is there except TFrame, which is handled as project frames (item 45: File > New Frame, a placed frame shows its components), and a tray for non-visual ones (timers, dialogs, menus, action lists, and the database components: SQLdb, TBufDataset, TMemDataset, TDbf).
 - Select, move, resize and multi-select, with copy and paste, alignment guides, align and spacing commands, and tab order.
 - Database forms: TDBGrid (Data Controls page) and a SQLdb connection editor (Edit Connection... in the inspector for a TSQLConnector: SQLite3 or PostgreSQL, with the driver unit added to uses). The data components come with the app (no import needed).
 - Data modules (File > New Data Module): a window-less unit for non-visual components (timers, dialogs, menus, action lists), used by forms through their unit.
 - Anchors, `Align`, `AutoSize`, `AnchorSide` and `BorderSpacing`. The canvas scrolls for large forms.
+- Inspector editors for colours (named Lazarus colours or any RGB), fonts (Name, Size, Style, Color) and collection lists (Add, Remove, Up, Down).
 - Inline editors for menus and action lists. Double-click a control to create its event handler, and the `.pas` unit stays in step.
 
 **Window**
@@ -220,7 +237,7 @@ Demo projects in `examples/` (open the main file and use Build & Run; the Tests 
 
 - `fpc` binaries are only linker-signed, and `lldb` cannot launch them until they are re-signed
   with the `get-task-allow` entitlement. The build does this automatically.
-- fpc 3.2.2's Objective-C output fails with Apple's current linker. GUI builds pass
+- fpc 3.2's Objective-C output fails with Apple's current linker. GUI builds pass
   `-k-ld_classic` as a workaround; Apple has deprecated that flag, so it may stop working.
 - `pasls` crashes during `initialize` if the client sends no `clientInfo`; the client always does.
 - Generated app bundles must not set `NSPrincipalClass`, or the LCL app crashes at startup.

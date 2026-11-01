@@ -1,5 +1,6 @@
 //! Drawing and input for the designer: palette, canvas with live native controls, inspector.
 
+use super::editors;
 use super::geometry::{self, Align, Anchors, Bounds, Guide, Handle};
 use super::menu::has_item_editor;
 use super::native::{Marks, Native};
@@ -535,13 +536,16 @@ fn canvas(
     // that grew the Ui past it must not move the canvas, or the native views, under the inspector.
     let avail = ui.available_rect_before_wrap().intersect(ui.clip_rect());
     let (w, h) = geometry::form_size(d.doc.root());
+    // A frame is a plain surface the size of the frame: no window, no title bar.
+    let title = if d.is_frame() { 0.0 } else { TITLE_BAR };
     // The visible canvas, minus scroll bars where the form does not fit.
-    let (area, hbar, vbar) = viewport::split(avail, (w, h));
+    let (area, hbar, vbar) = viewport::split_with(avail, (w, h), title);
     let key = d.pas_path.clone();
-    let mut view = View::new(
+    let mut view = View::with_title(
         area,
         (w, h),
         state.scroll.get(&key).copied().unwrap_or_default(),
+        title,
     );
 
     if native.is_none()
@@ -615,60 +619,62 @@ fn canvas(
     } else {
         Color32::from_rgb(0xF2, 0xF2, 0xF2)
     };
+    let frame = d.is_frame();
     painter.rect_filled(
         client,
-        CornerRadius {
-            nw: 0,
-            ne: 0,
-            sw: 10,
-            se: 10,
-        },
+        if frame { CornerRadius::same(2) } else { CornerRadius { nw: 0, ne: 0, sw: 10, se: 10 } },
         client_bg,
     );
-    let bar = Rect::from_min_size(window.min, vec2(window.width(), TITLE_BAR));
-    painter.rect_filled(
-        bar,
-        CornerRadius {
-            nw: 10,
-            ne: 10,
-            sw: 0,
-            se: 0,
-        },
-        pal.chrome,
-    );
-    for (i, c) in [
-        Color32::from_rgb(255, 95, 87),
-        Color32::from_rgb(254, 188, 46),
-        Color32::from_rgb(40, 200, 64),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        painter.circle_filled(
-            bar.min + vec2(16.0 + 20.0 * i as f32, TITLE_BAR / 2.0),
-            6.0,
-            c,
+    if frame {
+        // A frame has no window around it: a plain, slightly outlined surface.
+        painter.rect_stroke(client, CornerRadius::same(2), Stroke::new(1.0, ui.visuals().window_stroke.color), StrokeKind::Outside);
+    }
+    if !frame {
+        let bar = Rect::from_min_size(window.min, vec2(window.width(), TITLE_BAR));
+        painter.rect_filled(
+            bar,
+            CornerRadius {
+                nw: 10,
+                ne: 10,
+                sw: 0,
+                se: 0,
+            },
+            pal.chrome,
+        );
+        for (i, c) in [
+            Color32::from_rgb(255, 95, 87),
+            Color32::from_rgb(254, 188, 46),
+            Color32::from_rgb(40, 200, 64),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            painter.circle_filled(
+                bar.min + vec2(16.0 + 20.0 * i as f32, TITLE_BAR / 2.0),
+                6.0,
+                c,
+            );
+        }
+        let caption = d
+            .doc
+            .root()
+            .prop("Caption")
+            .and_then(PropValue::as_str)
+            .unwrap_or_default();
+        painter.text(
+            bar.center(),
+            egui::Align2::CENTER_CENTER,
+            caption,
+            egui::FontId::proportional(13.0),
+            ui.visuals().text_color(),
+        );
+        painter.rect_stroke(
+            window,
+            CornerRadius::same(10),
+            Stroke::new(1.0, ui.visuals().window_stroke.color),
+            StrokeKind::Inside,
         );
     }
-    let caption = d
-        .doc
-        .root()
-        .prop("Caption")
-        .and_then(PropValue::as_str)
-        .unwrap_or_default();
-    painter.text(
-        bar.center(),
-        egui::Align2::CENTER_CENTER,
-        caption,
-        egui::FontId::proportional(13.0),
-        ui.visuals().text_color(),
-    );
-    painter.rect_stroke(
-        window,
-        CornerRadius::same(10),
-        Stroke::new(1.0, ui.visuals().window_stroke.color),
-        StrokeKind::Inside,
-    );
 
     // Input, on the visible part of the form only. The native canvas is click-through, so egui
     // sees every click and drag here.
@@ -1120,7 +1126,7 @@ pub(super) fn create_handler(d: &mut Designer, unit: &mut String, out: &mut Outc
         return;
     };
     let event = if d.selected.is_empty() {
-        "OnCreate"
+        d.root_event()
     } else {
         default_event(&class)
     };
@@ -1277,6 +1283,53 @@ fn anchor_sides(d: &mut Designer, ui: &mut egui::Ui, path: &[usize], c: &pascoda
                     }
                 });
         });
+}
+
+/// The data a control shows: the data source (chosen from the form's `TDataSource` components) and, for the
+/// controls that show one field, its name. The field is typed: the database is not open at design time.
+fn data_section(d: &mut Designer, ui: &mut egui::Ui, path: &[usize], c: &pascoda_forms::Component, has_field: bool) {
+    ui.label(RichText::new("DATA").size(10.5).strong());
+    let sources = d.data_sources();
+    let current = c.prop("DataSource").and_then(PropValue::as_ident).map(String::from);
+    egui::Grid::new(("data-section", path.to_vec()))
+        .num_columns(2)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            let lbl = ui.label("DataSource");
+            let mut choice = current.clone();
+            egui::ComboBox::from_id_salt(("data-source", path.to_vec()))
+                .width(140.0)
+                .selected_text(choice.clone().unwrap_or_else(|| "\u{2014}".into()))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut choice, None, "\u{2014} (none)");
+                    for n in &sources {
+                        ui.selectable_value(&mut choice, Some(n.clone()), n);
+                    }
+                    // A name that is not on the form (a data source of another form or unit) stays selectable.
+                    if let Some(n) = current.as_ref().filter(|n| !sources.contains(n)) {
+                        ui.selectable_value(&mut choice, Some(n.clone()), n);
+                    }
+                })
+                .response
+                .labelled_by(lbl.id);
+            if choice != current {
+                let _ = d.set_data_source(path, choice.as_deref());
+            }
+            ui.end_row();
+            if has_field {
+                let lbl = ui.label("DataField");
+                let mut field = c.prop("DataField").and_then(PropValue::as_str).map(String::from).unwrap_or_default();
+                if ui
+                    .add(egui::TextEdit::singleline(&mut field).desired_width(140.0).hint_text("field name"))
+                    .labelled_by(lbl.id)
+                    .changed()
+                {
+                    let _ = d.set_data_field(path, &field);
+                }
+                ui.end_row();
+            }
+        });
+    ui.add_space(8.0);
 }
 
 /// `BorderSpacing.Left/Top/Right/Bottom/Around`: space kept to whatever an edge is anchored or
@@ -1601,8 +1654,39 @@ fn inspector(
             border_spacing(d, ui, &path, &c);
             ui.add_space(8.0);
         }
+        if !is_form
+            && let Some(has_field) = Designer::data_binding(&class)
+            && let Some(c) = d.selected_component().cloned()
+        {
+            data_section(d, ui, &path, &c, has_field);
+        }
         if is_form || is_container(&class) {
             tab_order(d, ui, &path);
+        }
+        // Fonts and collections have their own editors (spec 47); the grid below shows the rest.
+        if !is_nonvisual(&class) && d.item_owner(&path).is_none() {
+            ui.label(
+                RichText::new("FONT")
+                    .size(10.5)
+                    .strong()
+                    .color(pal.text_tertiary),
+            );
+            for (name, value) in editors::font_editor(ui, &props) {
+                let _ = match value {
+                    Some(v) => d.set_prop(&path, &name, v),
+                    None => d.remove_prop(&path, &name),
+                };
+            }
+            ui.add_space(8.0);
+        }
+        for (pname, value) in &props {
+            if let PropValue::Collection(items) = value {
+                let id = ui.make_persistent_id(("collection", &path, pname));
+                if let Some(v) = editors::collection_editor(ui, id, pname, items) {
+                    let _ = d.set_prop(&path, pname, v);
+                }
+                ui.add_space(8.0);
+            }
         }
         egui::Grid::new("props")
             .num_columns(2)
@@ -1610,13 +1694,26 @@ fn inspector(
             .show(ui, |ui| {
                 let layout_props = ["Anchors", "Align", "AutoSize"];
                 // Anchor sides and border spacing have their own sections.
-                let own_section =
-                    |n: &str| n.starts_with("AnchorSide") || n.starts_with("BorderSpacing.");
-                for (pname, value) in props.iter().filter(|(n, _)| {
-                    !n.starts_with("On") && !layout_props.contains(&n.as_str()) && !own_section(n)
+                let bound = Designer::data_binding(&class).is_some();
+                let own_section = |n: &str| {
+                    n.starts_with("AnchorSide")
+                        || n.starts_with("BorderSpacing.")
+                        || editors::is_font_prop(n)
+                        || (bound && matches!(n, "DataSource" | "DataField"))
+                };
+                for (pname, value) in props.iter().filter(|(n, v)| {
+                    !n.starts_with("On")
+                        && !layout_props.contains(&n.as_str())
+                        && !own_section(n)
+                        && !matches!(v, PropValue::Collection(_))
                 }) {
                     let lbl = ui.label(pname);
                     match value {
+                        _ if editors::is_colour_prop(pname, value) => {
+                            if let Some(v) = editors::colour_editor(ui, ui.make_persistent_id(("colour", &path, pname)), pname, value) {
+                                let _ = d.set_prop(&path, pname, v);
+                            }
+                        }
                         PropValue::Int(i) => {
                             let mut v = *i;
                             if ui
@@ -1677,7 +1774,7 @@ fn inspector(
                 .color(pal.text_tertiary),
         );
         let event = if is_form {
-            "OnCreate"
+            d.root_event()
         } else {
             default_event(&class)
         };
@@ -1689,7 +1786,8 @@ fn inspector(
                 }
             });
         }
-        if !props.iter().any(|(n, _)| n == event)
+        if !event.is_empty()
+            && !props.iter().any(|(n, _)| n == event)
             && ui.button(format!("Create {event} handler")).clicked()
         {
             create_handler(d, unit, out);
