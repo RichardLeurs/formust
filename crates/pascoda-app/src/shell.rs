@@ -131,6 +131,10 @@ pub(crate) fn kind_word(kind: u32) -> &'static str {
 #[derive(Default)]
 struct Pending {
     goto: Option<(PathBuf, u32, u32)>,
+    /// A thread clicked in the Threads list: its frames are shown next.
+    select_thread: Option<i64>,
+    /// The Memory section asked for these bytes: the address as typed, and the count.
+    memory_request: Option<(String, u64)>,
     open: Option<PathBuf>,
     close: Option<usize>,
     designer_outcome: Option<(PathBuf, designer::ui::Outcome)>,
@@ -171,6 +175,7 @@ impl App {
         self.refresh_custom_classes();
         self.poll_live_check(ctx);
         self.poll_syntax_check();
+        self.poll_profile();
         self.poll_export(ctx);
         self.handle_close_request(ctx);
         self.show_export_dialog(ctx);
@@ -266,6 +271,24 @@ impl App {
         if let Some((file, lines)) = p.breakpoints_changed {
             self.send(debugger::Cmd::Breakpoints(file, lines));
         }
+        if let Some(id) = p.select_thread {
+            self.send(debugger::Cmd::SelectThread(id));
+        }
+        if let Some((addr, count)) = p.memory_request.take() {
+            // An empty address reads at the stopped instruction, the address the box suggests.
+            let typed = addr.trim();
+            let target = if typed.is_empty() {
+                self.paused.as_ref().and_then(|s| s.pc.clone()).ok_or_else(|| {
+                    "Type an address (hex such as 0x1000, or decimal), or stop the program to read at its instruction.".to_string()
+                })
+            } else {
+                debugger::parse_address(typed)
+            };
+            match target {
+                Ok(a) => self.send(debugger::Cmd::ReadMemory(a, count)),
+                Err(e) => self.memory = Some(Err(e)),
+            }
+        }
         if let Some((key, what)) = p.external.take() {
             self.resolve_external(Some(ctx), key, what);
         }
@@ -312,6 +335,7 @@ impl App {
                 MenuAction::PreviousBookmark => self.step_bookmark(ctx, false),
                 MenuAction::NextBookmark => self.step_bookmark(ctx, true),
                 MenuAction::Laz(tool) => self.run_laz_tool(ctx, tool),
+                MenuAction::Profile if can_build => self.start_profile_build(ctx),
                 MenuAction::OpenRecent(i) => self.open_recent(i),
                 MenuAction::ConfigureTools => self.tools_editor = Some(crate::tools_editor::Editor::new(self.tools.clone())),
                 MenuAction::Tool(i) => self.run_tool(ctx, i),
@@ -717,9 +741,9 @@ impl App {
                     ui.add_space(8.0);
                     for (tab, icon, tip) in [
                         (NavTab::Files, Icon::Files, "Project"),
-                        (NavTab::Debug, Icon::Stack, "Debug"),
-                        (NavTab::Outline, Icon::Outline, "Outline"),
                         (NavTab::Breakpoints, Icon::Breakpoint, "Breakpoints"),
+                        (NavTab::Outline, Icon::Outline, "Outline"),
+                        (NavTab::Debug, Icon::Stack, "Debug"),
                         (NavTab::Search, Icon::Search, "Search the project"),
                     ] {
                         if icon_button(ui, pal, icon, true, self.nav_tab == tab)
@@ -1370,6 +1394,32 @@ impl App {
             ui.vertical_centered(|ui| ui.label(RichText::new(text).color(pal.text_tertiary)));
             return;
         };
+        // The program's threads, the one shown first marked; a click shows that thread's frames.
+        ui.label(RichText::new("Threads").size(11.0).color(pal.text_tertiary));
+        for t in &paused.threads {
+            let (rect, resp) =
+                ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click());
+            let painter = ui.painter();
+            let inner = rect.shrink2(vec2(6.0, 0.0));
+            if t.id == paused.thread {
+                painter.rect_filled(inner, 5.0, pal.row_selected);
+            } else if resp.hovered() {
+                painter.rect_filled(inner, 5.0, pal.row_hover);
+            }
+            painter.text(
+                rect.left_center() + vec2(12.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                format!("Thread {} \u{203a} {}", t.id, t.name),
+                egui::FontId::proportional(13.0),
+                pal.text,
+            );
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Thread {} {}", t.id, t.name)));
+            if resp.clicked() && t.id != paused.thread {
+                p.select_thread = Some(t.id);
+            }
+        }
+        ui.add_space(6.0);
+        ui.label(RichText::new("Call Stack").size(11.0).color(pal.text_tertiary));
         for (i, f) in paused.source_frames().enumerate() {
             let Some(file) = &f.file else { continue };
             let name = file
@@ -3344,6 +3394,8 @@ impl App {
                     .show(ui, |ui| match &self.paused {
                         Some(paused) => {
                             let source = self.docs.get(self.active).map_or("", |d| d.text.as_str());
+                            disassembly_rows(ui, pal, paused);
+                            memory_rows(ui, pal, paused, &mut self.memory_addr, &mut self.memory_count, &self.memory, p);
                             variable_rows(ui, pal, paused, source, &mut self.var_open, p);
                         }
                         None => {
@@ -4378,6 +4430,56 @@ fn var_row(
 /// an amber brown, so light mode uses a clear yellow instead; dark mode already has one.
 fn warning_yellow(pal: &Palette) -> egui::Color32 {
     if pal.dark { pal.warning } else { egui::Color32::from_rgb(0xF5, 0xB8, 0x00) }
+}
+
+/// The disassembly around the stop, with the stopped instruction marked.
+fn disassembly_rows(ui: &mut egui::Ui, pal: &Palette, paused: &debugger::Paused) {
+    egui::CollapsingHeader::new("Disassembly").default_open(false).show(ui, |ui| {
+        if paused.disasm.is_empty() {
+            ui.label(RichText::new("No instructions to show: the stop has no address the debugger can disassemble.").size(12.0).color(pal.text_tertiary));
+            return;
+        }
+        for ins in &paused.disasm {
+            let current = paused.pc.as_deref() == Some(ins.address.as_str());
+            let (mark, color) = if current { ("\u{25b6}", pal.accent) } else { (" ", pal.text_secondary) };
+            ui.label(RichText::new(format!("{mark} {}  {}", ins.address, ins.text)).monospace().size(12.0).color(color));
+        }
+    });
+}
+
+/// A hex dump of memory at an address typed by the user (hex or decimal) and a byte count.
+fn memory_rows(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    paused: &debugger::Paused,
+    addr: &mut String,
+    count: &mut u64,
+    memory: &Option<Result<(String, Vec<u8>), String>>,
+    p: &mut Pending,
+) {
+    egui::CollapsingHeader::new("Memory").default_open(false).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            let hint = paused.pc.clone().unwrap_or_else(|| "0x0".to_string());
+            ui.add(egui::TextEdit::singleline(addr).desired_width(150.0).hint_text(hint));
+            ui.add(egui::DragValue::new(count).range(1..=4096).suffix(" bytes"));
+            if ui.button("Show").clicked() {
+                p.memory_request = Some((addr.clone(), *count));
+            }
+        });
+        match memory {
+            None => {
+                ui.label(RichText::new("Type an address (hex such as 0x1000, or decimal) and press Show.").size(12.0).color(pal.text_tertiary));
+            }
+            Some(Err(e)) => {
+                ui.label(RichText::new(e).size(12.0).color(pal.error));
+            }
+            Some(Ok((start, bytes))) => {
+                for line in debugger::hex_dump(start, bytes) {
+                    ui.label(RichText::new(line).monospace().size(12.0));
+                }
+            }
+        }
+    });
 }
 
 fn problem_rows(ui: &mut egui::Ui, pal: &Palette, diagnostics: &[Diagnostic], p: &mut Pending) {
@@ -5460,7 +5562,7 @@ mod menu_tests {
         let program = crate::program_for(&dir.join("src/unit1.pas"), &dir);
         assert_eq!(program, dir.join("app.lpr"), "the unit builds the project's program");
         let (args, _) = crate::project_args(program.parent());
-        let built = crate::build_program(&program, None, pascoda_fpc::Mode::ObjFpc, &args, None, false, &mut |_| {}).unwrap();
+        let built = crate::build_program(&program, None, "", pascoda_fpc::Mode::ObjFpc, &args, None, false, &mut |_| {}).unwrap();
         assert!(built.success, "{}", built.raw_output);
         let mut child = std::process::Command::new(pascoda_project::executable_for(&program)).spawn().unwrap();
         std::thread::sleep(std::time::Duration::from_secs(3));
@@ -5489,13 +5591,13 @@ mod menu_tests {
         let plain = pascoda_fpc::build_progress_configured(&tool, pascoda_fpc::Mode::ObjFpc, &[], None, false, &mut |_| {}).unwrap();
         assert!(!plain.success, "a plain build cannot find LCLType");
         assert!(plain.diagnostics.iter().any(|d| d.message.contains("Can't find unit LCLType")), "{}", plain.raw_output);
-        let built = crate::build_program(&tool, None, pascoda_fpc::Mode::ObjFpc, &[], None, false, &mut |_| {}).unwrap();
+        let built = crate::build_program(&tool, None, "", pascoda_fpc::Mode::ObjFpc, &[], None, false, &mut |_| {}).unwrap();
         assert!(built.success, "{}", built.raw_output);
         assert!(built.raw_output.starts_with("Built with the LCL: the program uses LCL units."), "{}", built.raw_output);
         let run = std::process::Command::new(pascoda_project::executable_for(&tool)).status().unwrap();
         assert!(run.success(), "the program runs and finds VK_RETURN = 13");
         // another missing unit: the same error, no retry
-        let other = crate::build_program(&dir.join("other.lpr"), None, pascoda_fpc::Mode::ObjFpc, &[], None, false, &mut |_| {}).unwrap();
+        let other = crate::build_program(&dir.join("other.lpr"), None, "", pascoda_fpc::Mode::ObjFpc, &[], None, false, &mut |_| {}).unwrap();
         assert!(!other.success);
         assert!(!other.raw_output.contains("Built with the LCL"), "{}", other.raw_output);
         assert!(other.diagnostics.iter().any(|d| d.message.contains("Can't find unit NoSuchUnitAnywhere")), "{}", other.raw_output);
@@ -5536,10 +5638,10 @@ mod menu_tests {
         let dir = dir.canonicalize().unwrap();
         let program = dir.join("app.lpr");
         let (args, _) = crate::project_args(Some(&dir));
-        let bundled = crate::build_program(&program, None, pascoda_fpc::Mode::ObjFpc, &args, None, false, &mut |_| {}).unwrap();
+        let bundled = crate::build_program(&program, None, "", pascoda_fpc::Mode::ObjFpc, &args, None, false, &mut |_| {}).unwrap();
         assert!(!bundled.success, "the old LazControls cannot build against the bundled LCL");
         assert!(bundled.raw_output.contains("fNeedUpdate"), "{}", bundled.raw_output);
-        let made_for = crate::build_program(&program, Some(&old), pascoda_fpc::Mode::ObjFpc, &args, None, false, &mut |_| {}).unwrap();
+        let made_for = crate::build_program(&program, Some(&old), "", pascoda_fpc::Mode::ObjFpc, &args, None, false, &mut |_| {}).unwrap();
         assert!(made_for.success, "{}", made_for.raw_output);
         let _ = std::fs::remove_dir_all(&dir);
     }

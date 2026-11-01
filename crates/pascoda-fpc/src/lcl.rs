@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Oldest macOS the generated apps support (`-WM` and `LSMinimumSystemVersion`).
-pub const MIN_MACOS: &str = "14.0";
+pub const MIN_MACOS: &str = "11.0";
 
 /// Units compiled into the cache so projects normally find them precompiled.
 const WARM_UNITS: &[&str] = &[
@@ -37,6 +37,22 @@ pub struct Lcl {
     pub cache: PathBuf,
     /// What the units are compiled for; each target has its own cache folder.
     pub target: Target,
+    /// The oldest macOS the units are compiled for (`-WM`). Units built for another minimum live in
+    /// their own cache folder, because the object files record it.
+    pub macos_min: String,
+    /// The cache folder without the target and minimum suffixes (`lcl/<fpc>-<commit>`).
+    key: PathBuf,
+}
+
+/// The cache folder of `key` for `target` and `macos_min`. The native default keeps the plain name;
+/// Windows ignores the macOS minimum, so it has no suffix for it.
+fn cache_folder(key: &Path, target: Target, macos_min: &str) -> PathBuf {
+    let mut name = key.as_os_str().to_owned();
+    name.push(target.cache_suffix());
+    if !target.is_windows() && macos_min != MIN_MACOS {
+        name.push(format!("-macos{macos_min}"));
+    }
+    PathBuf::from(name)
 }
 
 impl Lcl {
@@ -62,25 +78,43 @@ impl Lcl {
         };
         let lazarus_dir = named.or_else(enclosing).or_else(vendored)?;
         let home = std::env::var_os("HOME")?;
-        let key = format!("{}-{}", fpc_version(), commit(&lazarus_dir));
+        let key = PathBuf::from(home)
+            .join("Library/Caches/Pascoda/lcl")
+            .join(format!("{}-{}", fpc_version(), commit(&lazarus_dir)));
+        let target = Target::native();
         Some(Self {
-            cache: PathBuf::from(home)
-                .join("Library/Caches/Pascoda/lcl")
-                .join(key),
+            cache: cache_folder(&key, target, MIN_MACOS),
+            key,
             lazarus_dir,
-            target: Target::native(),
+            target,
+            macos_min: MIN_MACOS.to_string(),
         })
     }
 
     /// The same LCL for another target: its own cache folder (units differ per CPU), the same sources.
     pub fn for_target(&self, target: Target) -> Lcl {
-        let mut name = self.cache.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        name.truncate(name.strip_suffix(self.target.cache_suffix()).map_or(name.len(), str::len));
-        name.push_str(target.cache_suffix());
         Lcl {
             lazarus_dir: self.lazarus_dir.clone(),
-            cache: self.cache.with_file_name(name),
+            cache: cache_folder(&self.key, target, &self.macos_min),
+            key: self.key.clone(),
             target,
+            macos_min: self.macos_min.clone(),
+        }
+    }
+
+    /// The same LCL built for another oldest macOS (a project's `min_macos`; empty = the default).
+    /// Its units go to their own cache folder, so the first build for that minimum compiles the LCL again.
+    pub fn with_macos_min(&self, min: &str) -> Lcl {
+        let min = match min.trim() {
+            "" => MIN_MACOS,
+            v => v,
+        };
+        Lcl {
+            lazarus_dir: self.lazarus_dir.clone(),
+            cache: cache_folder(&self.key, self.target, min),
+            key: self.key.clone(),
+            target: self.target,
+            macos_min: min.to_string(),
         }
     }
 
@@ -111,7 +145,7 @@ impl Lcl {
             return args;
         }
         args.extend([
-            format!("-WM{MIN_MACOS}").into(),
+            format!("-WM{}", self.macos_min).into(),
             // fpc 3.2 emits Objective-C method lists that Apple's current linker rejects;
             // the classic linker accepts them. Apple has deprecated that flag.
             "-k-ld_classic".into(),
@@ -619,5 +653,29 @@ mod minimum_version_tests {
         assert!(plist.contains("<key>LSMinimumSystemVersion</key><string>13.0</string>"), "{plist}");
         let default = info_plist("Notes", &BundleInfo::default(), None);
         assert!(default.contains(&format!("<string>{MIN_MACOS}</string>")), "{default}");
+    }
+
+    #[test]
+    fn a_project_minimum_gets_its_own_lcl_cache_and_the_flag() {
+        let lcl = Lcl {
+            lazarus_dir: PathBuf::new(),
+            cache: cache_folder(Path::new("/c/lcl/fpc-abc"), Target::MacArm64, MIN_MACOS),
+            key: PathBuf::from("/c/lcl/fpc-abc"),
+            target: Target::MacArm64,
+            macos_min: MIN_MACOS.into(),
+        };
+        assert_eq!(lcl.cache, PathBuf::from("/c/lcl/fpc-abc"), "the default keeps the old folder");
+        let older = lcl.with_macos_min("13.0");
+        assert_eq!(older.cache, PathBuf::from("/c/lcl/fpc-abc-macos13.0"));
+        assert_eq!(older.macos_min, "13.0");
+        assert_eq!(lcl.with_macos_min(" ").cache, lcl.cache, "empty means the default");
+        assert!(older.common_args().iter().any(|a| a == "-WM13.0"), "{:?}", older.common_args());
+        assert!(lcl.common_args().iter().any(|a| a == format!("-WM{MIN_MACOS}").as_str()));
+        assert_eq!(older.for_target(Target::MacX86_64).cache, PathBuf::from("/c/lcl/fpc-abc-x86_64-macos13.0"));
+        assert_eq!(
+            lcl.with_macos_min("13.0").for_target(Target::WinX64).cache,
+            PathBuf::from("/c/lcl/fpc-abc-win64"),
+            "Windows ignores the macOS minimum"
+        );
     }
 }

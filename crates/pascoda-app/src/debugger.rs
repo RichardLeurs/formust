@@ -13,6 +13,10 @@ pub enum Cmd {
     Step(Step),
     Stop,
     Breakpoints(PathBuf, Vec<pascoda_dap::Breakpoint>),
+    /// Shows another thread's frames and variables (the program stays stopped).
+    SelectThread(i64),
+    /// Reads `count` bytes at the address (a `0x...` memory reference); answered by [`Event::Memory`].
+    ReadMemory(String, u64),
     /// The variable paths the UI shows open; they are fetched again at every stop.
     Expanded(HashSet<String>),
     /// Children of the variable at `path` (`reference` as in [`Var::reference`]) are wanted.
@@ -34,6 +38,8 @@ pub enum Cmd {
 
 pub enum Event {
     Stopped(Paused),
+    /// The bytes [`Cmd::ReadMemory`] asked for, with their address, or the error the adapter gave.
+    Memory(Result<(String, Vec<u8>), String>),
     /// The children of the variable at the path, answering [`Cmd::Fetch`].
     Children(String, Vec<Var>),
     /// The values of the watch expressions, as the `Watches` scope of the variables, answering
@@ -60,9 +66,12 @@ pub fn lldb_expression(pascal: &str) -> String {
     let mut out = String::new();
     let mut i = 0;
     let mut prev = ' ';
+    // Where the last identifier was written, so a `^` after it can wrap it (`p^` is `(*P)`).
+    let mut last_word: Option<usize> = None;
     while i < chars.len() {
         let c = chars[i];
         if c == '\'' {
+            last_word = None;
             // A string literal; a doubled quote inside it is one quote.
             out.push('\'');
             i += 1;
@@ -89,6 +98,7 @@ pub fn lldb_expression(pascal: &str) -> String {
                 i += 1;
             }
             let word: String = chars[start..i].iter().collect();
+            last_word = None;
             match word.to_ascii_lowercase().as_str() {
                 "and" => out.push_str("&&"),
                 "or" => out.push_str("||"),
@@ -97,11 +107,33 @@ pub fn lldb_expression(pascal: &str) -> String {
                 "mod" => out.push('%'),
                 "true" => out.push('1'),
                 "false" => out.push('0'),
-                _ => out.push_str(&word.to_uppercase()),
+                _ => {
+                    last_word = Some(out.len());
+                    out.push_str(&word.to_uppercase());
+                }
             }
             prev = 'a';
             continue;
         }
+        // `p^` (a dereference) is C's `(*P)`; `@x` (the address) is `&X`.
+        if c == '^' {
+            if let (Some(start), true) = (last_word, prev == 'a') {
+                out.insert_str(start, "(*");
+                out.push(')');
+                last_word = None;
+                prev = ')';
+                i += 1;
+                continue;
+            }
+        }
+        if c == '@' {
+            out.push('&');
+            last_word = None;
+            prev = '&';
+            i += 1;
+            continue;
+        }
+        last_word = None;
         let next = chars.get(i + 1).copied();
         match c {
             '<' if next == Some('>') => {
@@ -190,6 +222,12 @@ pub struct Var {
 pub struct Paused {
     pub frames: Vec<Frame>,
     pub vars: Vec<(String, Vec<Var>)>,
+    /// The program's threads at this stop, and the one whose frames are shown.
+    pub threads: Vec<pascoda_dap::Thread>,
+    pub thread: i64,
+    /// The memory reference of the shown frame's instruction pointer, and the instructions around it.
+    pub pc: Option<String>,
+    pub disasm: Vec<pascoda_dap::Instruction>,
 }
 
 /// The condition and hit condition of a breakpoint as the user wrote them: a Pascal condition, and a
@@ -296,6 +334,62 @@ pub fn spawn(
     Handle { cmds, events }
 }
 
+/// The instructions around an instruction pointer: a few before it and the rest after, so the one that is
+/// stopped is among them. Empty when the stop has no address or the adapter cannot disassemble.
+fn instructions_at(dbg: &mut pascoda_dap::Session, pc: Option<String>) -> (Option<String>, Vec<pascoda_dap::Instruction>) {
+    let disasm = pc.as_deref().map(|r| dbg.disassemble(r, -6, 24).unwrap_or_default()).unwrap_or_default();
+    (pc, disasm)
+}
+
+/// The address the user typed: hex (`0x1000`) or decimal, written back as the adapter's `0x...` reference.
+pub fn parse_address(text: &str) -> Result<String, String> {
+    let t = text.trim();
+    let n = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => t.parse::<u64>(),
+    };
+    n.map(|n| format!("0x{n:x}"))
+        .map_err(|_| format!("\"{t}\" is not an address: write it as 0x1000 or 4096"))
+}
+
+/// A hex dump of `bytes` starting at `start` (a `0x...` address): one line per 16 bytes, with the address,
+/// the bytes in hex, and their text (`.` for bytes that are not printable).
+pub fn hex_dump(start: &str, bytes: &[u8]) -> Vec<String> {
+    let base = u64::from_str_radix(start.trim_start_matches("0x"), 16).unwrap_or(0);
+    bytes
+        .chunks(16)
+        .enumerate()
+        .map(|(row, chunk)| {
+            let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+            let text: String = chunk.iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' }).collect();
+            format!("{:016x}  {:<47}  {text}", base + (row as u64) * 16, hex.join(" "))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod memory_view_tests {
+    use super::*;
+
+    #[test]
+    fn addresses_are_read_as_hex_or_decimal() {
+        assert_eq!(parse_address("0x1000"), Ok("0x1000".to_string()));
+        assert_eq!(parse_address(" 4096 "), Ok("0x1000".to_string()));
+        assert!(parse_address("nowhere").unwrap_err().contains("not an address"));
+    }
+
+    #[test]
+    fn a_hex_dump_shows_addresses_bytes_and_text_in_rows_of_sixteen() {
+        let bytes: Vec<u8> = (0x40..0x40 + 18).collect();
+        let lines = hex_dump("0x1000", &bytes);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("0000000000001000  40 41 42"), "{}", lines[0]);
+        assert!(lines[0].ends_with("@ABCDEFGHIJKLMNO"), "{}", lines[0]);
+        assert!(lines[1].starts_with("0000000000001010  50 51"), "{}", lines[1]);
+        assert!(hex_dump("0x0", &[0, 0x7f, b'a']).first().unwrap().ends_with("..a"), "control bytes are dots");
+    }
+}
+
 fn drive(
     exe: &Path,
     cwd: &Path,
@@ -361,6 +455,23 @@ fn drive(
                     None => send(Event::Output("Run to Cursor needs the program stopped\n".into())),
                 },
                 Cmd::Expanded(paths) => expanded = paths,
+                Cmd::SelectThread(id) => {
+                    if let Ok(frames) = dbg.stack(id) {
+                        thread = id;
+                        let top = frames.iter().find(|f| is_source(f)).or(frames.first());
+                        let frame = top.map_or(0, |f| f.id);
+                        if let Ok(vars) = read_vars(&mut dbg, frame, top.is_some(), &expanded, &watches) {
+                            stopped_in = Some(frame);
+                            let threads = dbg.threads().unwrap_or_default();
+                            let (pc, disasm) = instructions_at(&mut dbg, top.and_then(|f| f.pc.clone()));
+                            send(Event::Stopped(Paused { frames, vars, threads, thread, pc, disasm }));
+                        }
+                    }
+                }
+                Cmd::ReadMemory(address, count) => {
+                    let result = dbg.read_memory(&address, count).map(|bytes| (address.clone(), bytes));
+                    send(Event::Memory(result));
+                }
                 Cmd::Fetch(path, reference) => {
                     if let Some(frame) = stopped_in {
                         let kids = children_of(&mut dbg, frame, reference, &path, &expanded)
@@ -423,7 +534,9 @@ fn drive(
                 let frame = top.map_or(0, |f| f.id);
                 let vars = read_vars(&mut dbg, frame, top.is_some(), &expanded, &watches)?;
                 stopped_in = Some(frame);
-                send(Event::Stopped(Paused { frames, vars }));
+                let threads = dbg.threads().unwrap_or_default();
+                let (pc, disasm) = instructions_at(&mut dbg, top.and_then(|f| f.pc.clone()));
+                send(Event::Stopped(Paused { frames, vars, threads, thread, pc, disasm }));
             }
             "output" => {
                 if let Some(text) = text_of(&event.body) {
@@ -946,7 +1059,8 @@ mod tests {
                 | Event::Watched(_)
                 | Event::Evaluated(..)
                 | Event::Assigned(_)
-                | Event::Refreshed(_) => {}
+                | Event::Refreshed(_)
+                | Event::Memory(_) => {}
             }
         }
     }
@@ -1313,6 +1427,11 @@ mod tests {
         assert_eq!(lldb_expression("name = 'a = b'"), "NAME == 'a = b'", "string literals are kept");
         assert_eq!(lldb_expression("c = 'it''s'"), "C == 'it\\'s'");
         assert_eq!(lldb_expression("flag = true"), "FLAG == 1");
+        assert_eq!(lldb_expression("p^"), "(*P)", "a dereference");
+        assert_eq!(lldb_expression("p^.x + 1"), "(*P).X + 1", "a field through a pointer");
+        assert_eq!(lldb_expression("q^ = 3"), "(*Q) == 3");
+        assert_eq!(lldb_expression("@total"), "&TOTAL", "the address of a variable");
+        assert_eq!(lldb_expression("'a'^"), "'a'^", "a caret after a literal is left as it is");
     }
 
     #[test]

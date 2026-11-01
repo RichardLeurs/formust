@@ -4,6 +4,7 @@ mod bookmarks;
 mod bottom;
 mod editor_lines;
 mod prefs;
+mod profile;
 mod unit_tests;
 mod vendor_ui;
 mod formatting;
@@ -206,6 +207,13 @@ struct App {
     bookmarks: bookmarks::Bookmarks,
     /// The files the last Replace All in Project changed, for Undo Replace.
     project_undo: Vec<find::Change>,
+    /// Build > Profile: the build in progress is followed by a sample of the program, and the sample's result.
+    profile_after_build: bool,
+    profile_rx: Option<Receiver<Result<String, String>>>,
+    /// The Memory section of the Debug tab: the address and length typed, and the bytes read last.
+    memory_addr: String,
+    memory_count: u64,
+    memory: Option<Result<(String, Vec<u8>), String>>,
     /// The results of a project search still running on its worker thread.
     project_search_rx: Option<std::sync::mpsc::Receiver<(Vec<find::FileHits>, bool)>>,
     rename: find::Rename,
@@ -340,6 +348,11 @@ impl App {
             go_to: Default::default(),
             bookmarks: Default::default(),
             project_undo: Vec::new(),
+            profile_after_build: false,
+            profile_rx: None,
+            memory_addr: String::new(),
+            memory_count: 64,
+            memory: None,
             project_search_rx: None,
             rename: Default::default(),
             import_packages_open: false,
@@ -965,6 +978,7 @@ impl App {
         self.build_progress = None;
         let ctx = ctx.clone();
         let lazarus = self.lazarus_setting(&path);
+        let macos_min = self.macos_min_setting(&path);
         std::thread::spawn(move || {
             let gui = is_gui_program(&path);
             let repaint = ctx.clone();
@@ -972,7 +986,7 @@ impl App {
                 let _ = ptx.send(p);
                 repaint.request_repaint();
             };
-            let built = build_program(&path, lazarus.as_deref(), mode, &project_args, total, release, &mut on);
+            let built = build_program(&path, lazarus.as_deref(), &macos_min, mode, &project_args, total, release, &mut on);
             let result = built.unwrap_or_else(|e| BuildResult {
                 success: false,
                 diagnostics: Vec::new(),
@@ -1038,6 +1052,9 @@ impl App {
             self.marks = self.place_marks(&diagnostics);
             self.diagnostics = diagnostics;
             self.building = None;
+            if std::mem::take(&mut self.profile_after_build) && result.success {
+                self.start_profile(ctx);
+            }
             self.assistant_build_done(&result);
         }
     }
@@ -1065,6 +1082,7 @@ impl App {
                 let text = self.docs[self.active].text.clone();
                 let mode = self.mode;
                 let lazarus = self.lazarus_setting(&program_for(&path, &self.root));
+                let macos_min = self.macos_min_setting(&program_for(&path, &self.root));
                 let (tx, rx) = channel();
                 self.syntax_rx = Some(rx);
                 let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
@@ -1072,7 +1090,9 @@ impl App {
                 self.auto_tab(ctx, bottom::BottomTab::Output);
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
-                    let lcl = pascoda_fpc::lcl::Lcl::find_in(&path, lazarus.as_deref()).filter(|l| !l.needs_build());
+                    let lcl = pascoda_fpc::lcl::Lcl::find_in(&path, lazarus.as_deref())
+                        .map(|l| l.with_macos_min(&macos_min))
+                        .filter(|l| !l.needs_build());
                     let result = pascoda_fpc::check::check_text(&path, &text, mode, lcl.as_ref());
                     let _ = tx.send((path, text, lcl.is_some(), result));
                     ctx.request_repaint();
@@ -1610,7 +1630,8 @@ impl App {
         {
             let (path, text) = (doc.path.clone(), doc.text.clone());
             let lazarus = self.lazarus_setting(&program_for(&path, &self.root));
-            self.live.start(ctx, path, text, self.mode, lazarus);
+            let macos_min = self.macos_min_setting(&program_for(&path, &self.root));
+            self.live.start(ctx, path, text, self.mode, lazarus, macos_min);
         } else {
             // Come back when the pause is over, even if nothing else repaints.
             ctx.request_repaint_after(livecheck::QUIET);
@@ -1651,6 +1672,41 @@ impl App {
             .collect()
     }
 
+    /// Build > Profile: builds the project, and once it is built the program is sampled.
+    fn start_profile_build(&mut self, ctx: &egui::Context) {
+        self.profile_after_build = true;
+        self.start_build(ctx, false, false);
+    }
+
+    /// Runs the built program and samples it (see `profile_program`), in the background.
+    fn start_profile(&mut self, ctx: &egui::Context) {
+        let exe = pascoda_project::executable_for(&self.build_source);
+        let folder = self.build_dir.clone();
+        let cwd = pascoda_project::run_folder(&folder, &exe);
+        let args = pascoda_project::load_run(&folder).args;
+        self.console = format!("Profiling {}: running it and sampling for {PROFILE_SECS} s...\n", exe.display());
+        self.auto_tab(ctx, bottom::BottomTab::Output);
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(profile_program(&exe, &cwd, &args));
+            ctx.request_repaint();
+        });
+        self.profile_rx = Some(rx);
+    }
+
+    /// Shows the profile once its sample is taken.
+    pub(crate) fn poll_profile(&mut self) {
+        let Some(rx) = self.profile_rx.as_ref() else { return };
+        if let Ok(result) = rx.try_recv() {
+            self.profile_rx = None;
+            self.console = match result {
+                Ok(text) => text,
+                Err(e) => format!("Profile: {e}\n"),
+            };
+        }
+    }
+
     fn start_debug(&mut self, ctx: &egui::Context) {
         let exe = pascoda_project::executable_for(&self.build_source);
         let folder = self.build_dir.clone();
@@ -1689,6 +1745,7 @@ impl App {
         for event in events {
             match event {
                 debugger::Event::Output(text) => self.console.push_str(&text),
+                debugger::Event::Memory(result) => self.memory = Some(result),
                 debugger::Event::Children(path, kids) => {
                     if let Some(v) = self.paused.as_mut().and_then(|p| p.var_mut(&path)) {
                         v.children = Some(kids);
@@ -2509,6 +2566,17 @@ impl App {
     /// The program the build works on: the last build's, else the active tab's.
     /// The Lazarus folder whose LCL builds `program` (`lazarus` in `pascoda.toml`): the program's folder first, then the
     /// opened project folder. `None`: the bundled Lazarus (or the Lazarus tree the program lies in).
+    /// The oldest macOS for the project of `program` (`min_macos` in `pascoda.toml`, as the export dialog writes it);
+    /// empty = the default. Read like `lazarus_setting`: the program's folder first, then the project folder.
+    fn macos_min_setting(&self, program: &Path) -> String {
+        let read = |dir: &Path| pascoda_project::load_export(dir).min_macos.trim().to_string();
+        program
+            .parent()
+            .map(read)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| read(&self.root))
+    }
+
     fn lazarus_setting(&self, program: &Path) -> Option<PathBuf> {
         program
             .parent()
@@ -2753,13 +2821,14 @@ fn missing_package_problems(folder: Option<&Path>) -> Vec<Diagnostic> {
 fn build_program(
     path: &Path,
     lazarus: Option<&Path>,
+    macos_min: &str,
     mode: pascoda_fpc::Mode,
     project_args: &[std::ffi::OsString],
     total: Option<usize>,
     release: bool,
     on: &mut dyn FnMut(pascoda_fpc::Progress),
 ) -> std::io::Result<BuildResult> {
-    let with_lcl = |on: &mut dyn FnMut(pascoda_fpc::Progress)| match pascoda_fpc::lcl::Lcl::find_in(path, lazarus) {
+    let with_lcl = |on: &mut dyn FnMut(pascoda_fpc::Progress)| match pascoda_fpc::lcl::Lcl::find_in(path, lazarus).map(|l| l.with_macos_min(macos_min)) {
         Some(lcl) => pascoda_fpc::lcl::build_gui_progress_with(path, mode, &lcl, project_args, total, on),
         None => Err(std::io::Error::other("vendor/lazarus not found (needed for GUI programs)")),
     };
@@ -2768,7 +2837,7 @@ fn build_program(
     }
     let plain = pascoda_fpc::build_progress_configured(path, mode, project_args, total, release, on)?;
     if !plain.success
-        && let Some(lcl) = pascoda_fpc::lcl::Lcl::find_in(path, lazarus)
+        && let Some(lcl) = pascoda_fpc::lcl::Lcl::find_in(path, lazarus).map(|l| l.with_macos_min(macos_min))
         && plain
             .diagnostics
             .iter()
@@ -2917,6 +2986,7 @@ struct NativeMenu {
     preferences: muda::MenuId,
     run_to: muda::MenuId,
     format: muda::MenuId,
+    profile: muda::MenuId,
     complete_class: muda::MenuId,
     rebuild: muda::MenuId,
     clean: muda::MenuId,
@@ -3027,6 +3097,8 @@ enum MenuAction {
     Laz(LazTool),
     /// Edit > Format Code.
     Format,
+    /// Build > Profile: build, run the program, and sample where it spends its time.
+    Profile,
     /// Edit > Complete Class (Ctrl+Shift+C): stubs for missing bodies, declarations for new methods.
     CompleteClass,
     ProjectOptions,
@@ -3264,6 +3336,7 @@ impl NativeMenu {
                 Code::KeyE,
             )),
         );
+        let profile = MenuItem::new("Profile", true, None);
         let run_to = MenuItem::new("Run to Cursor", true, Some(Accelerator::new(Modifiers::empty(), Code::F4)));
         let project_options = MenuItem::new("Project Options...", true, None);
         let rebuild = MenuItem::new("Rebuild", true, None);
@@ -3277,6 +3350,8 @@ impl NativeMenu {
                 &run_tests,
                 &debug,
                 &run_to,
+                &PredefinedMenuItem::separator(),
+                &profile,
                 &PredefinedMenuItem::separator(),
                 &rebuild,
                 &clean,
@@ -3329,6 +3404,7 @@ impl NativeMenu {
             preferences: preferences.id().clone(),
             run_to: run_to.id().clone(),
             format: format.id().clone(),
+            profile: profile.id().clone(),
             complete_class: complete_class.id().clone(),
             rebuild: rebuild.id().clone(),
             clean: clean.id().clone(),
@@ -3465,6 +3541,7 @@ impl NativeMenu {
                     (&self.debug, MenuAction::Debug),
                     (&self.run_to, MenuAction::RunToCursor),
                     (&self.format, MenuAction::Format),
+                    (&self.profile, MenuAction::Profile),
                     (&self.complete_class, MenuAction::CompleteClass),
                     (&self.project_options, MenuAction::ProjectOptions),
                     (&self.rebuild, MenuAction::Rebuild),
@@ -4452,4 +4529,47 @@ mod tool_run_tests {
         assert!(app.console.contains("$(Nonsense)"), "{}", app.console);
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// How long `sample` watches the program, in seconds.
+const PROFILE_SECS: u64 = 3;
+
+/// Runs the program, samples it for `PROFILE_SECS` with macOS's `sample`, and returns the functions it spent
+/// its time in. The program is stopped afterwards. Errors name what went wrong.
+fn profile_program(exe: &Path, cwd: &Path, args: &[String]) -> Result<String, String> {
+    let mut child = Command::new(exe)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("could not start {}: {e}", exe.display()))?;
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    if child.try_wait().ok().flatten().is_some() {
+        return Err("the program finished before it could be sampled: make it run longer, for example with more work".into());
+    }
+    let report = std::env::temp_dir().join(format!("pascoda-profile-{}.txt", child.id()));
+    let status = Command::new("/usr/bin/sample")
+        .arg(child.id().to_string())
+        .arg(PROFILE_SECS.to_string())
+        .arg("-file")
+        .arg(&report)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
+    let status = status.map_err(|e| format!("sample could not run: {e}"))?;
+    if !status.success() {
+        return Err("sample could not take the sample (macOS may need the program to be allowed to be sampled)".into());
+    }
+    let text = std::fs::read_to_string(&report).map_err(|e| format!("no report was written: {e}"))?;
+    let _ = std::fs::remove_file(&report);
+    let spots = profile::hotspots(&text);
+    Ok(format!(
+        "Profile of {} over {PROFILE_SECS} s (the top functions by samples):\n{}",
+        exe.display(),
+        profile::table(&spots, 15)
+    ))
 }

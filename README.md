@@ -11,6 +11,8 @@ Connect local LLM-models using oMLX and Ollama. OpenAI Codex CLI and Claude Code
 
 > ** Status: early work in progress. The Pascoda IDE app runs Pascal code and builds .app and .dmg files ** 
 
+Website: https://pascoda.richardleurs.nl/
+
 ## Specs
 
 | Area | Status | Notes |

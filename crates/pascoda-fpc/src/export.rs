@@ -104,7 +104,8 @@ fn run(
             fraction: p.fraction.map(|f| from + f * (to - from)),
             done: p.done,
         };
-        let lcl = lcl.map(|l| l.for_target(target));
+        // The LCL is compiled for the same oldest macOS as the app (`-WM` below), so the two agree.
+        let lcl = lcl.map(|l| l.for_target(target).with_macos_min(info.macos_min()));
         // The first export on a machine compiles the LCL for this target: 70% of its share.
         let mut lo = 0.0;
         if let Some(lcl) = &lcl

@@ -18,9 +18,26 @@ pub struct Event {
     pub body: Value,
 }
 
+/// A thread of the program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Thread {
+    pub id: i64,
+    pub name: String,
+}
+
+/// One machine instruction, from `disassemble`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Instruction {
+    /// The address as the adapter writes it (`0x100003f2c`).
+    pub address: String,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub id: i64,
+    /// The memory reference of the frame's instruction pointer (for disassembly), when the adapter gives one.
+    pub pc: Option<String>,
     pub name: String,
     pub file: Option<PathBuf>,
     pub line: u32,
@@ -298,9 +315,56 @@ impl Session {
                 a.iter()
                     .map(|f| Frame {
                         id: f["id"].as_i64().unwrap_or(0),
+                        pc: f["instructionPointerReference"].as_str().map(str::to_string),
                         name: f["name"].as_str().unwrap_or_default().to_string(),
                         file: f["source"]["path"].as_str().map(PathBuf::from),
                         line: f["line"].as_u64().unwrap_or(0) as u32,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// `count` instructions from `offset` instructions away from `reference` (a memory reference, such as a
+    /// frame's `pc`). A negative offset starts before it, so the instruction itself is among them.
+    pub fn disassemble(&mut self, reference: &str, offset: i64, count: i64) -> Result<Vec<Instruction>, String> {
+        let body = self.request(
+            "disassemble",
+            json!({"memoryReference": reference, "offset": 0, "instructionOffset": offset, "instructionCount": count, "resolveSymbols": true}),
+        )?;
+        Ok(body["instructions"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|i| Instruction {
+                        address: i["address"].as_str().unwrap_or_default().to_string(),
+                        text: i["instruction"].as_str().unwrap_or_default().to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// `count` bytes of memory from `reference` (`readMemory`). Bytes the adapter cannot read are left out.
+    pub fn read_memory(&mut self, reference: &str, count: u64) -> Result<Vec<u8>, String> {
+        use base64::Engine;
+        let body = self.request("readMemory", json!({"memoryReference": reference, "count": count}))?;
+        let data = body["data"].as_str().unwrap_or_default();
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|e| format!("the adapter sent bad memory data: {e}"))
+    }
+
+    /// The threads of the program (`threads`), with their names as the adapter gives them.
+    pub fn threads(&mut self) -> Result<Vec<Thread>, String> {
+        let body = self.request("threads", json!({}))?;
+        Ok(body["threads"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|t| Thread {
+                        id: t["id"].as_i64().unwrap_or(0),
+                        name: t["name"].as_str().unwrap_or_default().to_string(),
                     })
                     .collect()
             })

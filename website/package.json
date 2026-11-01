@@ -1,0 +1,19 @@
+{
+  "name": "pascoda-website",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && npm run build:docs",
+    "build:docs": "npm --prefix ../vitepress run docs:build -- --outDir ../website/dist/documentation",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.5.44"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.10",
+    "vite": "^8.3.5"
+  }
+}

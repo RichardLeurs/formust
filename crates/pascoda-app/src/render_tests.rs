@@ -86,9 +86,14 @@ fn debugging_app() -> App {
     let numbers = var("NUMBERS", "array of LongInt", "3 elements", Array, 5, None);
     app.var_open = ["Globals/POINT", "Globals/THING"].map(Into::into).into();
     app.paused = Some(debugger::Paused {
+        threads: vec![pascoda_dap::Thread { id: 1, name: "main".into() }, pascoda_dap::Thread { id: 2, name: "worker".into() }],
+        thread: 1,
+        pc: None,
+        disasm: Vec::new(),
         frames: vec![pascoda_dap::Frame {
             id: 1,
             name: "PASCALMAIN".into(),
+            pc: Some("0x100003f2c".into()),
             file: Some(file),
             line: 8,
         }],
@@ -768,7 +773,7 @@ fn variable_rows_open_and_close() {
         .build_ui_state(|ui, app: &mut App| app.draw(ui, None), {
             // The pane now also holds the tab strip: make it tall enough for every row.
             let mut app = debugging_app();
-            app.debug_height = 440.0;
+            app.debug_height = 500.0;
             app
         });
     theme::apply(&harness.ctx);
@@ -1865,6 +1870,73 @@ fn quick_syntax_check_understands_units_that_use_the_lcl() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// The Threads list in the Debug tab: the threads are shown, and clicking another one asks the debugger
+/// for its frames.
+#[test]
+fn clicking_a_thread_asks_the_debugger_for_its_frames() {
+    let mut app = debugging_app();
+    let (cmds, rx) = std::sync::mpsc::channel();
+    app.session = Some(debugger::Handle { cmds, events: std::sync::mpsc::channel().1 });
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1368.0, 800.0))
+        .with_pixels_per_point(1.0)
+        .with_context_setup(theme::apply)
+        .build_ui_state(|ui, app: &mut App| app.draw(ui, None), app);
+    h.run_steps(3);
+    h.get_by_label("Thread 2 worker").click();
+    h.run_steps(3);
+    match rx.try_recv() {
+        Ok(debugger::Cmd::SelectThread(2)) => {}
+        other => panic!("expected SelectThread(2), got {:?}", other.map(|_| "a command")),
+    }
+}
+
+/// The Debug tab shows the disassembly around the stop (the stopped instruction marked) and, when asked, a
+/// memory dump; the Show button sends the read to the debugger.
+#[test]
+fn the_debug_tab_shows_disassembly_and_asks_for_memory() {
+    let mut app = debugging_app();
+    if let Some(p) = app.paused.as_mut() {
+        p.pc = Some("0x100003f2c".into());
+        p.disasm = vec![
+            pascoda_dap::Instruction { address: "0x100003f28".into(), text: "mov x0, x1".into() },
+            pascoda_dap::Instruction { address: "0x100003f2c".into(), text: "bl 0x100003f40".into() },
+        ];
+    }
+    let (cmds, rx) = std::sync::mpsc::channel();
+    app.session = Some(debugger::Handle { cmds, events: std::sync::mpsc::channel().1 });
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1368.0, 800.0))
+        .with_pixels_per_point(1.0)
+        .with_context_setup(theme::apply)
+        .build_ui_state(|ui, app: &mut App| app.draw(ui, None), app);
+    h.run_steps(3);
+    h.get_by_label("Disassembly").click();
+    h.run_steps(2);
+    h.get_by_label("Memory").click();
+    h.run_steps(2);
+    h.get_by_label("Show").click();
+    h.run_steps(3);
+    // Nothing typed: the read is at the stopped instruction (the box's suggestion).
+    match rx.try_recv() {
+        Ok(debugger::Cmd::ReadMemory(addr, 64)) => assert_eq!(addr, "0x100003f2c"),
+        other => panic!("expected a read at the instruction pointer, got {:?}", other.map(|_| "a command")),
+    }
+    let image = h.render().expect("offscreen render");
+    image.save(out_dir().join("ui-disassembly-memory.png")).unwrap();
+}
+
+/// Build > Profile samples a running program: `sleep` runs long enough, and its report names the functions
+/// it was in.
+#[test]
+fn profile_samples_a_running_program_and_lists_its_functions() {
+    let text = profile_program(Path::new("/bin/sleep"), Path::new("/"), &["5".to_string()]).expect("the sample is taken");
+    assert!(text.starts_with("Profile of /bin/sleep over 3 s"), "{text}");
+    assert!(text.contains("samples"), "the table header: {text}");
+    let rows = text.lines().skip(2).count();
+    assert!(rows >= 1, "at least one function is listed: {text}");
+}
+
 /// Ctrl+Shift+3 sets bookmark 3 at the caret's line; Ctrl+3 from elsewhere jumps back to it.
 #[test]
 fn bookmarks_are_set_from_the_keyboard_and_jumped_to() {
@@ -1896,6 +1968,30 @@ fn bookmarks_are_set_from_the_keyboard_and_jumped_to() {
 
     let image = h.render().expect("offscreen render");
     image.save(out_dir().join("ui-bookmarks.png")).unwrap();
+}
+
+/// Show sends the typed address (hex or decimal) and count to the debugger as a memory reference.
+#[test]
+fn show_reads_memory_at_the_typed_address() {
+    let mut app = debugging_app();
+    app.memory_addr = "4096".into();
+    app.memory_count = 32;
+    let (cmds, rx) = std::sync::mpsc::channel();
+    app.session = Some(debugger::Handle { cmds, events: std::sync::mpsc::channel().1 });
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1368.0, 800.0))
+        .with_pixels_per_point(1.0)
+        .with_context_setup(theme::apply)
+        .build_ui_state(|ui, app: &mut App| app.draw(ui, None), app);
+    h.run_steps(3);
+    h.get_by_label("Memory").click();
+    h.run_steps(2);
+    h.get_by_label("Show").click();
+    h.run_steps(3);
+    match rx.try_recv() {
+        Ok(debugger::Cmd::ReadMemory(addr, 32)) => assert_eq!(addr, "0x1000"),
+        other => panic!("expected ReadMemory, got {:?}", other.map(|_| "a command")),
+    }
 }
 
 /// A TOML file in the editor is coloured as configuration (keys, strings, comments), not as Pascal.
