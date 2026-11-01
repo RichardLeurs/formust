@@ -162,6 +162,21 @@ impl Editor {
         out
     }
 
+    /// Writes the window's values into the project file (`.lpi` or `.dproj`): the mode, the output (when set),
+    /// the unit and include paths and the defines. Returns how many values changed.
+    pub fn write_to_project_file(&self, root: &Path) -> Result<usize, String> {
+        let file = pascoda_project::foreign::find(root).ok_or("there is no project file")?;
+        let output = self.output.trim();
+        let values = pascoda_project::foreign::WriteBack {
+            mode: Some(self.mode),
+            target: (!output.is_empty()).then(|| output.replace('\\', "/")),
+            unit_paths: Some(lines(&self.units)),
+            include_paths: Some(lines(&self.includes)),
+            defines: Some(lines(&self.defines)),
+        };
+        pascoda_project::foreign::write_back(&file, &values)
+    }
+
     /// Writes the values into the project's `pascoda.toml`, keeping its other lines.
     pub fn save(&self, root: &Path) -> Result<(), String> {
         pascoda_project::save_compiler(root, &self.settings()).map_err(|e| e.to_string())?;
@@ -186,6 +201,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn the_window_writes_its_values_into_the_project_file() {
+        let root = tmp("write-lpi");
+        std::fs::write(
+            root.join("app.lpi"),
+            r#"<CONFIG><CompilerOptions>
+  <SearchPaths><OtherUnitFiles Value="$(LazarusDir)/lcl"/><IncludeFiles Value=""/></SearchPaths>
+  <Parsing><SyntaxOptions><SyntaxMode Value="ObjFPC"/></SyntaxOptions></Parsing>
+  <Target><Filename Value="app"/></Target>
+  <Other><CustomOptions Value="-O2 -dOLD"/></Other>
+</CompilerOptions></CONFIG>"#,
+        )
+        .unwrap();
+        let mut e = Editor::load(&root, String::new());
+        e.mode = Mode::Delphi;
+        e.units = "frames".into();
+        e.defines = "FOO".into();
+        assert_eq!(e.write_to_project_file(&root), Ok(4));
+        let text = std::fs::read_to_string(root.join("app.lpi")).unwrap();
+        assert!(text.contains(r#"<OtherUnitFiles Value="$(LazarusDir)/lcl;frames"/>"#), "{text}");
+        assert!(text.contains(r#"<SyntaxMode Value="Delphi"/>"#), "{text}");
+        assert!(text.contains(r#"<CustomOptions Value="-O2 -dFOO"/>"#), "{text}");
+        // The window shows the file as written.
+        let view = file_view(&root).expect("read back");
+        assert_eq!(view.rows.iter().find(|(l, _)| l == "Mode").map(|(_, v)| v.as_str()), Some("Delphi"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

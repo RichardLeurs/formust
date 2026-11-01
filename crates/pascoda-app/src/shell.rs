@@ -384,6 +384,7 @@ impl App {
                 MenuAction::Open => self.pick_file(),
                 MenuAction::Save => self.save_active(),
                 MenuAction::Format => self.format_active(true),
+                MenuAction::CompleteClass => self.complete_class(ctx),
                 MenuAction::Run if can_build => self.build_and_run(ctx, false),
                 MenuAction::RunTests => self.start_unit_tests(ctx, None),
                 MenuAction::ImportPackages => self.import_packages_open = true,
@@ -2086,6 +2087,7 @@ impl App {
         let warnings = self.project_options.warnings(&root);
         let mut save = false;
         let mut cancel = false;
+        let mut write_file = false;
         // The app's own dialog (no system-grey title bar), as the export dialog is drawn.
         crate::style::dialog(ctx, "project-options", Some("Project Options"), 560.0, |ui| {
                 // Roomier rows than the default: the dialog is for a form of settings.
@@ -2186,7 +2188,7 @@ impl App {
                         .color(pal.text_tertiary),
                 );
                 if let Some(view) = &e.project_file {
-                    egui::CollapsingHeader::new(format!("From {} (read-only)", view.file_name))
+                    egui::CollapsingHeader::new(format!("From {}", view.file_name))
                         .default_open(true)
                         .show(ui, |ui| {
                             egui::Grid::new("project-file-view")
@@ -2207,10 +2209,13 @@ impl App {
                                 );
                             }
                             ui.label(
-                                RichText::new("The build reads these; they are changed in the project file, not here.")
+                                RichText::new("The build reads these. Write to file saves the values above into it, keeping the rest of the file.")
                                     .size(11.0)
                                     .color(pal.text_tertiary),
                             );
+                            if ui.button(format!("Write to {}", view.file_name)).clicked() {
+                                write_file = true;
+                            }
                         });
                 }
                 for w in &warnings {
@@ -2236,6 +2241,16 @@ impl App {
                     }
                 });
             });
+        if write_file {
+            match self.project_options.write_to_project_file(&root) {
+                Ok(n) => {
+                    self.project_options.project_file = crate::project_options::file_view(&root);
+                    self.project_options.error.clear();
+                    self.console.push_str(&format!("Wrote {n} values to the project file\n"));
+                }
+                Err(e) => self.project_options.error = format!("Could not write the project file: {e}"),
+            }
+        }
         if save {
             match self.project_options.save(&root) {
                 Ok(()) => {
@@ -5720,10 +5735,11 @@ fn diff_line(line: &str) -> DiffLine {
 /// The background of a whole diff line: green for added, red for removed, none for the rest.
 fn diff_background(kind: DiffLine, dark: bool) -> Option<egui::Color32> {
     match (kind, dark) {
-        (DiffLine::Added, false) => Some(egui::Color32::from_rgb(0xDA, 0xFB, 0xE1)),
-        (DiffLine::Added, true) => Some(egui::Color32::from_rgb(0x23, 0x3E, 0x2B)),
-        (DiffLine::Removed, false) => Some(egui::Color32::from_rgb(0xFF, 0xEB, 0xE9)),
-        (DiffLine::Removed, true) => Some(egui::Color32::from_rgb(0x4A, 0x25, 0x27)),
+        // Translucent, so the editor's background shows through the tint.
+        (DiffLine::Added, false) => Some(egui::Color32::from_rgba_unmultiplied(0x1A, 0x7F, 0x37, 40)),
+        (DiffLine::Added, true) => Some(egui::Color32::from_rgba_unmultiplied(0x3F, 0xB9, 0x50, 48)),
+        (DiffLine::Removed, false) => Some(egui::Color32::from_rgba_unmultiplied(0xCF, 0x22, 0x2E, 40)),
+        (DiffLine::Removed, true) => Some(egui::Color32::from_rgba_unmultiplied(0xF8, 0x51, 0x49, 48)),
         _ => None,
     }
 }
@@ -5733,6 +5749,8 @@ fn diff_background(kind: DiffLine, dark: bool) -> Option<egui::Color32> {
 fn diff_view(ui: &mut egui::Ui, text: &str, pal: &Palette) {
     let font = egui::FontId::monospace(12.0);
     let row_h = 16.0;
+    // The rows touch: no gap between them (the default spacing would leave one).
+    ui.spacing_mut().item_spacing.y = 0.0;
     for line in text.lines() {
         let kind = diff_line(line);
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), egui::Sense::hover());
@@ -5763,8 +5781,10 @@ mod diff_colour_tests {
         assert_eq!(diff_line("+++ b.pas"), DiffLine::Header);
         assert_eq!(diff_line("@@ -1,2 +1,2 @@"), DiffLine::Header);
         assert_eq!(diff_line(" unchanged"), DiffLine::Plain);
-        assert_eq!(diff_background(DiffLine::Added, false), Some(egui::Color32::from_rgb(0xDA, 0xFB, 0xE1)));
-        assert_eq!(diff_background(DiffLine::Removed, false), Some(egui::Color32::from_rgb(0xFF, 0xEB, 0xE9)));
+        let added = diff_background(DiffLine::Added, false).expect("a tint");
+        let removed = diff_background(DiffLine::Removed, true).expect("a tint");
+        assert!(added.a() < 255 && removed.a() < 255, "translucent, so the editor shows through");
+        assert!(added.g() > added.r() && removed.r() > removed.g(), "green for added, red for removed");
         assert_eq!(diff_background(DiffLine::Plain, false), None, "unchanged lines have no background");
         assert_eq!(diff_background(DiffLine::Header, true), None);
     }

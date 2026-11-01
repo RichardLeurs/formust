@@ -621,3 +621,224 @@ mod passthrough_tests {
         assert_eq!(f.unit_output, Some(Path::new("/work").join("dcu")));
     }
 }
+
+/// The values the IDE writes back into the project file. `None` leaves a value as it is; the lists
+/// replace the file's list (`;`-separated in both formats).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteBack {
+    pub mode: Option<Mode>,
+    /// The executable's path, relative to the project folder (`Target/Filename`, `DCC_ExeOutput`).
+    pub target: Option<String>,
+    pub unit_paths: Option<Vec<String>>,
+    pub include_paths: Option<Vec<String>>,
+    pub defines: Option<Vec<String>>,
+}
+
+/// Writes `values` into the project file at `file` and returns how many values changed. Only the
+/// values themselves are replaced; the rest of the file stays byte for byte. A value whose element is
+/// missing makes the whole write fail, and nothing is written: add the element in the IDE first.
+pub fn write_back(file: &Path, values: &WriteBack) -> Result<usize, String> {
+    let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let kind = match ext_lower(file).as_deref() {
+        Some("lpi") => Kind::Lazarus,
+        Some("dproj") => Kind::Delphi,
+        _ => return Err(format!("{} is not a project file Pascoda writes", file.display())),
+    };
+    let edits = match kind {
+        Kind::Lazarus => lazarus_edits(&text, values)?,
+        Kind::Delphi => delphi_edits(&text, values)?,
+    };
+    let mut out = text.clone();
+    let mut sorted = edits.clone();
+    sorted.sort_by(|a, b| b.0.start.cmp(&a.0.start));
+    for (range, replacement) in &sorted {
+        out.replace_range(range.clone(), replacement);
+    }
+    if out != text {
+        std::fs::write(file, out).map_err(|e| format!("{}: {e}", file.display()))?;
+    }
+    Ok(edits.len())
+}
+
+/// The XML text of `s`, escaped for an attribute value or an element's text.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
+}
+
+/// The new list for a `;`-separated value: the entries of `existing` that hold a macro (`$(LazarusDir)`,
+/// which the reader leaves out and the IDE does not show) are kept in front, then `parts`.
+fn join_keeping_macros(existing: &str, parts: &[String]) -> String {
+    let mut out: Vec<String> = existing.split(';').map(str::trim).filter(|e| e.contains("$(")).map(str::to_string).collect();
+    out.extend(parts.iter().cloned());
+    out.join(";")
+}
+
+/// The edits for a Lazarus `.lpi`: the attribute values of the elements the IDE writes, plus the
+/// `-d` defines inside `CustomOptions` (its other tokens stay).
+fn lazarus_edits(text: &str, v: &WriteBack) -> Result<Vec<(std::ops::Range<usize>, String)>, String> {
+    let doc = roxmltree::Document::parse(text).map_err(|e| e.to_string())?;
+    let root = doc.root_element();
+    let mut edits = Vec::new();
+    let find = |path: &[&str]| -> Option<roxmltree::Node> {
+        let mut node = root;
+        for name in path {
+            node = node.children().find(|c| c.has_tag_name(*name))?;
+        }
+        Some(node)
+    };
+    // The Value of an element as it is in the file (for the macro entries of a list).
+    let existing = |path: &[&str]| -> String { find(path).and_then(|n| n.attribute("Value")).unwrap_or_default().to_string() };
+    let mut set_attr = |path: &[&str], value: String| -> Result<(), String> {
+        let node = find(path).ok_or_else(|| format!("the project file has no {} element: add it in the IDE first", path.join("/")))?;
+        let attr = node.attribute_node("Value").ok_or_else(|| format!("{} has no Value", path.join("/")))?;
+        edits.push((attr.range_value(), xml_escape(&value)));
+        Ok(())
+    };
+    if let Some(mode) = v.mode {
+        let name = if mode == Mode::Delphi { "Delphi" } else { "ObjFPC" };
+        set_attr(&["CompilerOptions", "Parsing", "SyntaxOptions", "SyntaxMode"], name.into())?;
+    }
+    if let Some(target) = &v.target {
+        set_attr(&["CompilerOptions", "Target", "Filename"], target.clone())?;
+    }
+    if let Some(units) = &v.unit_paths {
+        let value = join_keeping_macros(&existing(&["CompilerOptions", "SearchPaths", "OtherUnitFiles"]), units);
+        set_attr(&["CompilerOptions", "SearchPaths", "OtherUnitFiles"], value)?;
+    }
+    if let Some(includes) = &v.include_paths {
+        let value = join_keeping_macros(&existing(&["CompilerOptions", "SearchPaths", "IncludeFiles"]), includes);
+        set_attr(&["CompilerOptions", "SearchPaths", "IncludeFiles"], value)?;
+    }
+    if let Some(defines) = &v.defines {
+        // The defines are the `-d` tokens of CustomOptions; the other tokens (switches, `-Fu`) stay as they are.
+        let current = find(&["CompilerOptions", "Other", "CustomOptions"])
+            .and_then(|n| n.attribute_node("Value"))
+            .ok_or("the project file has no CompilerOptions/Other/CustomOptions element: add it in the IDE first")?;
+        let mut tokens: Vec<String> = current
+            .value()
+            .split_whitespace()
+            .filter(|t| !t.starts_with("-d"))
+            .map(str::to_string)
+            .collect();
+        tokens.extend(defines.iter().map(|d| format!("-d{d}")));
+        edits.push((current.range_value(), xml_escape(&tokens.join(" "))));
+    }
+    Ok(edits)
+}
+
+/// The edits for a Delphi `.dproj`: the text of its `DCC_*` elements in every property group that applies.
+fn delphi_edits(text: &str, v: &WriteBack) -> Result<Vec<(std::ops::Range<usize>, String)>, String> {
+    let doc = roxmltree::Document::parse(text).map_err(|e| e.to_string())?;
+    let mut edits = Vec::new();
+    let mut set_text = |tag: &str, value: String| -> Result<(), String> {
+        let mut found = false;
+        for group in doc
+            .descendants()
+            .filter(|n| n.has_tag_name("PropertyGroup") && applies(n.attribute("Condition")))
+        {
+            for node in group.children().filter(|n| n.is_element() && n.has_tag_name(tag)) {
+                found = true;
+                let r = node.range();
+                let whole = &text[r.clone()];
+                let start_end = whole.find('>').ok_or("bad element")? + 1;
+                let content = if whole[..start_end].ends_with("/>") {
+                    // `<Tag/>`: the whole element becomes `<Tag>value</Tag>`.
+                    edits.push((r, format!("<{tag}>{}</{tag}>", xml_escape(&value))));
+                    continue;
+                } else {
+                    let close = whole.rfind("</").ok_or("bad element")?;
+                    (r.start + start_end)..(r.start + close)
+                };
+                edits.push((content, xml_escape(&value)));
+            }
+        }
+        if !found {
+            return Err(format!("the project file has no {tag} element: add it in the IDE first"));
+        }
+        Ok(())
+    };
+    if let Some(target) = &v.target {
+        set_text("DCC_ExeOutput", target.replace('/', "\\"))?;
+    }
+    if let Some(units) = &v.unit_paths {
+        let existing = doc.descendants().find(|n| n.has_tag_name("DCC_UnitSearchPath")).and_then(|n| n.text()).unwrap_or_default();
+        set_text("DCC_UnitSearchPath", join_keeping_macros(existing, units))?;
+    }
+    if let Some(includes) = &v.include_paths {
+        let existing = doc.descendants().find(|n| n.has_tag_name("DCC_IncludePath")).and_then(|n| n.text()).unwrap_or_default();
+        set_text("DCC_IncludePath", join_keeping_macros(existing, includes))?;
+    }
+    if let Some(defines) = &v.defines {
+        set_text("DCC_Define", defines.join(";"))?;
+    }
+    Ok(edits)
+}
+
+#[cfg(test)]
+mod write_back_tests {
+    use super::*;
+
+    /// A folder of its own for each test (the tests run in parallel), holding `app.<ext>` with `body`.
+    fn tmp(test: &str, ext: &str, body: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pascoda-writeback-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("app.{ext}"));
+        std::fs::write(&file, body).unwrap();
+        file
+    }
+
+    #[test]
+    fn a_lazarus_project_file_gets_its_values_and_nothing_else_changes() {
+        let body = "<CONFIG>\n <CompilerOptions>\n  <SearchPaths><OtherUnitFiles Value=\"old;$(LazarusDir)/lcl\"/><IncludeFiles Value=\"inc\"/></SearchPaths>\n  <Parsing><SyntaxOptions><SyntaxMode Value=\"ObjFPC\"/></SyntaxOptions></Parsing>\n  <Target><Filename Value=\"bin/app\"/></Target>\n  <Other><CustomOptions Value=\"-dOLD -O2 -Fuelse\"/></Other>\n </CompilerOptions>\n</CONFIG>\n";
+        let file = tmp("lazarus-values", "lpi", body);
+        let v = WriteBack {
+            mode: Some(Mode::Delphi),
+            target: Some("out/app".into()),
+            unit_paths: Some(vec!["frames".into(), "lib&more".into()]),
+            include_paths: None,
+            defines: Some(vec!["FOO".into()]),
+        };
+        assert_eq!(write_back(&file, &v), Ok(4));
+        let out = std::fs::read_to_string(&file).unwrap();
+        assert!(out.contains(r#"<OtherUnitFiles Value="$(LazarusDir)/lcl;frames;lib&amp;more"/>"#), "the macro entry is kept: {out}");
+        assert!(out.contains(r#"<SyntaxMode Value="Delphi"/>"#), "{out}");
+        assert!(out.contains(r#"<Filename Value="out/app"/>"#), "{out}");
+        assert!(out.contains(r#"<CustomOptions Value="-O2 -Fuelse -dFOO"/>"#), "the other tokens stay: {out}");
+        assert!(out.contains(r#"<IncludeFiles Value="inc"/>"#), "untouched");
+        // The reader reads back what was written.
+        let f = parse_lpi(&out, &file).unwrap();
+        assert_eq!(f.mode, Some(Mode::Delphi));
+        assert_eq!(f.defines, vec!["FOO".to_string()]);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn a_missing_element_refuses_the_whole_write() {
+        let body = "<CONFIG><CompilerOptions><Parsing><SyntaxOptions><SyntaxMode Value=\"ObjFPC\"/></SyntaxOptions></Parsing></CompilerOptions></CONFIG>";
+        let file = tmp("lazarus-missing", "lpi", body);
+        let v = WriteBack { mode: Some(Mode::Delphi), unit_paths: Some(vec!["x".into()]), ..Default::default() };
+        let err = write_back(&file, &v).unwrap_err();
+        assert!(err.contains("OtherUnitFiles") || err.contains("SearchPaths"), "{err}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), body, "nothing written");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn a_dproj_gets_its_dcc_values_in_every_group_that_has_them() {
+        let body = "<Project><PropertyGroup><DCC_UnitSearchPath>a;b</DCC_UnitSearchPath><DCC_Define/><DCC_ExeOutput>.\\bin</DCC_ExeOutput></PropertyGroup><PropertyGroup Condition=\"'$(Cfg)'=='Debug'\"><DCC_UnitSearchPath>old</DCC_UnitSearchPath></PropertyGroup></Project>";
+        let file = tmp("dproj-values", "dproj", body);
+        let v = WriteBack {
+            target: Some("out/app".into()),
+            unit_paths: Some(vec!["x".into(), "y".into()]),
+            defines: Some(vec!["DEBUG".into(), "FOO".into()]),
+            ..Default::default()
+        };
+        assert_eq!(write_back(&file, &v), Ok(4), "unit paths in both groups, the define and the output");
+        let out = std::fs::read_to_string(&file).unwrap();
+        assert!(out.contains("<DCC_UnitSearchPath>x;y</DCC_UnitSearchPath><DCC_Define>DEBUG;FOO</DCC_Define>"), "{out}");
+        assert!(out.contains("<DCC_ExeOutput>out\\app</DCC_ExeOutput>"), "{out}");
+        assert!(out.contains("<DCC_UnitSearchPath>x;y</DCC_UnitSearchPath></PropertyGroup>"), "{out}");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+}

@@ -420,6 +420,14 @@ pub(crate) fn build_streaming_for(
         };
         std::io::Error::new(std::io::ErrorKind::NotFound, hint)
     })?;
+    // fpc does not create the folder an executable goes to (a Delphi project's DCC_ExeOutput, for one).
+    for arg in extra {
+        if let Some(out) = arg.to_str().and_then(|a| a.strip_prefix("-o")) {
+            if let Some(parent) = Path::new(out).parent().filter(|p| !p.as_os_str().is_empty()) {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+    }
     let config = config_args(&fpc, dir);
     let mut child = Command::new(fpc)
         .args(target.args())

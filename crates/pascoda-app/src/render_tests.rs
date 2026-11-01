@@ -1780,7 +1780,7 @@ fn clicking_a_bookmark_chip_unsets_it() {
     assert_eq!(h.state().bookmarks.get(2), None, "clicking the chip unsets the bookmark");
 }
 
-/// The Lazarus tools: Make Resource String edits the active unit at the caret; Check LFM reports a
+/// The Lazarus tools: Make Resource String edits the active unit at the caret; Check Form reports a
 /// form's errors into the console; Quick Syntax Check starts fpc on the active file.
 #[test]
 fn the_lazarus_tools_act_on_the_active_file() {
@@ -1803,16 +1803,16 @@ fn the_lazarus_tools_act_on_the_active_file() {
     assert!(out.contains("ShowMessage(rsHelloWorld)"), "{out}");
     assert!(app.docs[0].dirty(), "the change is unsaved, like typing");
 
-    // Check LFM on a form with a broken line reports where it is.
+    // Check Form on a form with a broken line reports where it is.
     let form = base.join("form1.lfm");
     std::fs::write(&form, "object Form1: TForm1\n  Caption = \n").unwrap();
     let mut app = App::bare(Some(form.clone()));
     app.run_laz_tool(&ctx, LazTool::CheckLfm);
-    assert!(app.console.starts_with("Check LFM: form1.lfm:"), "{}", app.console);
+    assert!(app.console.starts_with("Check Form: form1.lfm:"), "{}", app.console);
     std::fs::write(&form, "object Form1: TForm1\n  Caption = 'ok'\nend\n").unwrap();
     let mut app = App::bare(Some(form.clone()));
     app.run_laz_tool(&ctx, LazTool::CheckLfm);
-    assert_eq!(app.console, "Check LFM: form1.lfm is a valid form\n");
+    assert_eq!(app.console, "Check Form: form1.lfm is a valid form\n");
 
     // Quick Syntax Check needs a Pascal file, and starts fpc on the file otherwise.
     let mut app = App::bare(Some(base.join("notes.txt")));

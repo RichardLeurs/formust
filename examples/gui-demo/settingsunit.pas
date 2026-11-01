@@ -5,11 +5,11 @@ unit settingsunit;
 interface
 
 uses
-  Classes, SysUtils, Forms, Controls, Graphics, Dialogs, StdCtrls, ExtCtrls,
+  Classes , SysUtils , Forms , Controls , Graphics , Dialogs , StdCtrls , ExtCtrls ,
   Buttons;
 
 type
-  TThemeSetting = (tsSystem, tsLight, tsDark);
+  TThemeSetting = (tsSystem , tsLight , tsDark);
 
   TSettingsForm = class(TForm)
     WordWrapCheckBox: TCheckBox;
@@ -19,8 +19,9 @@ type
     OKButton: TBitBtn;
     CancelButton: TBitBtn;
     procedure OKButtonClick(Sender: TObject);
-  public
-    procedure LoadSettings(AWordWrap: Boolean; AFontSize: Integer; ATheme: TThemeSetting);
+  PUBLIC
+    procedure LoadSettings(AWordWrap: Boolean ; AFontSize: Integer ;
+      ATheme: TThemeSetting);
     function WordWrapSetting: Boolean;
     function FontSizeSetting: Integer;
     function ThemeSetting: TThemeSetting;
@@ -37,7 +38,8 @@ const
   DefaultFontSize = 12;
 
 // Shows the current values. Unknown font sizes fall back to DefaultFontSize.
-procedure TSettingsForm.LoadSettings(AWordWrap: Boolean; AFontSize: Integer; ATheme: TThemeSetting);
+procedure TSettingsForm.LoadSettings(AWordWrap: Boolean ; AFontSize: Integer ;
+  ATheme: TThemeSetting);
 var
   Index: Integer;
 begin
@@ -56,24 +58,25 @@ end;
 
 function TSettingsForm.FontSizeSetting: Integer;
 begin
-  Result := StrToIntDef(FontSizeCombo.Text, DefaultFontSize);
+  Result := StrToIntDef(FontSizeCombo.Text , DefaultFontSize);
 end;
 
 function TSettingsForm.ThemeSetting: TThemeSetting;
 begin
   case ThemeGroup.ItemIndex of
-    1: Result := tsLight;
-    2: Result := tsDark;
+  1: Result := tsLight;
+  2: Result := tsDark;
   else
     Result := tsSystem;
-  end;
+    end;
 end;
 
 
 procedure TSettingsForm.OKButtonClick(Sender: TObject);
 var
-index: integer;
+  index: integer;
 begin
- index:=1;
+  index := 1;
 end;
+
 end.

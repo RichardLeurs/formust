@@ -22,6 +22,7 @@ mod files;
 mod external;
 mod highlight;
 mod hints;
+mod classcomplete;
 mod icons;
 mod laztools;
 mod livecheck;
@@ -1050,7 +1051,7 @@ impl App {
     /// Runs a tool from the Tools menu. Its output goes to the Output tab and its compiler-style errors to
     /// Problems. One build or tool at a time, since they share the console.
     /// Runs a built-in Lazarus tool. Quick Syntax Check and Diff run as tools (their output goes to the
-    /// Output tab); Check LFM reports into the console; Make Resource String edits the active unit.
+    /// Output tab); Check Form reports into the console; Make Resource String edits the active unit.
     fn run_laz_tool(&mut self, ctx: &egui::Context, tool: LazTool) {
         let active = self.docs.get(self.active).map(|d| d.path.clone());
         let is_source = |p: &Path| p.extension().and_then(|e| e.to_str()).is_some_and(|e| SOURCE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
@@ -1101,14 +1102,14 @@ impl App {
                 let Some(path) = active.filter(|p| {
                     p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("lfm") || e.eq_ignore_ascii_case("dfm"))
                 }) else {
-                    self.note("Check LFM needs a form file (.lfm or .dfm) open");
+                    self.note("Check Form needs a form file (.lfm or .dfm) open");
                     return;
                 };
                 let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
                 let text = self.docs[self.active].text.clone();
                 self.console = match pascoda_forms::lfm::parse(&text) {
-                    Ok(_) => format!("Check LFM: {name} is a valid form\n"),
-                    Err(e) => format!("Check LFM: {name}:{}:{}: {}\n", e.line, e.col, e.message),
+                    Ok(_) => format!("Check Form: {name} is a valid form\n"),
+                    Err(e) => format!("Check Form: {name}:{}:{}: {}\n", e.line, e.col, e.message),
                 };
                 self.auto_tab(ctx, bottom::BottomTab::Output);
             }
@@ -2916,6 +2917,7 @@ struct NativeMenu {
     preferences: muda::MenuId,
     run_to: muda::MenuId,
     format: muda::MenuId,
+    complete_class: muda::MenuId,
     rebuild: muda::MenuId,
     clean: muda::MenuId,
     build_package: muda::MenuId,
@@ -2997,7 +2999,7 @@ impl LazTool {
             LazTool::QuickSyntaxCheck => "Quick Syntax Check",
             LazTool::MakeResourceString => "Make Resource String",
             LazTool::Diff => "Diff Checker",
-            LazTool::CheckLfm => "Check LFM",
+            LazTool::CheckLfm => "Check Form",
         }
     }
 }
@@ -3025,6 +3027,8 @@ enum MenuAction {
     Laz(LazTool),
     /// Edit > Format Code.
     Format,
+    /// Edit > Complete Class (Ctrl+Shift+C): stubs for missing bodies, declarations for new methods.
+    CompleteClass,
     ProjectOptions,
     Rebuild,
     Clean,
@@ -3185,6 +3189,12 @@ impl NativeMenu {
         );
         edit_menu.append(&PredefinedMenuItem::separator()).ok()?;
         edit_menu.append(&format).ok()?;
+        let complete_class = MenuItem::new(
+            "Complete Class",
+            true,
+            Some(Accelerator::new(Modifiers::CONTROL | Modifiers::SHIFT, Code::KeyC)),
+        );
+        edit_menu.append(&complete_class).ok()?;
         // Bookmarks, all on Cmd+Ctrl (the editor's Ctrl+digit and Ctrl+Shift+digit keys are separate).
         let bookmark_key = |code| Some(Accelerator::new(Modifiers::META | Modifiers::CONTROL, code));
         let set_bookmark = MenuItem::new("Set Bookmark", true, bookmark_key(Code::KeyB));
@@ -3232,10 +3242,10 @@ impl NativeMenu {
                 &new_console,
                 &new_library,
                 &new_package,
-                &new_form,
                 &PredefinedMenuItem::separator(),
                 &new_file,
                 &new_folder,
+                &new_form,
                 &rename_item,
                 &PredefinedMenuItem::separator(),
                 &open_recent,
@@ -3268,11 +3278,11 @@ impl NativeMenu {
                 &debug,
                 &run_to,
                 &PredefinedMenuItem::separator(),
-                &project_options,
-                &PredefinedMenuItem::separator(),
                 &rebuild,
                 &clean,
                 &build_package,
+                &PredefinedMenuItem::separator(),
+                &project_options,
                 &PredefinedMenuItem::separator(),
                 &export,
             ],
@@ -3295,7 +3305,7 @@ impl NativeMenu {
             &[&toggle_view, &jump_bar, &assistant, &appearance_menu],
         )
         .ok()?;
-        menu.append_items(&[&app, &file, &edit_menu, &view, &build, &tools_menu])
+        menu.append_items(&[&app, &file, &edit_menu, &view, &tools_menu, &build])
             .ok()?;
         menu.init_for_nsapp();
 
@@ -3319,6 +3329,7 @@ impl NativeMenu {
             preferences: preferences.id().clone(),
             run_to: run_to.id().clone(),
             format: format.id().clone(),
+            complete_class: complete_class.id().clone(),
             rebuild: rebuild.id().clone(),
             clean: clean.id().clone(),
             build_package: build_package.id().clone(),
@@ -3454,6 +3465,7 @@ impl NativeMenu {
                     (&self.debug, MenuAction::Debug),
                     (&self.run_to, MenuAction::RunToCursor),
                     (&self.format, MenuAction::Format),
+                    (&self.complete_class, MenuAction::CompleteClass),
                     (&self.project_options, MenuAction::ProjectOptions),
                     (&self.rebuild, MenuAction::Rebuild),
                     (&self.clean, MenuAction::Clean),
