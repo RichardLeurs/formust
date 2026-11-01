@@ -115,6 +115,8 @@ NO_DMG=1 packaging/bundle.sh         # apps only, no disk images
 | Intel | `Pascoda-x86_64-darwin.app` / `.dmg` | x86_64 executable, `vendor/fpc-intel` (the compiler that runs on Intel), x86_64 `pasls`; no Windows export (the Intel compiler cannot build Windows programs, the app falls back) | about 189 MB | about 343 MB |
 | Universal | `Pascoda-universal-darwin.app` / `.dmg` | both executables joined with `lipo`, both compilers, both `pasls` | about 524 MB | about 1.1 GB |
 
+Why the Intel app is smaller: most of the difference is Free Pascal. The Apple Silicon app's `vendor/fpc` is about 770 MB: the arm64 units (about 275 MB), the x86_64 units for the Intel cross compiler (about 304 MB), the Windows 64-bit units (about 164 MB) and the arm64 compiler (about 26 MB). The Intel app carries only `vendor/fpc-intel` (about 144 MB), the compiler and units for Intel, and no Windows units, which is why it cannot export for Windows. The FPC sources, the LCL sources and `pasls` (about 170 MB) are in both apps.
+
 A bundle is replaced only when the same build is made again; other files in the output folder (including an older
 `Pascoda.app`) are not deleted. `packaging/make-dmg.sh` still expects the old single `Pascoda.app` and has not been
 updated for these names.
