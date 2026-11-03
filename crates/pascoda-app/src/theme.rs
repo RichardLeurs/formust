@@ -89,6 +89,7 @@ impl Appearance {
 
 pub fn apply(ctx: &egui::Context) {
     install_fonts(ctx);
+    crate::app_icons::install(ctx);
     ctx.set_visuals_of(Theme::Light, visuals(false));
     ctx.set_visuals_of(Theme::Dark, visuals(true));
     ctx.all_styles_mut(|style| {

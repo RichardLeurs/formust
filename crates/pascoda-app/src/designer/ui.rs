@@ -168,12 +168,12 @@ pub fn show(
                 // (many pages, e.g. imported packages, or a long sync error) would widen this Ui,
                 // and the canvas laid out after it would then reach under the inspector (the form
                 // centred too far right, and the native controls covering the inspector).
-                egui::ScrollArea::horizontal()
+                crate::style::thin_scroll(ui, &pal, |ui| { egui::ScrollArea::horizontal()
                     .id_salt("designer-pages")
                     .show(ui, |ui| ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     if let (Some(i), _) =
-                        crate::style::page_tabs(ui, &pal, &pages, page_index, pal.chrome)
+                        crate::style::page_tabs(ui, &pal, &pages, &[], page_index, pal.chrome)
                     {
                         state.page = i;
                     }
@@ -185,7 +185,7 @@ pub fn show(
                     if let Some(a) = &d.ancestor {
                         ui.colored_label(pal.text_tertiary, a.note());
                     }
-                }));
+                })); });
             });
         Frame::new()
             .inner_margin(Margin::symmetric(10, 6))

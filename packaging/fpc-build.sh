@@ -145,6 +145,14 @@ for t in aarch64-darwin x86_64-darwin x86_64-win64; do
     done
 done
 
+# fpcres: the resource compiler the compiler runs for {$R file.res} on macOS. The compiler looks for it in
+# -FD and then on PATH; Pascoda puts the compiler's own folder first, so it ships here next to the compiler.
+mkdir -p "$work/fpcres-units"
+"$dest/bin/fpc" -Mobjfpc -O2 -Xs -Fu"$work/src/packages/fcl-res/src" -Fu"$work/src/utils/fpcres" \
+    -FU"$work/fpcres-units" -o"$dest/bin/fpcres" "$work/src/utils/fpcres/fpcres.pas" >"$work/fpcres.log" 2>&1 \
+    || { tail -20 "$work/fpcres.log"; echo "fpc-build.sh: fpcres did not build (log: $work/fpcres.log)" >&2; exit 1; }
+[ -x "$dest/bin/fpcres" ] || { echo "fpc-build.sh: bin/fpcres was not produced" >&2; exit 1; }
+
 # Licences: the compiler is GPL, the runtime library and packages LGPL with a linking exception.
 for f in "$root/vendor/lazarus/COPYING.GPL.txt" "$root/vendor/lazarus/COPYING.LGPL.txt" \
          "$src/rtl/COPYING.FPC" "$src/rtl/COPYING.txt" "$src/compiler/COPYING.txt"; do

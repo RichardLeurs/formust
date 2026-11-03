@@ -16,6 +16,8 @@ use std::collections::HashSet;
 const GUTTER_W: f32 = 46.0;
 const TOOLBAR_H: f32 = 44.0;
 const STATUS_H: f32 = 22.0;
+/// The Project Options tab column (its tabs, with 8 pt inside on each side).
+const PROJECT_SIDE_W: f32 = 208.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum NavTab {
@@ -184,6 +186,9 @@ impl App {
         self.show_go_to_line(ctx);
         self.show_rename(ctx);
         self.show_preferences(ctx);
+        if self.about_open && crate::about::show(ctx) {
+            self.about_open = false;
+        }
         self.show_tools_editor(ctx);
         self.show_project_options(ctx);
         self.show_import_packages(ctx);
@@ -216,7 +221,9 @@ impl App {
         if self.assistant.open {
             self.assistant_panel(ui, &pal);
         }
-        self.debug_area(ui, &pal, &mut p);
+        if self.show_bottom {
+            self.debug_area(ui, &pal, &mut p);
+        }
         if self.show_navigator {
             self.navigator(ui, &pal, &mut p);
         }
@@ -329,6 +336,7 @@ impl App {
                 MenuAction::NewLibrary => self.new_project(pascoda_project::Template::Library),
                 MenuAction::NewPackage => self.new_project(pascoda_project::Template::Package),
                 MenuAction::Preferences => self.preferences_open = true,
+                MenuAction::About => self.about_open = true,
                 MenuAction::RunToCursor => self.run_to_cursor(ctx),
                 MenuAction::SetBookmark => self.set_bookmark_here(ctx),
                 MenuAction::UnsetBookmark => self.unset_bookmark_here(ctx),
@@ -467,7 +475,7 @@ impl App {
         } else if let Some(summary) = self.tests_summary(pal) {
             summary
         } else {
-            ("Ready".into(), pal.text_secondary)
+            ("Ready".into(), pal.ok)
         }
     }
 
@@ -505,14 +513,6 @@ impl App {
                 ui.horizontal_centered(|ui| {
                     ui.add_space(78.0); // room for the traffic-light buttons
                     let hover = |r: egui::Response, tip: &str| r.on_hover_text(tip);
-                    if hover(
-                        icon_button(ui, pal, Icon::Sidebar, true, self.show_navigator),
-                        "Show or hide the navigator",
-                    )
-                    .clicked()
-                    {
-                        self.show_navigator = !self.show_navigator;
-                    }
                     ui.add_space(8.0);
                     pill(ui, pal, |ui| {
                         if hover(
@@ -525,7 +525,7 @@ impl App {
                         }
                         if hover(
                             icon_button(ui, pal, Icon::Folder, true, false),
-                            "Open (Cmd+O)",
+                            "Open project... (Cmd+O)",
                         )
                         .clicked()
                         {
@@ -542,11 +542,8 @@ impl App {
                     });
                     ui.add_space(8.0);
                     pill(ui, pal, |ui| {
-                        if hover(
-                            icon_button(ui, pal, Icon::Play, can_build, false),
-                            "Build and Run (Cmd+R)",
-                        )
-                        .clicked()
+                        if hover(style::run_button(ui, pal, can_build), "Build and Run (Cmd+R)").clicked()
+                            && can_build
                         {
                             self.build_and_run(ctx, false);
                         }
@@ -581,18 +578,26 @@ impl App {
                     let painter = ui.painter();
                     painter.rect(
                         rect,
-                        14.0,
+                        8.0,
                         fill,
                         egui::Stroke::new(1.0, pal.separator),
                         egui::StrokeKind::Inside,
                     );
-                    painter.text(
-                        rect.left_center() + vec2(14.0, 0.0),
-                        egui::Align2::LEFT_CENTER,
-                        &project,
-                        egui::FontId::proportional(13.0),
-                        pal.text,
+                    // The project name, then a chevron. The name is drawn twice, a fraction of a point apart: the
+                    // theme ships one weight of SF Pro, so this is how it reads bold.
+                    let name_font = egui::FontId::proportional(13.0);
+                    let name_pos = rect.left_center() + vec2(12.0, 0.0);
+                    let name_width = painter
+                        .layout_no_wrap(project.clone(), name_font.clone(), pal.text)
+                        .size()
+                        .x;
+                    painter.text(name_pos, egui::Align2::LEFT_CENTER, &project, name_font.clone(), pal.text);
+                    painter.text(name_pos + vec2(0.35, 0.0), egui::Align2::LEFT_CENTER, &project, name_font, pal.text);
+                    let chevron = Rect::from_center_size(
+                        egui::pos2(name_pos.x + name_width + 10.0, rect.center().y),
+                        vec2(10.0, 10.0),
                     );
+                    crate::app_icons::paint(painter, chevron, "chevron-right", pal.text_tertiary);
                     if self.working() {
                         // A thin bar along the bottom of the pill; it slides when the amount of
                         // work is not known.
@@ -622,24 +627,64 @@ impl App {
                         painter.rect_filled(fill_bar, 1.5, pal.accent);
                         ui.ctx().request_repaint();
                     }
-                    painter.text(
-                        rect.right_center() - vec2(14.0, 0.0),
-                        egui::Align2::RIGHT_CENTER,
-                        &status,
-                        egui::FontId::proportional(12.0),
-                        status_color,
+                    // The status, as a badge at the right: tinted fill, outlined in its colour.
+                    let status_font = egui::FontId::proportional(12.0);
+                    let status_width = painter
+                        .layout_no_wrap(status.clone(), status_font.clone(), status_color)
+                        .size()
+                        .x;
+                    let badge = Rect::from_min_size(
+                        egui::pos2(rect.right() - 10.0 - status_width - 16.0, rect.center().y - 9.0),
+                        vec2(status_width + 16.0, 18.0),
                     );
+                    painter.rect(
+                        badge,
+                        5.0,
+                        status_color.gamma_multiply(0.15),
+                        egui::Stroke::new(1.0, status_color.gamma_multiply(0.5)),
+                        egui::StrokeKind::Inside,
+                    );
+                    painter.text(badge.center(), egui::Align2::CENTER_CENTER, &status, status_font, status_color);
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add_space(8.0);
                         if hover(
-                            icon_button(ui, pal, Icon::Sparkle, true, self.assistant.open),
-                            "Show or hide the assistant (Cmd+Opt+A)",
+                            icon_button(ui, pal, Icon::Gear, true, self.preferences_open),
+                            "Preferences (Cmd+,)",
                         )
                         .clicked()
                         {
-                            self.toggle_assistant();
+                            self.preferences_open = true;
                         }
+                        ui.add_space(4.0);
+                        // The navigator, bottom pane and assistant toggles: one group. The layout runs right to
+                        // left, so the buttons are added assistant first, navigator last (it ends up on the left).
+                        pill(ui, pal, |ui| {
+                            if hover(
+                                style::toggle_button(ui, pal, Icon::Sparkle, self.assistant.open),
+                                "Show or hide the assistant (Cmd+Opt+A)",
+                            )
+                            .clicked()
+                            {
+                                self.toggle_assistant();
+                            }
+                            if hover(
+                                style::toggle_button(ui, pal, Icon::PanelBottom, self.show_bottom),
+                                "Show or hide the bottom pane",
+                            )
+                            .clicked()
+                            {
+                                self.show_bottom = !self.show_bottom;
+                            }
+                            if hover(
+                                style::toggle_button(ui, pal, Icon::Sidebar, self.show_navigator),
+                                "Show or hide the navigator",
+                            )
+                            .clicked()
+                            {
+                                self.show_navigator = !self.show_navigator;
+                            }
+                        });
                         ui.add_space(4.0);
                         if has_form {
                             pill(ui, pal, |ui| {
@@ -694,7 +739,7 @@ impl App {
             .frame(
                 Frame::new()
                     .fill(pal.chrome)
-                    .inner_margin(Margin::symmetric(12, 0)),
+                    .inner_margin(Margin::ZERO),
             )
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
@@ -738,7 +783,6 @@ impl App {
             .show(ui, |ui| {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    ui.add_space(8.0);
                     for (tab, icon, tip) in [
                         (NavTab::Files, Icon::Files, "Project"),
                         (NavTab::Breakpoints, Icon::Breakpoint, "Breakpoints"),
@@ -755,6 +799,32 @@ impl App {
                     }
                 });
                 if self.nav_tab == NavTab::Files {
+                    // The filter field sits at the top, with a search icon inside it, as in Xcode's navigator. Its
+                    // box is 10 pt in from each side of the navigator, and its text is centred in the box.
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        Frame::new()
+                            .stroke(egui::Stroke::new(1.0, pal.separator))
+                            .corner_radius(6)
+                            .inner_margin(Margin::symmetric(8, 4))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width() - 17.0);
+                                ui.horizontal_centered(|ui| {
+                                    let (r, _) = ui.allocate_exact_size(vec2(13.0, 13.0), Sense::hover());
+                                    style::paint_icon(ui.painter(), r, Icon::Filter, pal.text_tertiary);
+                                    ui.add_space(4.0);
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.file_filter)
+                                            .hint_text("Filter files...")
+                                            .frame(Frame::NONE)
+                                            .margin(Margin::symmetric(0, 0))
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                });
+                            });
+                    });
+                    ui.add_space(4.0);
                     // The file actions get a row of their own: the tabs and the actions together are
                     // wider than the sidebar. Right to left: the first button added is the rightmost.
                     ui.horizontal(|ui| {
@@ -793,27 +863,6 @@ impl App {
                 }
                 ui.add_space(4.0);
                 hline(ui, pal);
-
-                egui::Panel::bottom("nav-filter")
-                    .exact_size(32.0)
-                    .show_separator_line(false)
-                    .frame(
-                        Frame::new()
-                            .fill(pal.sidebar)
-                            .inner_margin(Margin::symmetric(10, 4)),
-                    )
-                    .show(ui, |ui| {
-                        ui.horizontal_centered(|ui| {
-                            let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                            style::paint_icon(ui.painter(), r, Icon::Filter, pal.text_tertiary);
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.file_filter)
-                                    .hint_text("Filter")
-                                    .frame(Frame::NONE)
-                                    .desired_width(f32::INFINITY),
-                            );
-                        });
-                    });
 
                 if let Some(path) = self.tree_delete.clone() {
                     self.delete_prompt(ui, pal, &path, &mut actions);
@@ -993,6 +1042,7 @@ impl App {
                     false,
                     false,
                     &path,
+                    false,
                     active.as_deref() == Some(path.as_path()),
                 )
                 .clicked()
@@ -1519,7 +1569,8 @@ impl App {
             })
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
+                // Many files: the row scrolls sideways, like the designer's page tabs.
+                style::thin_scroll(ui, pal, |ui| { egui::ScrollArea::horizontal().id_salt("editor-tabs").show(ui, |ui| ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     let mut switched = None;
                     for (i, d) in self.docs.iter().enumerate() {
@@ -1538,7 +1589,14 @@ impl App {
                             egui::FontId::proportional(12.5),
                             if active { pal.text } else { pal.text_secondary },
                         );
-                        let width = galley.size().x + 38.0;
+                        // The file's icon: blue for a source file, amber for a database. Then the name.
+                        let ext = d.path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                        let (icon_name, icon_color) = match ext.as_str() {
+                            "sqlite" | "sqlite3" | "db" => ("database", egui::Color32::from_rgb(0xF5, 0xA5, 0x24)),
+                            _ if pal.dark => ("file-code", egui::Color32::from_rgb(0x60, 0xA5, 0xFA)),
+                            _ => ("file-code", egui::Color32::from_rgb(0x3B, 0x82, 0xF6)),
+                        };
+                        let width = galley.size().x + 56.0;
                         let (rect, resp) =
                             ui.allocate_exact_size(vec2(width, 28.0), Sense::click());
                         let hovered = resp.hovered();
@@ -1570,7 +1628,12 @@ impl App {
                                 pal.row_hover,
                             );
                         }
-                        let text_pos = rect.left_center() + vec2(10.0, -galley.size().y / 2.0);
+                        let icon_rect = Rect::from_center_size(
+                            egui::pos2(rect.left() + 18.0, rect.center().y),
+                            vec2(13.0, 13.0),
+                        );
+                        crate::app_icons::paint(ui.painter(), icon_rect, icon_name, icon_color);
+                        let text_pos = rect.left_center() + vec2(28.0, -galley.size().y / 2.0);
                         ui.painter().galley(text_pos, galley.clone(), pal.text);
                         let close = egui::Rect::from_center_size(
                             rect.right_center() - vec2(13.0, 0.0),
@@ -1623,7 +1686,7 @@ impl App {
                             self.form_view = false;
                         }
                     }
-                });
+                })); });
             });
         // The separator under the strip, interrupted where the active tab joins the editor.
         let y = strip.response.rect.bottom() - 0.5;
@@ -2138,159 +2201,291 @@ impl App {
         let mut save = false;
         let mut cancel = false;
         let mut write_file = false;
-        // The app's own dialog (no system-grey title bar), as the export dialog is drawn.
-        crate::style::dialog(ctx, "project-options", Some("Project Options"), 560.0, |ui| {
-                // Roomier rows than the default: the dialog is for a form of settings.
-                ui.spacing_mut().item_spacing.y = 8.0;
-                let e = &mut self.project_options;
-                // The settings scroll; Save and Cancel stay in view below them.
-                egui::ScrollArea::vertical().max_height(600.0).auto_shrink([false, false]).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Configuration");
-                    ui.radio_value(&mut e.configuration, pascoda_project::Configuration::Debug, "Debug");
-                    ui.radio_value(&mut e.configuration, pascoda_project::Configuration::Release, "Release");
+        // 0 = Compiler, 1 = Paths, 2 = Lazarus Environment.
+        let tab = self.project_options_tab;
+        let mut tab_choice: Option<usize> = None;
+        // The app's own dialog (no system-grey title bar), as the export dialog is drawn. Its width does not depend
+        // on the tab: each tab fits the same 400 pt column.
+        // Flush: the sidebar runs to the dialog's left edge. The content keeps its own 30 pt margin on the right.
+        crate::style::dialog_edges(ctx, "project-options", Some("Project Options"), 700.0, 0, 18, 0, 0.0, Some("options-glyph"), |ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            let e = &mut self.project_options;
+            // No space between the tab column and the footer rule: the column's fill meets it. The fields pane sets its own.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            // No space between the tab column and the fields pane: the pane's own left margin is the gap.
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let row = ui.horizontal_top(|ui| {
+                // A flat column down the left: the tabs (the chosen one is blue), on a fill that runs the full height
+                // of the row, from the title rule to the footer rule. Its fill is painted once the row's height is known.
+                let left = ui.cursor().left();
+                let bg = ui.painter().add(egui::Shape::Noop);
+                // 16 pt clear of the column's edges, and of the title rule above the first tab.
+                egui::Frame::new()
+                    .inner_margin(egui::Margin { left: 16, right: 16, top: 16, bottom: 0 })
+                    .show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(PROJECT_SIDE_W - 32.0);
+                        ui.set_min_height(360.0);
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        for (i, (icon, label)) in [("cpu", "Compiler"), ("folder", "Paths"), ("settings", "Lazarus Environment")]
+                            .into_iter()
+                            .enumerate()
+                        {
+                            if crate::style::side_tab(ui, &pal, icon, label, tab == i) {
+                                tab_choice = Some(i);
+                            }
+                        }
+                    });
                 });
-                ui.horizontal(|ui| {
-                    ui.label("Language");
-                    ui.radio_value(&mut e.mode, pascoda_fpc::Mode::ObjFpc, "ObjFPC");
-                    ui.radio_value(&mut e.mode, pascoda_fpc::Mode::Delphi, "Delphi");
-                });
-                ui.label(
-                    RichText::new("ObjFPC and Delphi make Integer 32 bits; fpc's own default is 16.")
-                        .size(11.0)
-                        .color(pal.text_tertiary),
-                );
-                ui.add_space(6.0);
-                for (label, text, hint) in [
-                    ("Defines (-d)", &mut e.defines, "One name per line"),
-                    ("Unit search paths (-Fu)", &mut e.units, "Folders, relative to the project"),
-                    ("Include search paths (-Fi)", &mut e.includes, "Folders, relative to the project"),
-                    ("Compiler switches", &mut e.switches, "One per line, such as -O2 or -Cr"),
-                ] {
-                    let l = ui.label(label);
-                    ui.add(
-                        egui::TextEdit::multiline(text)
-                            .id(egui::Id::unique(label))
-                            .hint_text(hint)
-                            .desired_rows(2)
-                            .desired_width(f32::INFINITY),
-                    )
-                    .labelled_by(l.id);
-                }
-                ui.add_space(4.0);
-                for (label, text, hint) in [
-                    ("Program arguments", &mut e.args, "One argument per line"),
-                ] {
-                    let l = ui.label(label);
-                    ui.add(
-                        egui::TextEdit::multiline(text)
-                            .id(egui::Id::unique(label))
-                            .hint_text(hint)
-                            .desired_rows(2)
-                            .desired_width(f32::INFINITY),
-                    )
-                    .labelled_by(l.id);
-                }
-                ui.horizontal(|ui| {
-                    let l = ui.label("Working folder");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut e.workdir)
-                            .id(egui::Id::unique("project-workdir"))
-                            .hint_text("The program's folder")
-                            .desired_width(300.0),
-                    )
-                    .labelled_by(l.id);
-                });
-                ui.horizontal(|ui| {
-                    let l = ui.label("Lazarus folder");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut e.lazarus)
-                            .id(egui::Id::unique("project-lazarus"))
-                            .hint_text("Bundled Lazarus")
-                            .desired_width(240.0),
-                    )
-                    .labelled_by(l.id);
-                    if ui.button("Choose...").clicked()
-                        && let Some(f) = rfd::FileDialog::new().set_directory(&root).pick_folder()
-                    {
-                        e.lazarus = f.to_string_lossy().into_owned();
-                    }
-                });
-                ui.label(
-                    RichText::new("The Lazarus source folder whose LCL builds this project, for a project made with another Lazarus than the bundled one (for example one that brings its own copy of LazControls).")
-                        .size(11.0)
-                        .color(pal.text_tertiary),
-                );
-                ui.horizontal(|ui| {
-                    let l = ui.label("Output file");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut e.output)
-                            .id(egui::Id::unique("project-output"))
-                            .hint_text("Default")
-                            .desired_width(300.0),
-                    )
-                    .labelled_by(l.id);
-                });
-                ui.label(
-                    RichText::new(format!("Default: {}", e.default_target))
-                        .monospace()
-                        .size(11.0)
-                        .color(pal.text_tertiary),
-                );
-                if let Some(view) = &e.project_file {
-                    egui::CollapsingHeader::new(format!("From {}", view.file_name))
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            egui::Grid::new("project-file-view")
+                // Margins around the fields: 20 pt each side, 14 pt top and bottom.
+                egui::Frame::new()
+                    .fill(if pal.dark { crate::style::DIALOG_PANE_DARK } else { egui::Color32::TRANSPARENT })
+                    .inner_margin(egui::Margin::same(16))
+                    .show(ui, |ui| {
+                    ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                    // The settings scroll; Save and Cancel stay in view below them.
+                    egui::ScrollArea::vertical().max_height(340.0).auto_shrink([false, false]).show(ui, |ui| {
+                        if tab == 0 {
+                            // Configuration and language: two cards, which wrap onto a second line if the column is narrow.
+                            let field = ui.visuals().extreme_bg_color;
+                            // Two equal cards: a label above a full-width segmented control, as in Xcode.
+                            ui.columns(2, |cols| {
+                                egui::Frame::new()
+                                    .fill(field)
+                                    .stroke(egui::Stroke::new(1.0, pal.separator))
+                                    .corner_radius(8)
+                                    .inner_margin(egui::Margin::symmetric(10, 8))
+                                    .show(&mut cols[0], |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.label(RichText::new("Configuration").size(12.0).color(pal.text_secondary));
+                                        ui.add_space(4.0);
+                                        let debug = e.configuration == pascoda_project::Configuration::Debug;
+                                        match style::segmented(ui, &pal, ["Debug", "Release"], [debug, !debug]) {
+                                            Some(0) => e.configuration = pascoda_project::Configuration::Debug,
+                                            Some(_) => e.configuration = pascoda_project::Configuration::Release,
+                                            None => {}
+                                        }
+                                    });
+                                egui::Frame::new()
+                                    .fill(field)
+                                    .stroke(egui::Stroke::new(1.0, pal.separator))
+                                    .corner_radius(8)
+                                    .inner_margin(egui::Margin::symmetric(10, 8))
+                                    .show(&mut cols[1], |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.label(RichText::new("Language syntax").size(12.0).color(pal.text_secondary));
+                                        ui.add_space(4.0);
+                                        let objfpc = e.mode == pascoda_fpc::Mode::ObjFpc;
+                                        match style::segmented(ui, &pal, ["ObjFPC", "Delphi"], [objfpc, !objfpc]) {
+                                            Some(0) => e.mode = pascoda_fpc::Mode::ObjFpc,
+                                            Some(_) => e.mode = pascoda_fpc::Mode::Delphi,
+                                            None => {}
+                                        }
+                                    });
+                            });
+                            // ui.label(
+                            //     RichText::new("ObjFPC and Delphi make Integer 32 bits; fpc's own default is 16.")
+                            //         .size(11.0)
+                            //         .color(pal.text_tertiary),
+                            // );
+                            // Each label sits beside its field, as on the Paths tab.
+                            let field_w = (ui.available_width() - 190.0).max(230.0);
+                            egui::Grid::new("compiler-fields")
                                 .num_columns(2)
-                                .spacing([12.0, 3.0])
+                                .spacing([16.0, 12.0])
                                 .show(ui, |ui| {
-                                    for (label, value) in &view.rows {
-                                        ui.label(RichText::new(label).size(12.0).color(pal.text_tertiary));
-                                        ui.label(RichText::new(value).monospace().size(12.0));
+                                    for (label, text, hint) in [
+                                        ("Defines (-d)", &mut e.defines, "One name per line"),
+                                        ("Compiler switches", &mut e.switches, "One per line, such as -O2 or -Cr"),
+                                        ("Program arguments", &mut e.args, "One argument per line"),
+                                    ] {
+                                        ui.label(label);
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                            ui.add(
+                                                egui::TextEdit::multiline(text)
+                                                    .id(egui::Id::unique(label))
+                                                    .hint_text(hint)
+                                                    .font(egui::FontId::monospace(12.5))
+                                                    .desired_rows(2)
+                                                    .desired_width(field_w),
+                                            );
+                                        });
                                         ui.end_row();
                                     }
                                 });
-                            if !view.skipped.is_empty() {
-                                ui.label(
-                                    RichText::new(format!("Left out by the build: {}", view.skipped.join(", ")))
-                                        .size(11.0)
-                                        .color(pal.text_tertiary),
-                                );
+                        } else if tab == 1 {
+                            // The paths: one column of fields, all the same width, right aligned, with room between the lines.
+                            // The fields fill the pane, leaving room for the labels on the left.
+                            let field_w = (ui.available_width() - 190.0).max(230.0);
+                            egui::Grid::new("project-paths")
+                                .num_columns(2)
+                                .spacing([16.0, 16.0])
+                                .show(ui, |ui| {
+                                    let l = ui.label("Unit search paths (-Fu)");
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                        ui.add(
+                                            egui::TextEdit::multiline(&mut e.units)
+                                                .id(egui::Id::unique("project-units"))
+                                                .hint_text("Folders, relative to the project")
+                                                .font(egui::FontId::monospace(12.5))
+                                                .desired_rows(2)
+                                                .desired_width(field_w),
+                                        )
+                                        .labelled_by(l.id);
+                                    });
+                                    ui.end_row();
+                                    let l = ui.label("Include search paths (-Fi)");
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                        ui.add(
+                                            egui::TextEdit::multiline(&mut e.includes)
+                                                .id(egui::Id::unique("project-includes"))
+                                                .hint_text("Folders, relative to the project")
+                                                .font(egui::FontId::monospace(12.5))
+                                                .desired_rows(2)
+                                                .desired_width(field_w),
+                                        )
+                                        .labelled_by(l.id);
+                                    });
+                                    ui.end_row();
+                                    let l = ui.label("Working folder");
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut e.workdir)
+                                                .id(egui::Id::unique("project-workdir"))
+                                                .hint_text("The program's folder")
+                                                .font(egui::FontId::monospace(12.5))
+                                                .desired_width(field_w),
+                                        )
+                                        .labelled_by(l.id);
+                                    });
+                                    ui.end_row();
+                                    let l = ui.label("Lazarus folder");
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                        if ui.button("Choose...").clicked()
+                                            && let Some(f) = rfd::FileDialog::new().set_directory(&root).pick_folder()
+                                        {
+                                            e.lazarus = f.to_string_lossy().into_owned();
+                                        }
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut e.lazarus)
+                                                .id(egui::Id::unique("project-lazarus"))
+                                                .hint_text("Bundled Lazarus")
+                                                .font(egui::FontId::monospace(12.5))
+                                                .desired_width(field_w - 80.0),
+                                        )
+                                        .labelled_by(l.id);
+                                    });
+                                    ui.end_row();
+                                    let l = ui.label("Output file");
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut e.output)
+                                                .id(egui::Id::unique("project-output"))
+                                                .hint_text("Default")
+                                                .font(egui::FontId::monospace(12.5))
+                                                .desired_width(field_w),
+                                        )
+                                        .labelled_by(l.id);
+                                    });
+                                    ui.end_row();
+                                });
+                        } else {
+                            // The .lpi (or .dproj) the project was made with: what the build reads from it.
+                            match &e.project_file {
+                                Some(view) => {
+                                    ui.add(egui::Label::new(RichText::new(&view.file_name).strong()).wrap());
+                                    egui::Grid::new("project-file-view")
+                                        .num_columns(2)
+                                        .spacing([12.0, 6.0])
+                                        .show(ui, |ui| {
+                                            for (label, value) in &view.rows {
+                                                ui.label(RichText::new(label).size(12.0).color(pal.text_tertiary));
+                                                ui.add(egui::Label::new(RichText::new(value).monospace().size(12.0)).wrap());
+                                                ui.end_row();
+                                            }
+                                        });
+                                    if !view.skipped.is_empty() {
+                                        ui.label(
+                                            RichText::new(format!("Left out by the build: {}", view.skipped.join(", ")))
+                                                .size(11.0)
+                                                .color(pal.text_tertiary),
+                                        );
+                                    }
+                                    // ui.label(
+                                    //     RichText::new("The build reads these. Write to file saves the values from the other tabs into it, keeping the rest of the file.")
+                                    //         .size(11.0)
+                                    //         .color(pal.text_tertiary),
+                                    // );
+                                    // if ui.button(format!("Write to {}", view.file_name)).clicked() {
+                                    //     write_file = true;
+                                    // }
+                                }
+                                None => {
+                                    ui.label(
+                                        RichText::new("This folder has no .lpi or .dproj project file.")
+                                            .size(12.0)
+                                            .color(pal.text_tertiary),
+                                    );
+                                }
                             }
-                            ui.label(
-                                RichText::new("The build reads these. Write to file saves the values above into it, keeping the rest of the file.")
-                                    .size(11.0)
-                                    .color(pal.text_tertiary),
-                            );
-                            if ui.button(format!("Write to {}", view.file_name)).clicked() {
-                                write_file = true;
-                            }
-                        });
-                }
-                for w in &warnings {
-                    ui.label(RichText::new(w).size(12.0).color(pal.warning));
-                }
-                if !e.error.is_empty() {
-                    ui.label(RichText::new(&e.error).color(pal.error));
-                }
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("The language server reads these when it starts: reopen the project for it.")
-                        .size(11.0)
-                        .color(pal.text_tertiary),
-                );
+                        }
+                        for w in &warnings {
+                            ui.label(RichText::new(w).size(12.0).color(pal.warning));
+                        }
+                        if !e.error.is_empty() {
+                            ui.label(RichText::new(&e.error).color(pal.error));
+                        }
+                        // ui.label(
+                        //     RichText::new("The language server reads these when it starts: reopen the project for it.")
+                        //         .size(11.0)
+                        //         .color(pal.text_tertiary),
+                        // );
+                    });
+                    });
                 });
-                ui.add_space(4.0);
-                crate::style::buttons(ui, |ui| {
-                    if crate::style::primary_button(ui, "Save").clicked() {
-                        save = true;
-                    }
-                    if crate::style::secondary_button(ui, "Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
+                (bg, left)
             });
+            // The column's fill and rule run the full height of the row (from the title rule to the footer rule).
+            let (bg, left) = row.inner;
+            let row_rect = row.response.rect;
+            ui.painter().set(
+                bg,
+                egui::Shape::rect_filled(
+                    // Starts 1 pt below the row's top, so the title rule above it stays visible across the column.
+                    egui::Rect::from_min_size(
+                        egui::pos2(left, row_rect.top() + 1.0),
+                        egui::vec2(PROJECT_SIDE_W, row_rect.height() - 1.0),
+                    ),
+                    0.0,
+                    crate::style::DIALOG_SIDE_BG,
+                ),
+            );
+            ui.painter().vline(left + PROJECT_SIDE_W, row_rect.y_range(), egui::Stroke::new(1.0, pal.separator));
+            // The footer: its own background, with a rule along its top, running the full width of the dialog.
+            let footer = egui::Frame::new()
+                .fill(if pal.dark { crate::style::DIALOG_FOOTER_DARK } else { crate::style::DIALOG_FOOTER_LIGHT })
+                // 20 pt on the right, as the fields pane: Save lines up with the fields' right edge.
+                .inner_margin(egui::Margin::symmetric(20, 10))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    crate::style::buttons(ui, |ui| {
+                        if crate::style::primary_button(ui, "Save").clicked() {
+                            save = true;
+                        }
+                        if crate::style::secondary_button(ui, "Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            let r = footer.response.rect;
+            let border = if pal.dark { crate::style::DIALOG_FOOTER_BORDER_DARK } else { crate::style::DIALOG_FOOTER_BORDER_LIGHT };
+            ui.painter().hline(r.x_range(), r.top(), egui::Stroke::new(1.0, border));
+        });
+        if let Some(choice) = tab_choice {
+            self.project_options_tab = choice;
+        }
         if write_file {
             match self.project_options.write_to_project_file(&root) {
                 Ok(n) => {
@@ -2406,6 +2601,7 @@ impl App {
             || self.go_to.open
             || self.rename.open
             || self.preferences_open
+            || self.about_open
             || self.project_options.open
             || self.bp_edit.is_some()
             || self.value_edit.is_some()
@@ -2437,132 +2633,138 @@ impl App {
         }
         let before = self.prefs;
         let mut done = false;
+        let current_dark = Palette::of(ctx).dark;
         // The app's own dialog (no system-grey title bar), with a Done button to close it.
-        crate::style::dialog(ctx, "preferences", Some("Preferences"), 460.0, |ui| {
-                ui.spacing_mut().item_spacing.y = 8.0;
-                ui.heading("Editor");
-                egui::Grid::new("prefs-editor").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-                    ui.label("Line numbers");
-                    ui.checkbox(&mut self.prefs.line_numbers, "Show in the gutter");
-                    ui.end_row();
-                    ui.label("Long lines");
-                    ui.checkbox(&mut self.prefs.word_wrap, "Wrap to the editor width");
-                    ui.end_row();
-                    ui.label("Saving");
-                    ui.checkbox(&mut self.prefs.format_on_save, "Format Pascal files (Cmd+S)");
-                    ui.end_row();
-                    let font_label = ui.label("Font");
-                    egui::ComboBox::from_id_salt("prefs-font")
-                        .selected_text(theme::EDITOR_FONTS[self.prefs.font].0)
-                        .show_ui(ui, |ui| {
-                            for (i, (name, _)) in theme::EDITOR_FONTS.iter().enumerate() {
-                                ui.selectable_value(&mut self.prefs.font, i, *name);
-                            }
-                        })
-                        .response
-                        .labelled_by(font_label.id);
-                    ui.end_row();
-                    ui.label("Background");
-                    ui.horizontal(|ui| {
-                        for dark in [false, true] {
-                            let pal = if dark { Palette::DARK } else { Palette::LIGHT };
-                            let fallback = pal.editor;
-                            let mut rgb = self.prefs.background[dark as usize]
-                                .unwrap_or([fallback.r(), fallback.g(), fallback.b()]);
-                            let label = if dark { "Dark" } else { "Light" };
-                            ui.label(label);
-                            if ui.color_edit_button_srgb(&mut rgb).changed() {
-                                self.prefs.set_background(dark, Some(rgb));
-                            }
-                            if self.prefs.background[dark as usize].is_some() && ui.small_button("Reset").clicked() {
-                                self.prefs.set_background(dark, None);
-                            }
-                        }
-                    });
-                    ui.end_row();
-                    ui.label("Current line");
-                    ui.horizontal(|ui| {
-                        for dark in [false, true] {
-                            let pal = if dark { Palette::DARK } else { Palette::LIGHT };
-                            let fallback = pal.current_line;
-                            let mut rgb = self.prefs.current_line[dark as usize]
-                                .unwrap_or([fallback.r(), fallback.g(), fallback.b()]);
-                            ui.label(if dark { "Dark" } else { "Light" });
-                            if ui.color_edit_button_srgb(&mut rgb).changed() {
-                                self.prefs.set_current_line(dark, Some(rgb));
-                            }
-                            if self.prefs.current_line[dark as usize].is_some() && ui.small_button("Reset").clicked() {
-                                self.prefs.set_current_line(dark, None);
-                            }
-                        }
-                    });
-                    ui.end_row();
-                    let size_label = ui.label("Font size");
-                    ui.add(
-                        egui::DragValue::new(&mut self.prefs.font_size)
-                            .range(*prefs::FONT_SIZES.start()..=*prefs::FONT_SIZES.end())
-                            .speed(0.2)
-                            .fixed_decimals(0)
-                            .suffix(" pt"),
-                    )
-                    .labelled_by(size_label.id);
-                    ui.end_row();
-                    ui.label("Tab key inserts");
-                    ui.horizontal(|ui| {
-                        for width in prefs::TAB_WIDTHS {
-                            ui.radio_value(&mut self.prefs.tab_width, width, format!("{width} spaces"));
-                        }
-                    });
-                    ui.end_row();
+        style::dialog(ctx, "preferences", Some("Preferences"), 520.0, |ui| {
+            let pal = Palette::of(ui.ctx());
+            // The appearance whose colours the rows below edit: the current one unless the Light/Dark choice says.
+            let dark = self.prefs_dark.unwrap_or(current_dark);
+            ui.spacing_mut().item_spacing.y = 0.0;
+
+            // Two tabs: the editor's settings, and the code colours.
+            let colours = self.prefs_colours_tab;
+            ui.horizontal(|ui| {
+                style::pill(ui, &pal, |ui| {
+                    if style::accent_segment(ui, &pal, "Editor", !colours).clicked() {
+                        self.prefs_colours_tab = false;
+                    }
+                    if style::accent_segment(ui, &pal, "Colours", colours).clicked() {
+                        self.prefs_colours_tab = true;
+                    }
                 });
-                ui.add_space(8.0);
-                ui.heading("Code colours");
-                egui::Grid::new("prefs-colors").num_columns(3).spacing([16.0, 6.0]).show(ui, |ui| {
-                    ui.label(RichText::new("Token").color(egui::Color32::GRAY));
-                    ui.label(RichText::new("Light").color(egui::Color32::GRAY));
-                    ui.label(RichText::new("Dark").color(egui::Color32::GRAY));
-                    ui.end_row();
+            });
+            ui.add_space(8.0);
+            if !colours {
+            pref_row(ui, &pal, "Line numbers", |ui| {
+                toggle_caption(ui, &pal, &mut self.prefs.line_numbers, "Show in the gutter");
+            });
+            pref_row(ui, &pal, "Long lines", |ui| {
+                toggle_caption(ui, &pal, &mut self.prefs.word_wrap, "Wrap to the editor width");
+            });
+            pref_row(ui, &pal, "Saving", |ui| {
+                toggle_caption(ui, &pal, &mut self.prefs.format_on_save, "Format Pascal files (Cmd+S)");
+            });
+            pref_row(ui, &pal, "Font family", |ui| {
+                egui::ComboBox::from_id_salt("prefs-font")
+                    .selected_text(theme::EDITOR_FONTS[self.prefs.font].0)
+                    .show_ui(ui, |ui| {
+                        for (i, (name, _)) in theme::EDITOR_FONTS.iter().enumerate() {
+                            ui.selectable_value(&mut self.prefs.font, i, *name);
+                        }
+                    })
+                    .response
+                    .widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, "Font family"));
+            });
+            pref_row(ui, &pal, "Font size", |ui| {
+                let (lo, hi) = (*prefs::FONT_SIZES.start(), *prefs::FONT_SIZES.end());
+                // Right to left: the + is the rightmost button.
+                if stepper(ui, &pal, "+", self.prefs.font_size < hi) {
+                    self.prefs.font_size = (self.prefs.font_size + 1.0).min(hi);
+                }
+                ui.label(RichText::new(format!("{:.0} pt", self.prefs.font_size)).size(12.5).color(pal.accent));
+                if stepper(ui, &pal, "\u{2212}", self.prefs.font_size > lo) {
+                    self.prefs.font_size = (self.prefs.font_size - 1.0).max(lo);
+                }
+            });
+            pref_row(ui, &pal, "Tab key inserts", |ui| {
+                style::pill(ui, &pal, |ui| {
+                    // Right to left, so the widths are added from the largest to read 2, 4, 8 from the left.
+                    for width in prefs::TAB_WIDTHS.into_iter().rev() {
+                        let label = format!("{width} spaces");
+                        if style::accent_segment(ui, &pal, &label, self.prefs.tab_width == width).clicked() {
+                            self.prefs.tab_width = width;
+                        }
+                    }
+                });
+            });
+
+            } else {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Code Colours").size(14.0).color(pal.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    style::pill(ui, &pal, |ui| {
+                        if style::accent_segment(ui, &pal, "Dark", dark).clicked() {
+                            self.prefs_dark = Some(true);
+                        }
+                        if style::accent_segment(ui, &pal, "Light", !dark).clicked() {
+                            self.prefs_dark = Some(false);
+                        }
+                    });
+                });
+            });
+            ui.add_space(6.0);
+            Frame::new()
+                .stroke(egui::Stroke::new(1.0, pal.separator))
+                .corner_radius(8)
+                .inner_margin(Margin::symmetric(12, 4))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    // The list scrolls, so the dialog keeps its height on a small screen.
+                    egui::ScrollArea::vertical()
+                        .id_salt("prefs-colours")
+                        .max_height(260.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                    let base = if dark { Palette::DARK } else { Palette::LIGHT };
+                    let bg = [base.editor.r(), base.editor.g(), base.editor.b()];
+                    let line = [base.current_line.r(), base.current_line.g(), base.current_line.b()];
+                    if let Some(v) = swatch_row(ui, &pal, "Background", self.prefs.background[dark as usize], bg) {
+                        self.prefs.set_background(dark, v);
+                    }
+                    if let Some(v) = swatch_row(ui, &pal, "Current line", self.prefs.current_line[dark as usize], line) {
+                        self.prefs.set_current_line(dark, v);
+                    }
                     for (token, (kind, label)) in highlight::TOKENS.iter().enumerate() {
-                        ui.label(*label);
-                        for dark in [false, true] {
-                            ui.horizontal(|ui| {
-                                let pal = if dark { Palette::DARK } else { Palette::LIGHT };
-                                let fallback = highlight::default_color(*kind, &pal);
-                                let mut rgb = self.prefs.colors[dark as usize][token]
-                                    .unwrap_or([fallback.r(), fallback.g(), fallback.b()]);
-                                if ui.color_edit_button_srgb(&mut rgb).changed() {
-                                    self.prefs.set_color(dark, token, Some(rgb));
-                                }
-                                if self.prefs.colors[dark as usize][token].is_some()
-                                    && ui.small_button("Reset").clicked()
-                                {
-                                    self.prefs.set_color(dark, token, None);
-                                }
-                            });
+                        let c = highlight::default_color(*kind, &base);
+                        let fallback = [c.r(), c.g(), c.b()];
+                        if let Some(v) = swatch_row(ui, &pal, label, self.prefs.colors[dark as usize][token], fallback) {
+                            self.prefs.set_color(dark, token, v);
                         }
-                        ui.end_row();
+                    }
+                        });
+                });
+            }
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Each appearance (View > Appearance) has its own colours and background.")
+                    .size(12.0)
+                    .color(pal.text_tertiary),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if crate::style::secondary_button(ui, "Reset to Defaults").clicked() {
+                    self.prefs = prefs::Prefs::default();
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if crate::style::primary_button(ui, "Done").clicked() {
+                        done = true;
                     }
                 });
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Each appearance (View > Appearance) has its own colours and background.")
-                        .size(12.0)
-                        .color(egui::Color32::GRAY),
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if crate::style::secondary_button(ui, "Reset to Defaults").clicked() {
-                        self.prefs = prefs::Prefs::default();
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if crate::style::primary_button(ui, "Done").clicked() {
-                            done = true;
-                        }
-                    });
-                });
+            });
         });
         if done {
             self.preferences_open = false;
+            self.prefs_dark = None;
         }
         let after = self.prefs.checked();
         if after != before {
@@ -3292,7 +3494,8 @@ impl App {
         let tab = self.bottom.tab;
         let exited = self.bottom.terminal.as_ref().is_some_and(|t| t.exited());
         let (mut clear, mut restart, mut clear_terminal) = (false, false, false);
-        let clicked = style::tab_bar(ui, pal, &names, tab.index(), pal.editor, |ui| match tab {
+        let icons = ["alert-triangle", "cpu", "bug", "check-circle", "terminal"];
+        let clicked = style::tab_bar(ui, pal, &names, &icons, tab.index(), pal.editor, |ui| match tab {
             BottomTab::Output => {
                 clear = text_button(ui, pal, "Clear").clicked();
             }
@@ -3797,6 +4000,7 @@ fn row(
     open: bool,
     path: &Path,
     selected: bool,
+    active: bool,
 ) -> egui::Response {
     let (rect, resp) =
         ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click_and_drag());
@@ -3809,10 +4013,14 @@ fn row(
     // While another item is dragged over this row, show where it would land: a folder is outlined (the item
     // goes into it); a file gets an insertion line under its row (the item goes into the file's folder).
     let dragged_over = resp.dnd_hover_payload::<PathBuf>().is_some_and(|from| from.as_path() != path);
-    if selected {
+    if selected || active {
         painter.rect_filled(inner, 5.0, pal.row_selected);
     } else if resp.hovered() || (is_dir && dragged_over) {
         painter.rect_filled(inner, 5.0, pal.row_hover);
+    }
+    // The open file is outlined in the accent colour and marked "Active", as in the navigator of Xcode.
+    if active {
+        painter.rect_stroke(inner, 5.0, egui::Stroke::new(1.0, pal.accent), egui::StrokeKind::Inside);
     }
     if dragged_over && is_dir {
         painter.rect_stroke(inner, 5.0, egui::Stroke::new(1.5, pal.accent), egui::StrokeKind::Inside);
@@ -3839,6 +4047,7 @@ fn row(
             icon_rect,
             path.extension().and_then(|e| e.to_str()).unwrap_or(""),
             pal,
+            active,
         );
     }
     let name = path
@@ -3851,6 +4060,13 @@ fn row(
         egui::FontId::proportional(13.0),
         pal.text,
     );
+    if active {
+        let badge = egui::Rect::from_min_size(
+            egui::pos2(inner.right() - 50.0, rect.center().y - 7.0),
+            vec2(42.0, 14.0),
+        );
+        style::paint_badge(painter, badge, "Active", pal.accent);
+    }
     resp
 }
 
@@ -4073,7 +4289,7 @@ fn collect_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 /// The folder `dir` and, when expanded, everything below it.
 fn tree_rows(ui: &mut egui::Ui, pal: &Palette, dir: &Path, depth: usize, is_root: bool, view: &mut TreeView) {
     let is_open = view.expanded.contains(dir);
-    let resp = row(ui, pal, depth, true, is_open, dir, view.sel == Some(dir));
+    let resp = row(ui, pal, depth, true, is_open, dir, view.sel == Some(dir), false);
     let renaming = view.rename.as_ref().is_some_and(|r| r.path == dir);
     if renaming {
         rename_overlay(ui, pal, resp.rect, depth, view);
@@ -4134,7 +4350,8 @@ fn tree_rows(ui: &mut egui::Ui, pal: &Palette, dir: &Path, depth: usize, is_root
                 false,
                 false,
                 &p,
-                view.active == Some(p.as_path()) || view.sel == Some(p.as_path()),
+                view.sel == Some(p.as_path()),
+                view.active == Some(p.as_path()),
             );
             // Dropping onto a file moves the dragged item into the file's folder.
             if let Some(from) = resp.dnd_release_payload::<PathBuf>()
@@ -5890,4 +6107,68 @@ mod diff_colour_tests {
         assert_eq!(diff_background(DiffLine::Plain, false), None, "unchanged lines have no background");
         assert_eq!(diff_background(DiffLine::Header, true), None);
     }
+}
+
+/// One setting: its name on the left, the control on the right, and a rule under it.
+fn pref_row(ui: &mut egui::Ui, pal: &Palette, label: &str, control: impl FnOnce(&mut egui::Ui)) {
+    ui.add_space(5.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).size(13.0).color(pal.text_secondary));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control);
+    });
+    ui.add_space(5.0);
+}
+
+/// A small switch with its caption to the right of it (right to left: the caption is added first).
+fn toggle_caption(ui: &mut egui::Ui, pal: &Palette, on: &mut bool, caption: &str) {
+    ui.label(RichText::new(caption).size(12.5).color(pal.text));
+    if toggle(ui, pal, *on) {
+        *on = !*on;
+    }
+}
+
+/// A switch: a rounded track, lit in the accent colour when on. True when it is clicked.
+fn toggle(ui: &mut egui::Ui, pal: &Palette, on: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(30.0, 17.0), Sense::click());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 8.5, if on { pal.accent } else { pal.separator });
+    let knob_x = if on { rect.right() - 8.5 } else { rect.left() + 8.5 };
+    painter.circle_filled(egui::pos2(knob_x, rect.center().y), 6.5, egui::Color32::WHITE);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+/// A round step button of the font-size control. Disabled when the size is at its limit.
+fn stepper(ui: &mut egui::Ui, pal: &Palette, label: &str, enabled: bool) -> bool {
+    let color = if enabled { pal.text } else { pal.text_tertiary };
+    let button = egui::Button::new(RichText::new(label).size(13.0).color(color))
+        .min_size(vec2(22.0, 20.0))
+        .fill(pal.row_hover);
+    ui.add_enabled(enabled, button).clicked()
+}
+
+/// A colour row: its name, then the swatch, and a Reset when the colour is changed from the default.
+/// `Some(v)` when the user picked `v` (`None` = back to the default); `None` when nothing changed.
+fn swatch_row(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    label: &str,
+    value: Option<[u8; 3]>,
+    fallback: [u8; 3],
+) -> Option<Option<[u8; 3]>> {
+    let mut change = None;
+    ui.add_space(3.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).size(12.5).color(pal.text));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let mut rgb = value.unwrap_or(fallback);
+            if ui.color_edit_button_srgb(&mut rgb).changed() {
+                change = Some(Some(rgb));
+            }
+            if value.is_some() && ui.small_button("Reset").clicked() {
+                change = Some(None);
+            }
+        });
+    });
+    ui.add_space(3.0);
+    change
 }

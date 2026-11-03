@@ -119,9 +119,20 @@ step "Checking vendor/ and the compilers"
 
 # Single source of truth for version and copyright.
 version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/crates/pascoda-app/Cargo.toml" | head -1)"
-copyright="$(sed -n 's/^pub const COPYRIGHT: &str = "\(.*\)";/\1/p' "$root/crates/pascoda-app/src/about.rs")"
-min_macos="$(sed -n 's/^pub const MIN_MACOS: &str = "\(.*\)";/\1/p' "$root/crates/pascoda-fpc/src/lcl.rs")"
-[ -n "$version" ] && [ -n "$copyright" ] && [ -n "$min_macos" ] || fail "cannot read version/copyright/min macOS"
+# The IDE's identity: [workspace.metadata.pascoda] in the root Cargo.toml (name, bundle_id, copyright, min_macos).
+meta() { awk -v k="$1" '
+    /^[[:space:]]*#/ { next }
+    /^\[/ { in_table = ($0 == "[workspace.metadata.pascoda]"); next }
+    in_table && $1 == k && $2 == "=" { sub(/^[^"]*"/, ""); sub(/".*$/, ""); print; exit }' "$root/Cargo.toml"; }
+app_name="$(meta name)"
+bundle_id="$(meta bundle_id)"
+copyright="$(meta copyright)"
+# The oldest macOS the IDE runs on: `min_macos` under [workspace.metadata.pascoda] in the root Cargo.toml.
+ide_min="$(meta min_macos)"
+[ -n "$version" ] && [ -n "$app_name" ] && [ -n "$bundle_id" ] && [ -n "$copyright" ] && [ -n "$ide_min" ] \
+    || fail "cannot read the version, name, bundle_id, copyright or min_macos (Cargo.toml [workspace.metadata.pascoda])"
+# Rust and the linker record this as the binary's minimum (LC_BUILD_VERSION).
+export MACOSX_DEPLOYMENT_TARGET="$ide_min"
 if [ -n "${NOTARY_PROFILE:-}" ] && [ -z "${CODESIGN_IDENTITY:-}" ]; then
     fail "NOTARY_PROFILE needs CODESIGN_IDENTITY"
 fi
@@ -271,21 +282,21 @@ make_bundle() {
     rsync -a --exclude '.git' "$root/components/" "$app/Contents/Resources/components/"
 
     # NSPrincipalClass is deliberately absent: eframe/winit create their own NSApplication.
-    # CFBundleIdentifier is a PLACEHOLDER; replace it with the identifier of the real developer account.
+    # The bundle identifier is a placeholder until the real developer account is used (Cargo.toml bundle_id).
     cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-<key>CFBundleName</key><string>Pascoda</string>
-<key>CFBundleDisplayName</key><string>Pascoda</string>
-<key>CFBundleIdentifier</key><string>com.richardleurs.pascoda</string>
+<key>CFBundleName</key><string>$app_name</string>
+<key>CFBundleDisplayName</key><string>$app_name</string>
+<key>CFBundleIdentifier</key><string>$bundle_id</string>
 <key>CFBundleExecutable</key><string>pascoda-app</string>
 <key>CFBundleIconFile</key><string>Pascoda</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleVersion</key><string>$version</string>
 <key>CFBundleShortVersionString</key><string>$version</string>
-<key>LSMinimumSystemVersion</key><string>$min_macos</string>
+<key>LSMinimumSystemVersion</key><string>$ide_min</string>
 <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSDisabledDictationMenuItem</key><true/>

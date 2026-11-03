@@ -118,49 +118,53 @@ impl ExportDialog {
 
     pub fn show(&mut self, ctx: &egui::Context, root: &Path) -> Option<Answer> {
         let mut answer = None;
-        crate::style::dialog(
-            ctx,
-            "export-dialog",
-            Some("Export Application"),
-            380.0,
-            |ui| {
-                let gui = self.gui;
-                egui::Grid::new("export-fields")
-                    .num_columns(2)
-                    .spacing([10.0, 8.0])
-                    .show(ui, |ui| {
-                        let l = ui.label("App name");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.settings.app_name)
-                                .desired_width(240.0),
-                        )
+        let pal = crate::style::Palette::of(ctx);
+        crate::style::dialog_with_tile(ctx, "export-dialog", "Export Application", DIALOG_WIDTH, |ui| {
+            let gui = self.gui;
+            ui.spacing_mut().item_spacing.y = 10.0;
+            let current = self.arch();
+            let windows = current == Arch::Windows;
+            egui::Grid::new("export-fields")
+                .num_columns(2)
+                .spacing([16.0, 18.0])
+                .min_col_width(LABEL_WIDTH)
+                .show(ui, |ui| {
+                    let l = ui.label(egui::RichText::new("App name").color(pal.text_secondary));
+                    ui.add(egui::TextEdit::singleline(&mut self.settings.app_name).desired_width(FIELD_WIDTH))
                         .labelled_by(l.id);
-                        ui.end_row();
-                        // One row per choice, so the label lines up with the first option. A choice whose compiler
-                        // is not installed is greyed out with the reason.
-                        let mut choice = self.arch();
-                        for (i, (arch, text, ok, missing)) in [
+                    ui.end_row();
+
+                    // Runs on: four cards in a grid. A choice whose compiler is not installed is disabled, and the
+                    // reason shows on hover.
+                    let l = ui.label(egui::RichText::new("Runs on").color(pal.text_secondary));
+                    let mut choice = current;
+                    egui::Grid::new("export-runs-on").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
+                        for (i, (arch, title, subtitle, ok, missing)) in [
                             (
                                 Arch::Universal,
-                                "Apple Silicon + Intel (universal)",
+                                "Apple Silicon + Intel",
+                                "Universal 2 Binary",
                                 self.arm && self.intel,
                                 "A universal app needs both compilers, and this installation does not have them.",
                             ),
                             (
                                 Arch::Arm64,
                                 "Apple Silicon",
+                                "M1 / M2 / M3 / M4 (ARM64)",
                                 self.arm,
                                 "The Apple Silicon compiler is not in this installation (an Intel Mac has only the Intel one).",
                             ),
                             (
                                 Arch::Intel,
                                 "Apple Intel",
+                                "Legacy x86_64 Architecture",
                                 self.intel,
                                 "The Intel compiler is missing from this installation (a checkout builds it with packaging/fpc-build.sh and packaging/fpc-intel-build.sh).",
                             ),
                             (
                                 Arch::Windows,
-                                "Windows 64-bit (.exe)",
+                                "Windows 64-bit",
+                                "Executable (.exe)",
                                 self.windows,
                                 "The Windows units are missing from this installation (a checkout builds them with packaging/fpc-build.sh).",
                             ),
@@ -168,108 +172,238 @@ impl ExportDialog {
                         .into_iter()
                         .enumerate()
                         {
-                            ui.label(if i == 0 { "Runs on" } else { "" });
-                            ui.vertical(|ui| {
-                                if ui.add_enabled(ok, egui::RadioButton::new(choice == arch, text)).clicked() {
-                                    choice = arch;
-                                }
-                                if !ok {
-                                    ui.label(egui::RichText::new(missing).weak().small());
-                                }
-                            });
-                            ui.end_row();
-                        }
-                        self.settings.arch = choice.name().into();
-                        let windows = self.arch() == Arch::Windows;
-                        // The oldest system the program runs on. A blank field is the default (macOS 14.0; for
-                        // Windows the compiler's own).
-                        if !windows {
-                            let l = ui.label("Minimum macOS");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.settings.min_macos)
-                                    .hint_text("14.0")
-                                    .desired_width(240.0),
-                            )
-                            .labelled_by(l.id);
-                            ui.end_row();
-                        } else {
-                            let l = ui.label("Minimum Windows");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.settings.min_windows)
-                                    .hint_text("6.1 (Windows 7), 10.0 (Windows 10)")
-                                    .desired_width(240.0),
-                            )
-                            .labelled_by(l.id);
-                            ui.end_row();
-                        }
-                        if gui && !windows {
-                            let l = ui.label("Bundle identifier");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.settings.bundle_id)
-                                    .hint_text("com.example.myapp")
-                                    .desired_width(240.0),
-                            )
-                            .labelled_by(l.id);
-                            ui.end_row();
-                        }
-                        // Version and icon: an app bundle's, or a Windows program's version information and icon.
-                        if gui || windows {
-                            let l = ui.label("Version");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.settings.version)
-                                    .hint_text("1.0")
-                                    .desired_width(240.0),
-                            )
-                            .labelled_by(l.id);
-                            ui.end_row();
-                            let l = ui.label("Icon");
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.settings.icon)
-                                        .hint_text(".png or .icns")
-                                        .desired_width(160.0),
-                                )
-                                .labelled_by(l.id);
-                                if ui.button("Choose...").clicked()
-                                    && let Some(f) = rfd::FileDialog::new()
-                                        .add_filter("Icon", &["png", "icns"])
-                                        .set_directory(root)
-                                        .pick_file()
-                                {
-                                    self.settings.icon = f.to_string_lossy().into_owned();
-                                }
-                            });
-                            ui.end_row();
+                            if run_card(ui, &pal, title, subtitle, choice == arch, ok, missing) && ok {
+                                choice = arch;
+                            }
+                            if i % 2 == 1 {
+                                ui.end_row();
+                            }
                         }
                     });
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(self.summary()).weak());
-                if let Some(e) = &self.error {
-                    ui.add_space(4.0);
-                    ui.colored_label(ui.visuals().error_fg_color, e);
-                }
-                ui.add_space(8.0);
-                crate::style::buttons(ui, |ui| {
-                    if crate::style::primary_button(ui, "Export...").clicked() {
-                        match self.validate(root) {
-                            Ok((name, info)) => {
-                                self.error = None;
-                                answer = Some(Answer::Export(name, info, self.arch()));
-                            }
-                            Err(e) => self.error = Some(e),
-                        }
+                    self.settings.arch = choice.name().into();
+                    ui.end_row();
+                    let _ = l;
+
+                    if !windows {
+                        let l = ui.label(egui::RichText::new("Minimum macOS").color(pal.text_secondary));
+                        let value = {
+                            let v = self.settings.min_macos.trim();
+                            if v.is_empty() { "14.0".to_string() } else { v.to_string() }
+                        };
+                        let shown = MACOS_VERSIONS
+                            .iter()
+                            .find(|(v, _)| *v == value)
+                            .map_or(value.clone(), |(_, name)| name.to_string());
+                        egui::ComboBox::from_id_salt("export-min-macos")
+                            .width(FIELD_WIDTH)
+                            .selected_text(shown)
+                            .show_ui(ui, |ui| {
+                                for (v, name) in MACOS_VERSIONS {
+                                    if ui.selectable_label(value == *v, (*name).to_string()).clicked() {
+                                        self.settings.min_macos = (*v).to_string();
+                                    }
+                                }
+                            })
+                            .response
+                            .widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, "Minimum macOS"));
+                        let _ = l;
+                        ui.end_row();
+                    } else {
+                        let l = ui.label(egui::RichText::new("Minimum Windows").color(pal.text_secondary));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.min_windows)
+                                .hint_text("6.1 (Windows 7), 10.0 (Windows 10)")
+                                .desired_width(FIELD_WIDTH),
+                        )
+                        .labelled_by(l.id);
+                        ui.end_row();
                     }
-                    if crate::style::secondary_button(ui, "Cancel").clicked() {
-                        answer = Some(Answer::Cancel);
+
+                    if gui && !windows {
+                        let l = ui.label(egui::RichText::new("Bundle identifier").color(pal.text_secondary));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.bundle_id)
+                                .hint_text("com.example.myapp")
+                                .desired_width(FIELD_WIDTH),
+                        )
+                        .labelled_by(l.id);
+                        ui.end_row();
+                    }
+
+                    // Version and icon: an app bundle's, or a Windows program's version information and icon.
+                    if gui || windows {
+                        let l = ui.label(egui::RichText::new("Version").color(pal.text_secondary));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.version)
+                                .hint_text("1.0")
+                                .desired_width(FIELD_WIDTH),
+                        )
+                        .labelled_by(l.id);
+                        ui.end_row();
+
+                        let _ = ui.label(egui::RichText::new("Icon").color(pal.text_secondary));
+                        ui.horizontal(|ui| {
+                            icon_tile(ui, &pal);
+                            let file = icon_name(&self.settings.icon);
+                            egui::Frame::new()
+                                .stroke(egui::Stroke::new(1.0, pal.separator))
+                                .corner_radius(8)
+                                .inner_margin(egui::Margin::symmetric(10, 6))
+                                .show(ui, |ui| {
+                                    ui.set_width(FIELD_WIDTH - 46.0);
+                                    ui.horizontal(|ui| {
+                                        let text = if file.is_empty() { "No icon chosen" } else { file.as_str() };
+                                        ui.label(egui::RichText::new(text).monospace().size(12.5).color(
+                                            if file.is_empty() { pal.text_tertiary } else { pal.text },
+                                        ));
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if ui.button("Choose...").clicked()
+                                                && let Some(f) = rfd::FileDialog::new()
+                                                    .add_filter("Icon", &["png", "icns"])
+                                                    .set_directory(root)
+                                                    .pick_file()
+                                            {
+                                                self.settings.icon = f.to_string_lossy().into_owned();
+                                            }
+                                        });
+                                    });
+                                });
+                        });
+                        ui.end_row();
                     }
                 });
-            },
-        );
+
+            // What Export creates, the architecture and the identifier.
+            ui.add_space(4.0);
+            egui::Frame::new()
+                .fill(pal.sidebar)
+                .stroke(egui::Stroke::new(1.0, pal.separator))
+                .corner_radius(10)
+                .inner_margin(egui::Margin::symmetric(14, 10))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.add(egui::Label::new(egui::RichText::new(self.summary()).color(pal.text_secondary).size(12.5)).wrap());
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Architecture:").color(pal.text_tertiary).size(12.0));
+                        ui.label(egui::RichText::new(current.label()).size(12.0));
+                        if !windows && gui {
+                            ui.add_space(14.0);
+                            ui.label(egui::RichText::new("Identifier:").color(pal.text_tertiary).size(12.0));
+                            let id = self.settings.bundle_id.trim();
+                            let id = if id.is_empty() { "(none)" } else { id };
+                            ui.label(egui::RichText::new(id).monospace().size(12.0));
+                        }
+                    });
+                });
+            if let Some(e) = &self.error {
+                ui.add_space(4.0);
+                ui.colored_label(ui.visuals().error_fg_color, e);
+            }
+            ui.add_space(6.0);
+            crate::style::buttons(ui, |ui| {
+                if crate::style::primary_button(ui, "Export...").clicked() {
+                    match self.validate(root) {
+                        Ok((name, info)) => {
+                            self.error = None;
+                            answer = Some(Answer::Export(name, info, self.arch()));
+                        }
+                        Err(e) => self.error = Some(e),
+                    }
+                }
+                if crate::style::secondary_button(ui, "Cancel").clicked() {
+                    answer = Some(Answer::Cancel);
+                }
+            });
+        });
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             answer = Some(Answer::Cancel);
         }
         answer
     }
+}
+
+/// Every field of the form is this wide: a 120 pt label column, a 16 pt gap and this column. The dialog is as wide as
+/// the label, the gap and the column together, so the title rule and the fields line up.
+const FIELD_WIDTH: f32 = 470.0;
+/// The label column.
+const LABEL_WIDTH: f32 = 120.0;
+const DIALOG_WIDTH: f32 = LABEL_WIDTH + 16.0 + FIELD_WIDTH;
+
+/// The macOS releases the Minimum macOS list offers: the stored value, and the name shown for it.
+const MACOS_VERSIONS: [(&str, &str); 7] = [
+    ("11.0", "11.0 Big Sur"),
+    ("12.0", "12.0 Monterey"),
+    ("13.0", "13.0 Ventura"),
+    ("14.0", "14.0 Sonoma (Standard)"),
+    ("15.0", "15.0 Sequoia"),
+    ("26.0", "26.0 Tahoe"),
+    ("27.0", "27.0"),
+];
+
+/// One option card of "Runs on": a title, a caption and a radio dot. Returns true when clicked.
+fn run_card(
+    ui: &mut egui::Ui,
+    pal: &crate::style::Palette,
+    title: &str,
+    subtitle: &str,
+    selected: bool,
+    enabled: bool,
+    reason: &str,
+) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(230.0, 52.0), egui::Sense::click());
+    let resp = if enabled { resp } else { resp.on_hover_text(reason) };
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, enabled, selected, title));
+    let painter = ui.painter();
+    let fill = if selected {
+        pal.accent.gamma_multiply(0.12)
+    } else if pal.dark {
+        crate::style::DIALOG_PANE_DARK
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let stroke = if selected { pal.accent } else { pal.separator };
+    painter.rect(rect, 8.0, fill, egui::Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+    let text_color = if !enabled {
+        pal.text_tertiary
+    } else if selected {
+        pal.accent
+    } else {
+        pal.text
+    };
+    painter.text(
+        rect.left_top() + egui::vec2(12.0, 14.0),
+        egui::Align2::LEFT_CENTER,
+        title,
+        egui::FontId::proportional(13.0),
+        text_color,
+    );
+    painter.text(
+        rect.left_top() + egui::vec2(12.0, 36.0),
+        egui::Align2::LEFT_CENTER,
+        subtitle,
+        egui::FontId::proportional(11.0),
+        pal.text_tertiary,
+    );
+    // The radio dot.
+    let dot = egui::pos2(rect.right() - 16.0, rect.center().y);
+    painter.circle_stroke(dot, 7.0, egui::Stroke::new(1.5, stroke));
+    if selected {
+        painter.circle_filled(dot, 3.5, pal.accent);
+    }
+    resp.clicked() && enabled
+}
+
+/// The preview tile of the icon row: the blue box.
+fn icon_tile(ui: &mut egui::Ui, pal: &crate::style::Palette) {
+    crate::style::app_tile(ui, pal, 38.0);
+}
+
+/// The file name of an icon path, for the icon row ("" when none).
+fn icon_name(icon: &str) -> String {
+    Path::new(icon.trim())
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]

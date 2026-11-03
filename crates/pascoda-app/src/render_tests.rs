@@ -292,6 +292,43 @@ fn renders_the_preferences_window_dark() {
 }
 
 #[test]
+fn renders_the_about_window() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = App::bare(None);
+    app.about_open = true;
+    render(app, false, (900.0, 760.0), "ui-about");
+}
+
+#[test]
+fn renders_the_about_window_dark() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = App::bare(None);
+    app.about_open = true;
+    render(app, true, (900.0, 760.0), "ui-about-dark");
+}
+
+#[test]
+fn renders_the_project_options_compiler_and_paths() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = App::bare(None);
+    app.project_options.open = true;
+    render(app, false, (720.0, 760.0), "ui-project-options");
+    let mut app = App::bare(None);
+    app.project_options.open = true;
+    app.project_options_tab = 1;
+    render(app, true, (720.0, 760.0), "ui-project-options-paths-dark");
+}
+
+#[test]
+fn renders_the_lazarus_environment_tab() {
+    let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
+    let mut app = App::bare(None);
+    app.project_options.open = true;
+    app.project_options_tab = 2;
+    render(app, false, (800.0, 760.0), "ui-project-options-lazarus");
+}
+
+#[test]
 fn renders_the_watches_in_a_stopped_program() {
     let _ui = crate::prefs::tests::APPLY.read().unwrap_or_else(|e| e.into_inner());
     let mut app = debugging_app();

@@ -77,10 +77,12 @@ pub struct Editor {
     /// The `output` key: the executable's path, relative to the project. Empty for the default.
     pub output: String,
     /// The executable the build makes without an `output` (shown as the default).
+    #[allow(dead_code)] // shown by the Paths tab no longer
     pub default_target: String,
     /// Why the last save was refused, if it was.
     pub error: String,
     /// The project file's values, shown read-only.
+    #[allow(dead_code)] // the dialog no longer shows the project file; the view and its writer stay for their tests
     pub project_file: Option<FileView>,
     /// The program's arguments, one per line, and the folder it runs in (empty: its own folder).
     pub args: String,
@@ -164,6 +166,7 @@ impl Editor {
 
     /// Writes the window's values into the project file (`.lpi` or `.dproj`): the mode, the output (when set),
     /// the unit and include paths and the defines. Returns how many values changed.
+    #[allow(dead_code)] // see `project_file`
     pub fn write_to_project_file(&self, root: &Path) -> Result<usize, String> {
         let file = pascoda_project::foreign::find(root).ok_or("there is no project file")?;
         let output = self.output.trim();

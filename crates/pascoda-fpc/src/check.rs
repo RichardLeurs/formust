@@ -4,7 +4,7 @@
 use crate::{Diagnostic, Mode, Severity, locate_fpc, parse_output};
 use std::ffi::OsString;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -105,7 +105,7 @@ fn run(
     args.push(format!("-Fu{}", dir.display()).into());
     // The folders below the program's folder too, so a unit in a subfolder finds its neighbours.
     args.extend(crate::source_folder_args(dir));
-    let mut child = Command::new(fpc)
+    let mut child = crate::fpc_command(fpc)
         .args(crate::config_args(fpc, work))
         .args(&args)
         .arg(name)

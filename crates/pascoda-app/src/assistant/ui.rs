@@ -145,9 +145,9 @@ impl App {
         egui::Panel::right("assistant")
             .resizable(true)
             .default_size(380.0)
-            .min_size(300.0)
+            .min_size(240.0)
             // leave the editor (or designer) room: at least 520 pt
-            .max_size((ui.available_width() - 520.0).clamp(300.0, 720.0))
+            .max_size((ui.available_width() - 520.0).clamp(240.0, 720.0))
             .show_separator_line(true)
             .frame(Frame::new().fill(pal.chrome))
             .show(ui, |ui| {
@@ -276,15 +276,29 @@ fn panel(ui: &mut Ui, pal: &Palette, a: &mut Assistant, view: &View, acts: &mut 
 
 fn header(ui: &mut Ui, pal: &Palette, a: &Assistant, acts: &mut Vec<Act>) {
     ui.horizontal_centered(|ui| {
+        // The name and the chip get a fixed share of the pane (the buttons on the right keep theirs); the chip
+        // is cut short if it does not fit.
+        let left = ui.available_width() - 84.0;
+        ui.allocate_ui_with_layout(vec2(left, 24.0), Layout::left_to_right(Align::Center), |ui| {
         let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
         paint_icon(ui.painter(), r, Icon::Sparkle, pal.accent);
-        ui.label(RichText::new("Assistant").size(13.0).color(pal.text));
-        // Which agent answers: the provider that is selected right now.
-        ui.label(
-            RichText::new(format!("\u{b7} {}", a.provider.short_name()))
-                .size(12.0)
-                .color(pal.text_secondary),
-        );
+        // The name in a heavier weight (drawn twice, a fraction of a point apart: the theme ships one weight).
+        let galley = ui.painter().layout_no_wrap("Assistant".into(), egui::FontId::proportional(13.0), pal.text);
+        let (rect, _) = ui.allocate_exact_size(galley.size() + vec2(0.4, 0.0), Sense::hover());
+        ui.painter().galley(rect.min, galley.clone(), pal.text);
+        ui.painter().galley(rect.min + vec2(0.4, 0.0), galley, pal.text);
+        // Which agent answers: the provider that is selected right now, as a monospace chip.
+        // The chip shrinks (its name is cut short) when the pane is narrow, instead of pushing the buttons out.
+        let chip = a.provider.short_name();
+        egui::Frame::new()
+            .fill(pal.accent.gamma_multiply(0.12))
+            .stroke(egui::Stroke::new(1.0, pal.accent.gamma_multiply(0.5)))
+            .corner_radius(5)
+            .inner_margin(egui::Margin::symmetric(6, 3))
+            .show(ui, |ui| {
+                ui.add(egui::Label::new(RichText::new(chip).monospace().size(11.5).color(pal.accent)).truncate());
+            });
+        });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if icon_button(ui, pal, Icon::Gear, true, a.show_settings)
                 .on_hover_text("Provider and privacy")
@@ -969,7 +983,7 @@ fn input_area(ui: &mut Ui, pal: &Palette, a: &mut Assistant, view: &View, acts: 
             acts.push(Act::ToggleAuto);
         }
     });
-    ui.add_space(4.0);
+    ui.add_space(2.0);
     // Context chips.
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
@@ -992,7 +1006,7 @@ fn input_area(ui: &mut Ui, pal: &Palette, a: &mut Assistant, view: &View, acts: 
             chip(ui, pal, &label, &mut a.chips.errors);
         }
     });
-    ui.add_space(4.0);
+    ui.add_space(2.0);
 
     let id = a.input_id;
     let streaming = a.streaming();
@@ -1012,27 +1026,24 @@ fn input_area(ui: &mut Ui, pal: &Palette, a: &mut Assistant, view: &View, acts: 
             if focused { pal.accent } else { pal.separator },
         ))
         .corner_radius(10)
-        .inner_margin(Margin::symmetric(8, 6))
+        .inner_margin(Margin::symmetric(8, 5))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             egui::ScrollArea::vertical()
                 .max_height(120.0)
                 .id_salt("assistant-input-scroll")
                 .show(ui, |ui| {
-                    let r = ui.add(
-                        egui::TextEdit::multiline(&mut a.input)
-                            .id(id)
-                            .desired_rows(2)
-                            .desired_width(f32::INFINITY)
-                            .frame(Frame::NONE)
-                            .hint_text(if a.provider == Provider::Codex {
-                                "Ask Codex...  Enter sends, Shift+Enter adds a line"
-                            } else if a.provider == Provider::OpenAi || a.provider.is_compatible() {
-                                "Ask the assistant...  Enter sends, Shift+Enter adds a line"
-                            } else {
-                                "Ask Claude...  Enter sends, Shift+Enter adds a line"
-                            }),
-                    );
+                    // One line to start with; it grows as the message does. Enter sends (see the tooltip).
+                    let r = ui
+                        .add(
+                            egui::TextEdit::multiline(&mut a.input)
+                                .id(id)
+                                .desired_rows(1)
+                                .desired_width(f32::INFINITY)
+                                .frame(Frame::NONE)
+                                .hint_text("Ask the assistant..."),
+                        )
+                        .on_hover_text("Enter sends, Shift+Enter adds a line");
                     r.widget_info(|| {
                         egui::WidgetInfo::labeled(egui::Role::MultilineTextInput, true, "Message")
                     });
@@ -1727,8 +1738,75 @@ fn markdown_ui(
     acts: &mut Vec<Act>,
 ) {
     let blocks = markdown::parse(text);
-    for (bi, b) in blocks.iter().enumerate() {
-        match b {
+    let mut i = 0;
+    while i < blocks.len() {
+        match &blocks[i] {
+            // A level 2 or 3 heading opens a card: the blocks up to the next heading of the same or a higher
+            // level sit inside its outline.
+            Block::Heading(level, spans) if (2..=3).contains(level) => {
+                let mut end = i + 1;
+                while end < blocks.len() && !matches!(&blocks[end], Block::Heading(l, _) if l <= level) {
+                    end += 1;
+                }
+                markdown_card(ui, pal, spans, &blocks, i + 1, end, live, salt, view, acts);
+                i = end;
+            }
+            _ => {
+                markdown_block(ui, pal, &blocks, i, live, salt, view, acts);
+                i += 1;
+            }
+        }
+    }
+}
+
+/// A section of a reply: a bordered card with a chevron and the heading, then the blocks `from..to`.
+#[allow(clippy::too_many_arguments)]
+fn markdown_card(
+    ui: &mut Ui,
+    pal: &Palette,
+    heading: &[Span],
+    blocks: &[Block],
+    from: usize,
+    to: usize,
+    live: bool,
+    salt: usize,
+    view: &View,
+    acts: &mut Vec<Act>,
+) {
+    Frame::new()
+        .stroke(egui::Stroke::new(1.0, pal.separator))
+        .corner_radius(8)
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                let (r, _) = ui.allocate_exact_size(vec2(14.0, 18.0), Sense::hover());
+                let chevron = egui::Rect::from_center_size(r.center(), vec2(10.0, 10.0));
+                crate::app_icons::paint(ui.painter(), chevron, "chevron-right", pal.text_secondary);
+                ui.add(egui::Label::new(spans_job(heading, pal, 13.5, true)).wrap());
+            });
+            ui.add_space(4.0);
+            for bi in from..to {
+                markdown_block(ui, pal, blocks, bi, live, salt, view, acts);
+            }
+        });
+    ui.add_space(6.0);
+}
+
+/// One block of a reply, by its index in `blocks`.
+#[allow(clippy::too_many_arguments)]
+fn markdown_block(
+    ui: &mut Ui,
+    pal: &Palette,
+    blocks: &[Block],
+    bi: usize,
+    live: bool,
+    salt: usize,
+    view: &View,
+    acts: &mut Vec<Act>,
+) {
+    let b = &blocks[bi];
+    match b {
             Block::Heading(level, spans) => {
                 ui.add_space(4.0);
                 let size = match level {
@@ -1803,7 +1881,6 @@ fn markdown_ui(
                 );
                 ui.add_space(6.0);
             }
-        }
     }
 }
 

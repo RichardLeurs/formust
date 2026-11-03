@@ -24,6 +24,7 @@ mod external;
 mod highlight;
 mod hints;
 mod classcomplete;
+mod app_icons;
 mod icons;
 mod laztools;
 mod livecheck;
@@ -46,6 +47,10 @@ use std::process::Command;
 use std::sync::mpsc::{Receiver, channel};
 
 const SOURCE_EXTENSIONS: &[&str] = &["pas", "pp", "lpr", "dpr", "inc"];
+
+/// What File > Open project... offers: the program files of a Lazarus (`.lpr`) or Delphi (`.dpr`) project, and
+/// a Delphi project file (`.dproj`), which opens its main program.
+const OPEN_EXTENSIONS: &[&str] = &["lpr", "dpr", "dproj"];
 
 struct Doc {
     path: PathBuf,
@@ -152,6 +157,8 @@ struct App {
     native: Option<designer::native::Native>,
     selftest: Option<SelfTest>,
     show_navigator: bool,
+    /// The bottom pane (Problems, Output, Debug, Tests, Terminal) is shown.
+    show_bottom: bool,
     /// The path bar (folder > file) above the editor; hidden by default to leave room for code.
     show_jump_bar: bool,
     nav_tab: shell::NavTab,
@@ -200,6 +207,13 @@ struct App {
     prefs: prefs::Prefs,
     project_options: project_options::Editor,
     preferences_open: bool,
+    /// Which appearance the Code Colours rows edit (`None`: the current one).
+    prefs_dark: Option<bool>,
+    /// The Preferences window shows its Colours tab (else its Editor tab).
+    prefs_colours_tab: bool,
+    /// The Project Options window shows its Paths tab (else its Compiler tab).
+    project_options_tab: usize,
+    about_open: bool,
     find: find::Bar,
     project_bar: find::ProjectBar,
     go_to: find::GoTo,
@@ -313,6 +327,7 @@ impl App {
             native: None,
             selftest: None,
             show_navigator: true,
+            show_bottom: true,
             show_jump_bar: false,
             nav_tab: shell::NavTab::default(),
             expanded: Default::default(),
@@ -343,6 +358,10 @@ impl App {
             prefs: Default::default(),
             project_options: Default::default(),
             preferences_open: false,
+            prefs_dark: None,
+            prefs_colours_tab: false,
+            project_options_tab: 0,
+            about_open: false,
             find: Default::default(),
             project_bar: Default::default(),
             go_to: Default::default(),
@@ -412,8 +431,11 @@ impl App {
     /// (the Problems list, the squiggles and the live check) do not belong to it any more.
     fn clear_build_results(&mut self) {
         self.diagnostics.clear();
+        self.build_problems.clear();
         self.marks.clear();
         self.build_texts.clear();
+        // The Output pane's text belongs to the old project too.
+        self.console.clear();
         self.live.forget();
         if !self.unit_tests.busy() {
             // The tests listed belong to the previous project.
@@ -491,23 +513,45 @@ impl App {
     }
 
     fn pick_file(&mut self) {
-        if let Some(p) = rfd::FileDialog::new()
-            .add_filter("Pascal", SOURCE_EXTENSIONS)
-            // Everything the project tree lists: forms, project files, packages and text files too.
-            .add_filter("Pascal, form, project and package files", files::TREE_EXTENSIONS)
+        if let Some(chosen) = rfd::FileDialog::new()
+            .add_filter("Projects", OPEN_EXTENSIONS)
             .pick_file()
         {
+            // A Lazarus or Delphi project file opens the program it names (the project's folder is the project).
+            let is_project = chosen
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("lpi") || e.eq_ignore_ascii_case("dproj"));
+            let p = if is_project {
+                pascoda_project::foreign::read(&chosen)
+                    .ok()
+                    .and_then(|f| f.main)
+                    .filter(|m| m.is_file())
+                    .unwrap_or_else(|| chosen.clone())
+            } else {
+                chosen
+            };
             match p.parent().map(Path::to_path_buf) {
                 Some(dir) => self.switch_project(dir.clone(), move |app| {
                     app.remember(|r| r.note_project(&dir));
                     app.remember(|r| r.note_file(&p));
-                    app.open_path(p);
+                    app.open_chosen(p);
                 }),
                 None => {
                     self.remember(|r| r.note_file(&p));
-                    self.open_path(p);
+                    self.open_chosen(p);
                 }
             }
+        }
+    }
+
+    /// Opens a file chosen with File > Open. A form file (`.lfm`, `.dfm`) and a unit with a form (`.pas`, `.pp`)
+    /// show the form in the designer; a unit without one shows its code.
+    fn open_chosen(&mut self, p: PathBuf) {
+        let has_form = designer::form_unit(&p).is_some();
+        self.select_in_tree(p);
+        if has_form {
+            self.show_form();
         }
     }
 
@@ -1796,6 +1840,8 @@ impl App {
     fn auto_tab(&mut self, ctx: &egui::Context, tab: bottom::BottomTab) {
         let now = ctx.input(|i| i.time);
         self.bottom.auto(tab, now);
+        // A build or a debug stop brings the pane back, so its output is never hidden.
+        self.show_bottom = true;
     }
 
     fn cursor_index(&self, ctx: &egui::Context) -> Option<usize> {
@@ -2401,14 +2447,10 @@ impl App {
                     chrome::close_button_center_from_top()
                 );
             }
-            18 => eprintln!(
-                "selftest: About menu item found and chosen: {}",
-                about::open_via_menu()
-            ),
-            24 => eprintln!(
-                "selftest: about panel: {:?}",
-                about::snapshot_key_window(&out("about.png"))
-            ),
+            18 => {
+                self.about_open = true;
+                eprintln!("selftest: About window opened");
+            }
             28 => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             _ => {}
         }
@@ -2984,6 +3026,7 @@ struct NativeMenu {
     new_folder: muda::MenuId,
     rename_item: muda::MenuId,
     preferences: muda::MenuId,
+    about: muda::MenuId,
     run_to: muda::MenuId,
     format: muda::MenuId,
     profile: muda::MenuId,
@@ -3086,6 +3129,7 @@ enum MenuAction {
     ToggleJumpBar,
     ToggleAssistant,
     Preferences,
+    About,
     RunTests,
     RunToCursor,
     /// Edit > Set Bookmark (the next free number at the caret's line), and Previous / Next Bookmark.
@@ -3207,7 +3251,7 @@ impl NativeMenu {
                 Code::KeyA,
             )),
         );
-        let open = MenuItem::new("Open...", true, cmd(Code::KeyO));
+        let open = MenuItem::new("Open project...", true, cmd(Code::KeyO));
         let import_packages = MenuItem::new("Import Component Package...", true, None);
         let save = MenuItem::new("Save", true, cmd(Code::KeyS));
         let run = MenuItem::new("Build & Run", true, cmd(Code::KeyR));
@@ -3289,11 +3333,13 @@ impl NativeMenu {
         // Not the system's Quit: that ends the process without asking about unsaved changes.
         let quit = MenuItem::new("Quit Pascoda", true, cmd(Code::KeyQ));
         let preferences = MenuItem::new("Preferences...", true, cmd(Code::Comma));
+        // The About window is the app's own (egui), so it follows the app's light or dark appearance.
+        let about = MenuItem::new("About Pascoda", true, None);
         let app = Submenu::with_items(
             "Pascoda",
             true,
             &[
-                &PredefinedMenuItem::about(Some("About Pascoda"), Some(about::metadata())),
+                &about,
                 &PredefinedMenuItem::separator(),
                 &preferences,
                 &PredefinedMenuItem::separator(),
@@ -3402,6 +3448,7 @@ impl NativeMenu {
             new_folder: new_folder.id().clone(),
             rename_item: rename_item.id().clone(),
             preferences: preferences.id().clone(),
+            about: about.id().clone(),
             run_to: run_to.id().clone(),
             format: format.id().clone(),
             profile: profile.id().clone(),
@@ -3533,6 +3580,7 @@ impl NativeMenu {
                     (&self.new_folder, MenuAction::NewFolder),
                     (&self.rename_item, MenuAction::RenameItem),
                     (&self.preferences, MenuAction::Preferences),
+                    (&self.about, MenuAction::About),
                     (&self.toggle_view, MenuAction::ToggleView),
                     (&self.open, MenuAction::Open),
                     (&self.save, MenuAction::Save),
@@ -3787,6 +3835,43 @@ mod tests {
             .unwrap();
         }
         dir.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn a_new_project_clears_the_output_and_the_problems() {
+        let mut app = App::bare(None);
+        app.console = "old build output\n".into();
+        app.build_problems = vec![Diagnostic {
+            file: PathBuf::from("pkg.lpk"),
+            line: 0,
+            col: 0,
+            severity: Severity::Warning,
+            message: "a package is missing".into(),
+        }];
+        app.enter_project(target_tmp().join("another-project"));
+        assert!(app.console.is_empty(), "the Output pane is cleared");
+        assert!(app.build_problems.is_empty(), "the missing-package problems are cleared");
+    }
+
+    #[test]
+    fn a_chosen_dfm_or_unit_with_a_form_opens_in_the_designer() {
+        let dir = scratch_project("open-chosen");
+        // A Delphi text form next to its unit (the .dfm reads like the .lfm here).
+        std::fs::copy(dir.join("unit1.lfm"), dir.join("unit2.dfm")).unwrap();
+        std::fs::copy(dir.join("unit1.pas"), dir.join("unit2.pas")).unwrap();
+        std::fs::write(dir.join("plain.pas"), "unit plain;\n\ninterface\n\nimplementation\n\nend.\n").unwrap();
+        let mut app = App::bare(None);
+
+        app.open_chosen(dir.join("unit2.dfm"));
+        assert!(app.form_showing(), "a chosen .dfm opens in the designer");
+        assert_eq!(app.docs[app.active].path, dir.join("unit2.dfm"));
+
+        app.open_chosen(dir.join("unit2.pas"));
+        assert!(app.form_showing(), "a chosen unit with a form opens in the designer");
+
+        app.open_chosen(dir.join("plain.pas"));
+        assert!(!app.form_showing(), "a unit without a form shows its code");
+        assert_eq!(app.docs[app.active].path, dir.join("plain.pas"));
     }
 
     #[test]

@@ -43,7 +43,7 @@ The documentation site is in `vitepress/` (`cd vitepress && npm install && npm r
 
 ## Requirements
 
-You need an Apple Silicon Mac with macOS 14 Sonoma or later (generated apps target 14.0; the IDE itself was developed on macOS 27).
+You need an Apple Silicon Mac (the IDE's oldest supported macOS is set by `min_macos` under `[workspace.metadata.pascoda]` in the root `Cargo.toml`, now 11; `packaging/bundle.sh` builds with it). The IDE itself was developed and run on macOS 27 only, so older systems are untested. Generated apps target 14.0 unless a project sets its own `min_macos`.
 
 | Tool | Used for | Notes |
 |---|---|---|
@@ -121,8 +121,9 @@ A bundle is replaced only when the same build is made again; other files in the 
 `Pascoda.app`) are not deleted. `packaging/make-dmg.sh` still expects the old single `Pascoda.app` and has not been
 updated for these names.
 
-Each build (release build, `packaging/Pascoda.icns`, `Info.plist` with version,
-copyright and minimum macOS taken from the sources) and signs it ad hoc, which runs on this Mac only.
+Each build (release build, `packaging/Pascoda.icns`, `Info.plist` with the name, bundle identifier, version,
+copyright and minimum macOS) and signs it ad hoc, which runs on this Mac only. The name, bundle identifier, copyright and
+minimum macOS are set in `[workspace.metadata.pascoda]` in the root `Cargo.toml`; the About window (Pascoda > About Pascoda) shows the name and copyright from the same table, in the app's light or dark appearance.
 The bundle carries the toolchain sources it needs (`Contents/Resources/vendor`: the LCL, CodeTools,
 FPC sources, the `pasls` binary and the Free Pascal compilers with their units), so it does not
 depend on this checkout. `packaging/bundle.sh` copies the compilers from `vendor/fpc` (`packaging/fpc-build.sh`) and, for the Intel and universal builds, `vendor/fpc-intel` (`packaging/fpc-intel-build.sh`). The three apps were built and checked (executable architecture, signature, disk image checksums); none was started on an Intel Mac. The Mac that runs the app needs the Command Line Tools (the linker and the macOS
@@ -145,6 +146,7 @@ in debug builds only, the checkout the app was built in. It adds `/opt/homebrew/
 | Crate | Version | Used in | Purpose |
 |---|---|---|---|
 | `eframe` / `egui` | 0.37.0 | `pascoda-app` | window, immediate-mode UI |
+| `egui_extras` (with `svg`, which brings in `resvg`) | 0.37.0 | `pascoda-app` | drawing the SVG icons |
 | `muda` | 0.21.2 | `pascoda-app` | native macOS menu bar |
 | `rfd` | 0.17.2 | `pascoda-app` | native Open dialog |
 | `image` | 0.25.10 | `pascoda-app` | decoding the component icons |
@@ -193,6 +195,7 @@ Demo projects in `examples/` (open the main file and use Build & Run; the Tests 
 - Preferences (Cmd+,): font (SF Mono, Menlo or Courier) and size, Tab width, line numbers, word wrap, and colours for each code token and the background, set separately for light and dark. Saved in `~/Library/Application Support/Pascoda/preferences`.
 - Files changed by other programs (`claude`, git, an editor in the terminal) show up. Clean tabs reload silently. A tab with unsaved edits shows a banner with **Reload** or **Keep mine**.
 - Closing a changed tab asks Save, Don't Save or Cancel. The last session's tabs and project come back at launch, and File > Open Recent lists recent projects and files.
+- File > Open project... (Cmd+O, also the toolbar folder button) only offers the program files of a project: `.lpr` and `.dpr`, and the Delphi project file `.dproj` (which opens its main program). Units, forms and other files open from the file tree.
 
 **Build, run and test**
 - Console and GUI programs (the LCL, Cocoa widgetset). GUI programs are packaged as a `.app`, and Build > Export makes a `.app` or `.dmg`. Demos are in `examples/`.
@@ -248,6 +251,8 @@ Demo projects in `examples/` (open the main file and use Build & Run; the Tests 
 - Generated GUI apps target macOS 14.0 or later.
 - Apps opened from Finder get a minimal `PATH`; Pascoda extends it so `fpc` is found.
 - The component icons are Lazarus's (modified LGPL); see `crates/pascoda-app/assets/`.
+- The IDE's toolbar, navigator and debugger icons are SVG files in `crates/pascoda-app/assets/icons/` (compiled in; the design set is in `svg/`, see `svg/README.md`). `style::paint_icon` draws them tinted with the theme colour; the filled breakpoint dot is still drawn by hand.
+- A `{$R file.res}` resource needs `fpcres`, which the compiler runs on macOS. It is built from the FPC sources and ships in the compiler's folder (`vendor/fpc/bin`, `vendor/fpc-intel/bin`, and the bundle's copies). The IDE puts that folder first on `PATH` when it runs `fpc`, so a Mac without Homebrew's FPC works; without it the build fails with `resource compiler "fpcres" not found`.
 
 ## Licences
 

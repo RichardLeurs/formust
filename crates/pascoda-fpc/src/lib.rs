@@ -383,6 +383,21 @@ pub(crate) fn build_streaming(
 
 /// `release`: optimised and stripped, no debug info, and not re-signed for the debugger. The
 /// caller says where the program goes (`-FE`) through `extra`.
+/// The `fpc` command, with the compiler's own folder first on `PATH`. fpc finds its helper tools
+/// through `-FD` and then `PATH`; `fpcres`, the resource compiler for `{$R file.res}`, ships in the
+/// compiler's folder (`vendor/fpc/bin`, or the bundle's), so a Mac without Homebrew's FPC still finds it.
+pub(crate) fn fpc_command(fpc: &Path) -> Command {
+    let mut cmd = Command::new(fpc);
+    if let Some(dir) = fpc.parent().filter(|d| !d.as_os_str().is_empty()) {
+        let mut dirs = vec![dir.to_path_buf()];
+        dirs.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+        if let Ok(path) = std::env::join_paths(dirs) {
+            cmd.env("PATH", path);
+        }
+    }
+    cmd
+}
+
 pub(crate) fn build_streaming_as(
     source: &Path,
     mode: Mode,
@@ -429,7 +444,7 @@ pub(crate) fn build_streaming_for(
         }
     }
     let config = config_args(&fpc, dir);
-    let mut child = Command::new(fpc)
+    let mut child = fpc_command(&fpc)
         .args(target.args())
         .args(config)
         .args(source_folder_args(dir))
@@ -668,5 +683,17 @@ mod locate_tests {
             Some(fake)
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn fpc_runs_with_its_own_folder_first_on_path() {
+        let cmd = fpc_command(Path::new("/opt/pascoda/bin/fpc"));
+        let path = cmd
+            .get_envs()
+            .find(|(k, _)| *k == "PATH")
+            .and_then(|(_, v)| v)
+            .expect("PATH is set");
+        let first = std::env::split_paths(path).next().unwrap();
+        assert_eq!(first, Path::new("/opt/pascoda/bin"));
     }
 }

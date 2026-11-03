@@ -1,22 +1,43 @@
-//! The text of the About panel: what Pascoda is, who holds the copyright, and what it is
-//! built with. macOS shows the credits in a scrolling box under the version.
+//! The About window: what Pascoda is, who holds the copyright, and what it is built with (the
+//! credits, in a scrolling box under the version).
 
+use eframe::egui;
 use std::process::Command;
 
-pub const NAME: &str = "Pascoda";
-pub const COPYRIGHT: &str = "Copyright © Richard Leurs 2026";
-//Copyright © 2026 Richard Leurs. All rights reserved.
-const INFO: &str = "A modern IDE for Pascal on macOS, written in Rust. It \
-compiles with Free Pascal, debugs with lldb, completes code with the Pascal language server, \
-and designs forms with live native macOS controls.";
+/// The app name and copyright from `[workspace.metadata.pascoda]` in the root Cargo.toml (see build.rs).
+pub const NAME: &str = env!("PASCODA_NAME");
+pub const COPYRIGHT: &str = env!("PASCODA_COPYRIGHT");
+const INFO: &str = "A modern IDE for Pascal on macOS.";
+
+/// Entries of `CRATES` that are not Cargo crates (the test checks the others against Cargo.lock).
+#[cfg(test)]
+const NOT_CRATES: &[&str] = &["Rust & rustc", "Lucide"];
 
 /// Rust crates the IDE is built on: `(crate, version, what it is used for, licence)`.
 /// `tests::versions_match_cargo_lock` keeps the versions honest.
 pub const CRATES: &[(&str, &str, &str, &str)] = &[
+ (
+        "Rust & rustc",
+        "1.98.1",
+        "programming language & compiler",
+        "MIT or Apache-2.0",
+    ),
     (
+        "Lucide",
+        "icons",
+        "the style of the toolbar, navigator and debugger icons (see svg/README.md)",
+        "ISC",
+    ),    
+(
         "eframe / egui",
         "0.37.0",
         "user interface",
+        "MIT or Apache-2.0",
+    ),
+    (
+        "egui_extras",
+        "0.37.0",
+        "drawing the SVG icons",
         "MIT or Apache-2.0",
     ),
     ("muda", "0.21.2", "native menu bar", "Apache-2.0 or MIT"),
@@ -101,81 +122,55 @@ pub fn credits(fpc: Option<&str>) -> String {
     s
 }
 
-pub fn metadata() -> muda::AboutMetadata {
-    muda::AboutMetadata {
-        name: Some(NAME.into()),
-        version: Some(env!("CARGO_PKG_VERSION").into()),
-        copyright: Some(COPYRIGHT.into()),
-        credits: Some(credits(fpc_version().as_deref())),
-        ..Default::default()
+static CREDITS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The app icon (256 px, `assets/pascoda-icon.png`) as an egui texture.
+fn icon(ctx: &egui::Context) -> egui::TextureHandle {
+    let id = egui::Id::NULL.with("about-icon");
+    if let Some(t) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return t;
     }
+    let img = image::load_from_memory(include_bytes!("../assets/pascoda-icon.png")).expect("the embedded icon is a PNG");
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+    let t = ctx.load_texture("about-icon", color, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|d| d.insert_temp(id, t.clone()));
+    t
 }
 
-/// Self-test: picks "About Pascoda" from the app menu, as a user would. False when the menu or
-/// the item is not there.
-pub fn open_via_menu() -> bool {
-    use objc2_app_kit::NSApplication;
-    use objc2_foundation::{MainThreadMarker, ns_string};
-    let Some(mtm) = MainThreadMarker::new() else {
-        return false;
-    };
-    let app = NSApplication::sharedApplication(mtm);
-    let Some(app_menu) = app
-        .mainMenu()
-        .and_then(|m| m.itemAtIndex(0))
-        .and_then(|i| i.submenu())
-    else {
-        return false;
-    };
-    let Some(item) = app_menu.itemWithTitle(ns_string!("About Pascoda")) else {
-        return false;
-    };
-    app_menu.performActionForItemAtIndex(app_menu.indexOfItem(&item));
-    true
-}
-
-/// Self-test: renders the content of the key window (the About panel once it is open) to a PNG
-/// and returns its title and size.
-pub fn snapshot_key_window(path: &std::path::Path) -> Result<String, String> {
-    use objc2::runtime::AnyObject;
-    use objc2_app_kit::{NSApplication, NSBitmapImageFileType};
-    use objc2_foundation::{MainThreadMarker, NSDictionary, NSString};
-    let mtm = MainThreadMarker::new().ok_or("not on the main thread")?;
-    let app = NSApplication::sharedApplication(mtm);
-    // The panel is not the key window when the app was started from a terminal, so find it:
-    // the visible window that is not the IDE's own (winit) window.
-    let windows = app.windows();
-    let names: Vec<String> = windows
-        .iter()
-        .map(|w| {
-            format!(
-                "{} visible={}",
-                w.class().name().to_string_lossy(),
-                w.isVisible()
-            )
-        })
-        .collect();
-    let window = windows
-        .iter()
-        .find(|w| w.isVisible() && !w.class().name().to_string_lossy().contains("Winit"))
-        .ok_or_else(|| format!("no About window among {names:?}"))?;
-    let view = window.contentView().ok_or("no content view")?;
-    let bounds = view.bounds();
-    let rep = view
-        .bitmapImageRepForCachingDisplayInRect(bounds)
-        .ok_or("no bitmap")?;
-    view.cacheDisplayInRect_toBitmapImageRep(bounds, &rep);
-    let props = NSDictionary::<NSString, AnyObject>::new();
-    let data =
-        unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &props) }
-            .ok_or("PNG encoding failed")?;
-    std::fs::write(path, data.to_vec()).map_err(|e| e.to_string())?;
-    Ok(format!(
-        "{:?} {}x{}",
-        window.title().to_string(),
-        bounds.size.width,
-        bounds.size.height
-    ))
+/// The About window, in the app's own dialog so it follows the light or dark appearance. Returns true when
+/// it should close (Done).
+pub fn show(ctx: &egui::Context) -> bool {
+    let icon = icon(ctx);
+    let credits = CREDITS.get_or_init(|| credits(fpc_version().as_deref()));
+    let muted = crate::style::Palette::of(ctx).text_tertiary;
+    let mut done = false;
+    crate::style::dialog(ctx, "about", None, 540.0, |ui| {
+        ui.spacing_mut().item_spacing.y = 10.0;
+        ui.horizontal_top(|ui| {
+            ui.add(egui::Image::new(&icon).fit_to_exact_size(egui::vec2(96.0, 96.0)));
+            ui.vertical(|ui| {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(NAME).size(24.0).strong());
+                ui.label(egui::RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).color(muted));
+                ui.label(COPYRIGHT);
+            });
+        });
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .max_height(260.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(credits.as_str()).size(14.0));
+            });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if crate::style::primary_button(ui, "Close").clicked() {
+                done = true;
+            }
+        });
+    });
+    done
 }
 
 #[cfg(test)]
@@ -199,7 +194,7 @@ mod tests {
                 && text.contains("pasls")
         );
         assert!(credits(None).contains("Free Pascal (not found)"));
-        assert!(COPYRIGHT.starts_with("Copyright") && COPYRIGHT.ends_with("Richard Leurs 2026"));
+        assert!(COPYRIGHT.starts_with("Copyright") && COPYRIGHT.contains("Richard Leurs 2026"));
     }
 
     /// The list above must name the versions the program is actually built with.
@@ -209,6 +204,10 @@ mod tests {
             std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"))
                 .unwrap();
         for (name, version, _, _) in CRATES {
+            // The Rust toolchain and the icon set are not crates, so they have no Cargo.lock entry.
+            if NOT_CRATES.contains(name) {
+                continue;
+            }
             for krate in name.split(" / ") {
                 let krate = if krate == "eframe" || krate == "egui" {
                     krate
