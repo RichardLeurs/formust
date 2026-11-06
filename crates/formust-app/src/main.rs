@@ -62,6 +62,8 @@ struct App {
     building: Option<cargo::Session>,
     /// Run Form being prepared (its program is written, then cargo starts), if any.
     form_prep: Option<run_form::Prep>,
+    /// Live Run, while it is on: rebuilds and relaunches the form's window after each edit.
+    live: Option<run_form::live::Live>,
     /// A question about unsaved changes that is waiting for an answer.
     confirm: Option<Confirm>,
     /// A change of project waiting for the answer to `confirm`: the new folder, and what to do in
@@ -213,6 +215,7 @@ impl App {
             console: String::new(),
             building: None,
             form_prep: None,
+            live: None,
             confirm: None,
             project_switch: None,
             quit_confirmed: false,
@@ -569,6 +572,8 @@ impl App {
                     d.saved = text;
                 }
                 self.forget_external(&frm);
+                // The form file is current again, so it is read with the `.rs` again.
+                self.designer.source_only.remove(path);
                 self.designer.prompt = None;
                 self.designer.status = Some(format!("Saved {}", name(&frm)));
                 self.note_designer_loaded();
@@ -594,6 +599,89 @@ impl App {
                 false
             }
         }
+    }
+
+    /// "Save into .rs" (the designer's button, File > Save Form into .rs...): works out what writing
+    /// the designer's forms into the `.rs` itself would change and asks for a confirmation (or says
+    /// why it can't). Nothing is written until the confirmation's answer ([`App::write_into_source`]).
+    pub(crate) fn save_into_source(&mut self) {
+        let active = self.docs.get(self.active).map(|d| d.path.clone());
+        let Some(loaded) = self
+            .designer
+            .loaded
+            .as_ref()
+            .filter(|l| Some(&l.path) == active.as_ref())
+        else {
+            self.designer.status =
+                Some("Save into .rs: open the .rs with the form first".to_string());
+            return;
+        };
+        let tab_unsaved = self.docs.iter().any(|d| d.path == loaded.path && d.dirty());
+        let outcome = designer::export::plan_into_source(
+            loaded,
+            &|p| std::fs::read_to_string(p).ok(),
+            tab_unsaved,
+        );
+        self.designer.diff = None;
+        match outcome {
+            designer::export::IntoSourceOutcome::Nothing(message) => {
+                self.designer.status = Some(message);
+            }
+            designer::export::IntoSourceOutcome::Confirm(plan) => {
+                self.designer.prompt = Some(designer::export::Prompt::IntoSource(plan));
+            }
+            designer::export::IntoSourceOutcome::Ask(prompt) => {
+                self.designer.prompt = Some(prompt);
+            }
+            designer::export::IntoSourceOutcome::Failed(message) => {
+                self.console
+                    .push_str(&format!("Save into .rs failed: {message}\n"));
+                self.designer.status = Some(format!("Not written: {message}"));
+            }
+        }
+    }
+
+    /// The confirmation's answer to "Save into .rs": writes `plan` (only while the `.rs` on disk is
+    /// still what it was made from, and its tab has no unsaved text), then reads the forms again from
+    /// the new `.rs` with a new history. The form file is not written or deleted; the status line
+    /// mentions it.
+    pub(crate) fn write_into_source(&mut self, plan: designer::export::IntoSource) {
+        let name = |p: &Path| {
+            p.file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+        };
+        let rs = name(&plan.path);
+        if self.docs.iter().any(|d| d.path == plan.path && d.dirty()) {
+            let message =
+                format!("{rs} has unsaved changes in the code editor; it was not overwritten");
+            self.console
+                .push_str(&format!("Save into .rs failed: {message}\n"));
+            self.designer.status = Some(format!("Not written: {message}"));
+            return;
+        }
+        if let Err(message) = designer::export::write_into_source(&plan) {
+            self.console
+                .push_str(&format!("Save into .rs failed: {message}\n"));
+            self.designer.status = Some(format!("Not written: {message}"));
+            return;
+        }
+        if let Some(d) = self.docs.iter_mut().find(|d| d.path == plan.path) {
+            d.text = plan.new.clone();
+            d.saved = plan.new.clone();
+        }
+        self.forget_external(&plan.path);
+        self.designer.diff = None;
+        self.designer.take_written_source(&plan.path, &plan.new);
+        self.note_designer_loaded();
+        let mut status = format!("Wrote {rs} ({})", plan.forms.join(", "));
+        if let Some(frm) = &plan.companion {
+            status.push_str(&format!(
+                ". {} was not changed and is now older than {rs}; the designer shows {rs} until you Save to the form file",
+                name(frm)
+            ));
+        }
+        self.console.push_str(&format!("{status}\n"));
+        self.designer.status = Some(status);
     }
 
     /// The designer's file is what the tabs and the disk now say, so the next sync doesn't read
@@ -653,9 +741,24 @@ impl App {
                     self.sync_designer(true);
                 }
                 designer::ui::Action::ShowDiff(prompt) => {
+                    // Save into .rs compares with the disk, which the tab may not show yet.
+                    let disk = |p: &Path| std::fs::read_to_string(p).ok();
+                    let from_disk =
+                        matches!(prompt, designer::export::Prompt::IntoSourceChanged { .. });
                     self.designer.diff = self.designer.loaded.as_ref().and_then(|l| {
-                        designer::export::diff_for(l, &prompt, &read, &|p| p.exists())
+                        if from_disk {
+                            designer::export::diff_for(l, &prompt, &disk, &|p| p.exists())
+                        } else {
+                            designer::export::diff_for(l, &prompt, &read, &|p| p.exists())
+                        }
                     });
+                }
+                designer::ui::Action::SaveIntoSource => self.save_into_source(),
+                designer::ui::Action::WriteIntoSource(plan) => self.write_into_source(plan),
+                designer::ui::Action::KeepIntoSource(form) => {
+                    self.designer
+                        .keep_form(&form, &|p: &Path| std::fs::read_to_string(p).ok());
+                    self.save_into_source();
                 }
             }
         }
@@ -749,6 +852,9 @@ impl App {
 
     fn remove_doc(&mut self, i: usize) {
         let closed = self.docs.remove(i);
+        if self.live.as_ref().is_some_and(|l| l.path == closed.path) {
+            self.end_live("Live Run ended: its tab was closed.\n");
+        }
         self.lsp_problems.clear(&mut self.diagnostics, &closed.path);
         if let Some(lsp) = &self.lsp {
             let _ = lsp.requests.send(lsp::Req::Close { path: closed.path });
@@ -913,6 +1019,10 @@ impl App {
             return None;
         }
         let path = doc.path.clone();
+        // Written by "Save into .rs" this session: the `.rs` alone, its form file is older.
+        if self.designer.source_only.contains(&path) {
+            return Some((path, doc.text.clone(), None));
+        }
         let open = |p: &Path| self.docs.iter().any(|d| d.path == p);
         // The companion on disk, else one open in a tab but not saved yet.
         let companion_path = files::companions(&path).into_iter().next().or_else(|| {
@@ -1754,6 +1864,7 @@ struct NativeMenu {
     assistant: muda::CheckMenuItem,
     open: muda::MenuId,
     save: muda::MenuId,
+    save_into_source: muda::MenuId,
     run: muda::MenuId,
     /// The Build & Run item, relabelled Run Form while Run runs a form (see `run_is_form`).
     run_item: muda::MenuItem,
@@ -1811,6 +1922,8 @@ enum MenuAction {
     ClearRecent,
     Open,
     Save,
+    /// File > Save Form into .rs...: the designer's forms into the `.rs` itself, after a confirmation.
+    SaveIntoSource,
     Run,
     Quit,
     Appearance(theme::Appearance),
@@ -1901,6 +2014,8 @@ impl NativeMenu {
             )),
         );
         let save = MenuItem::new("Save", true, cmd(Code::KeyS));
+        // No shortcut: it overwrites the user's source, so it is never a key press away.
+        let save_into_source = MenuItem::new("Save Form into .rs...", true, None);
         let check = MenuItem::new(
             "Check",
             true,
@@ -2020,6 +2135,7 @@ impl NativeMenu {
                 &open,
                 &open_folder,
                 &save,
+                &save_into_source,
             ],
         )
         .ok()?;
@@ -2094,6 +2210,7 @@ impl NativeMenu {
             assistant,
             open: open.id().clone(),
             save: save.id().clone(),
+            save_into_source: save_into_source.id().clone(),
             run: run.id().clone(),
             run_item: run.clone(),
             run_form_label: false,
@@ -2206,6 +2323,7 @@ impl NativeMenu {
                     (&self.open, MenuAction::Open),
                     (&self.open_folder, MenuAction::OpenFolder),
                     (&self.save, MenuAction::Save),
+                    (&self.save_into_source, MenuAction::SaveIntoSource),
                     (&self.check, MenuAction::Check),
                     (&self.build, MenuAction::Build),
                     (&self.run, MenuAction::Run),

@@ -2802,6 +2802,16 @@ fn dragging_on_the_canvas_and_in_the_outline_reorders_and_reparents() {
         "the moved node is selected"
     );
 
+    // The divider up, so the outline shows all of the sample's rows (at 50/50 the Group and
+    // its link are scrolled out of view).
+    h.state_mut().designer.palette_share = Some(0.2);
+    h.run_steps(2);
+    let (_, outline) = left_sections(&h);
+    let group_row = outline_row(&h, exact_node(h.state(), "Group"));
+    assert!(
+        outline.contains(group_row.center()),
+        "{group_row:?} in {outline:?}"
+    );
     // In the outline: the checkbox row onto the top of the heading row moves it first.
     let root = shown_form(&h).root.id;
     let checkbox = exact_node(h.state(), "Checkbox \"Remember me\"");
@@ -3196,6 +3206,270 @@ fn a_changed_source_or_form_file_brings_up_the_conflict_prompt() {
         h.state().designer.status
     );
     assert!(h.state().is_dirty(0), "the edits are still unsaved");
+}
+
+/// "Save into .rs…": an unedited form has nothing to write; an edit brings up the confirmation, Show
+/// diff shows the whole change, and the answer writes `sample.rs` (and no form file). The designer
+/// then reads the new `.rs`: clean, a new history, the same form, and nothing left to write.
+#[test]
+fn save_into_rs_asks_shows_the_difference_and_writes_the_source() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let rs = designer_copy("into-rs");
+    let original = std::fs::read_to_string(&rs).unwrap();
+    let mut h = designer_harness_for(rs.clone(), false);
+    h.get_by_label("Save into .rs…").click();
+    h.run_steps(3);
+    assert_eq!(h.state().designer.prompt, None);
+    assert!(
+        h.state()
+            .designer
+            .status
+            .as_deref()
+            .is_some_and(|s| s.contains("nothing to write")),
+        "{:?}",
+        h.state().designer.status
+    );
+
+    // A new bound field and an edited heading.
+    h.state_mut().designer.palette_filter = "Text edit".to_string();
+    h.run_steps(2);
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Text edit")
+        .click();
+    h.run_steps(2);
+    let heading = exact_node(h.state(), "Heading \"Sample heading\"");
+    h.state_mut().designer.try_edit(None, |f| {
+        f.set_prop(
+            heading,
+            "text",
+            formust_model::PropValue::Text("Edited heading".into()),
+        )
+    });
+    h.run_steps(1);
+    assert!(h.state().is_dirty(0));
+    h.get_by_label("Save into .rs…").click();
+    h.run_steps(3);
+    let Some(designer::export::Prompt::IntoSource(plan)) = h.state().designer.prompt.clone() else {
+        panic!("{:?}", h.state().designer.prompt)
+    };
+    assert_eq!(plan.forms, ["Sample::ui"]);
+    assert_eq!(
+        std::fs::read_to_string(&rs).unwrap(),
+        original,
+        "nothing is written before the answer"
+    );
+    h.get_by_label("Show diff").click();
+    h.run_steps(3);
+    let diff = h.state().designer.diff.clone().expect("the difference");
+    assert_eq!(diff.old, original);
+    assert_eq!(diff.new, plan.new);
+    let image = h.render().expect("offscreen render");
+    image
+        .save(out_dir().join("ui-designer-into-rs.png"))
+        .unwrap();
+    h.state_mut().designer.diff = None;
+    h.run_steps(1);
+    h.get_by_label("Write sample.rs").click();
+    h.run_steps(3);
+
+    let written = std::fs::read_to_string(&rs).unwrap();
+    assert_eq!(written, plan.new);
+    assert!(
+        written.contains("ui.heading(\"Edited heading\");")
+            && written.contains("ui.text_edit_singleline(&mut self.form.text);")
+            && written.contains("    busy: bool,\n    form: SampleForm,\n}")
+            && written.contains("#[derive(Default)] pub struct SampleForm { pub text: String }"),
+        "{written}"
+    );
+    assert!(!written.contains("// formust"), "{written}");
+    let panels = &original[original.find("pub struct Panels;").unwrap()..];
+    assert!(
+        written.ends_with(panels),
+        "the other form stays byte for byte"
+    );
+    assert!(!rs.with_file_name("sample.frm.rs").exists(), "no form file");
+    // The tab and the designer follow the new .rs: clean, from the source, a new history.
+    assert_eq!(h.state().docs[0].text, written);
+    assert!(!h.state().is_dirty(0));
+    let current = h.state().designer.current().unwrap();
+    assert_eq!(current.origin, Some(formust_rust::Origin::Rs));
+    assert_eq!(current.form().id(), "Sample::ui");
+    assert!(
+        !h.state()
+            .designer
+            .loaded
+            .as_ref()
+            .unwrap()
+            .history
+            .can_undo()
+    );
+    exact_node(h.state(), "Heading \"Edited heading\"");
+    h.run_steps(4);
+    let loaded = h.state().designer.loaded.as_ref().unwrap();
+    assert!(!loaded.stale && !loaded.is_dirty());
+    assert!(
+        h.state()
+            .designer
+            .status
+            .as_deref()
+            .is_some_and(|s| s.starts_with("Wrote sample.rs")),
+        "{:?}",
+        h.state().designer.status
+    );
+    // Idempotent: the .rs reads back to the same forms, and there is nothing left to write.
+    let back = formust_rust::import(&written).unwrap();
+    let again: Vec<_> = back.forms.iter().map(|f| (f.form.clone(), None)).collect();
+    assert_eq!(
+        formust_rust::update_source(&written, &again).unwrap().text,
+        written
+    );
+    h.get_by_label("Save into .rs…").click();
+    h.run_steps(3);
+    assert_eq!(h.state().designer.prompt, None);
+    assert_eq!(std::fs::read_to_string(&rs).unwrap(), written);
+}
+
+/// "Save into .rs…" refuses unsaved text in the `.rs` tab, asks when the form's body changed on
+/// disk, refuses when the disk changes while the confirmation is open, and never writes or deletes
+/// the form file, which the status line names.
+#[test]
+fn save_into_rs_refuses_conflicts_and_leaves_the_form_file() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let rs = designer_copy("into-rs-conflicts");
+    let frm = rs.with_file_name("sample.frm.rs");
+    let mut h = designer_harness_for(rs.clone(), false);
+    let add = |h: &mut Harness<'static, App>| {
+        h.state_mut().designer.select(None, false);
+        h.state_mut().designer.palette_filter = "Spinner".to_string();
+        h.run_steps(2);
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Spinner")
+            .click();
+        h.run_steps(2);
+    };
+    let into_rs = |h: &mut Harness<'static, App>| {
+        h.get_by_label("Save into .rs…").click();
+        h.run_steps(3);
+    };
+    add(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::S);
+    h.run_steps(3);
+    let frm_text = std::fs::read_to_string(&frm).expect("Save wrote the form file");
+    add(&mut h);
+
+    // Unsaved text in the .rs tab: refused, nothing written.
+    let saved = h.state().docs[0].saved.clone();
+    h.state_mut().docs[0].text = format!("{saved}\n// typing\n");
+    h.run_steps(2);
+    into_rs(&mut h);
+    assert_eq!(h.state().designer.prompt, None);
+    assert!(
+        h.state()
+            .designer
+            .status
+            .as_deref()
+            .is_some_and(|s| s.starts_with("Not written") && s.contains("unsaved changes")),
+        "{:?}",
+        h.state().designer.status
+    );
+    assert_eq!(std::fs::read_to_string(&rs).unwrap(), saved);
+    h.state_mut().docs[0].text = saved.clone();
+    h.run_steps(2);
+
+    // The form's body changed on disk: asked first, with the difference.
+    let title = saved.replace("\"Sample heading\"", "\"Sample title\"");
+    std::fs::write(&rs, &title).unwrap();
+    into_rs(&mut h);
+    assert_eq!(
+        h.state().designer.prompt,
+        Some(designer::export::Prompt::IntoSourceChanged {
+            form: "Sample::ui".into()
+        })
+    );
+    h.get_by_label("Show diff").click();
+    h.run_steps(3);
+    let diff = h.state().designer.diff.clone().expect("the difference");
+    assert!(diff.old.contains("Sample title") && diff.new.contains("Sample heading"));
+    h.state_mut().designer.diff = None;
+    h.run_steps(1);
+    h.get_by_label("Keep mine").click();
+    h.run_steps(3);
+    let Some(designer::export::Prompt::IntoSource(plan)) = h.state().designer.prompt.clone() else {
+        panic!("{:?}", h.state().designer.prompt)
+    };
+    assert_eq!(plan.companion.as_deref(), Some(frm.as_path()));
+    assert!(plan.changed_since_read);
+
+    // The disk changes again while the confirmation is open: the write refuses.
+    let later = format!("{title}\n// saved elsewhere\n");
+    std::fs::write(&rs, &later).unwrap();
+    h.get_by_label("Write sample.rs").click();
+    h.run_steps(3);
+    assert_eq!(std::fs::read_to_string(&rs).unwrap(), later);
+    assert!(
+        h.state()
+            .designer
+            .status
+            .as_deref()
+            .is_some_and(|s| s.contains("changed on disk")),
+        "{:?}",
+        h.state().designer.status
+    );
+    assert!(h.state().is_dirty(0), "the edits are kept");
+
+    // Asked again, it goes through: the form file is named, and left as it is.
+    into_rs(&mut h);
+    h.get_by_label("Write sample.rs").click();
+    h.run_steps(3);
+    let written = std::fs::read_to_string(&rs).unwrap();
+    assert!(
+        written.ends_with("// saved elsewhere\n") && written.matches("ui.spinner();").count() == 3,
+        "{written}"
+    );
+    assert!(
+        written.contains("ui.heading(\"Sample heading\");"),
+        "the designer's form was kept"
+    );
+    assert_eq!(std::fs::read_to_string(&frm).unwrap(), frm_text);
+    let status = h.state().designer.status.clone().unwrap_or_default();
+    assert!(status.contains("sample.frm.rs was not changed"), "{status}");
+    // The designer keeps showing the .rs, not the older form file.
+    h.run_steps(4);
+    let current = h.state().designer.current().unwrap();
+    assert_eq!(current.origin, Some(formust_rust::Origin::Rs));
+    assert_eq!(
+        current
+            .form()
+            .root
+            .children()
+            .iter()
+            .filter(|n| designer::node_title(n) == "Spinner")
+            .count(),
+        3
+    );
+    assert!(!h.state().is_dirty(0));
+
+    // A later Save to the form file asks first (it is not what the designer read), and then the
+    // pair is read together again.
+    add(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::S);
+    h.run_steps(3);
+    assert!(matches!(
+        h.state().designer.prompt,
+        Some(designer::export::Prompt::FormFileChanged { .. })
+    ));
+    h.get_by_label("Overwrite").click();
+    h.run_steps(3);
+    assert!(!h.state().designer.source_only.contains(&rs));
+    let text = std::fs::read_to_string(&frm).unwrap();
+    assert_eq!(text.matches("ui.spinner();").count(), 4, "{text}");
+    h.run_steps(3);
+    assert_eq!(
+        h.state().designer.current().unwrap().origin,
+        Some(formust_rust::Origin::Frm)
+    );
 }
 
 /// "Use in code" says the copy stands alone, lists the handler stubs the copy needs, what Save does
@@ -4058,6 +4332,8 @@ fn the_palette_scrolls_filters_and_folds_its_groups() {
     // A short window: the palette is taller than its room and scrolls.
     h.set_size(egui::vec2(1500.0, 700.0));
     h.run_steps(3);
+    // The split follows the window: still half each (no fixed cap on the palette).
+    assert!((palette_share(&h) - 0.5).abs() < 0.01);
     let outline_top = h.get_by_label("OUTLINE").rect().top();
     for item in designer::edit::palette() {
         h.state_mut().designer.palette_filter = item.label().to_string();
@@ -4097,6 +4373,100 @@ fn the_palette_scrolls_filters_and_folds_its_groups() {
         h.query_by_role_and_label(egui::accesskit::Role::Button, "Heading")
             .is_some()
     );
+}
+
+/// The palette and outline sections of the left pane, as last drawn.
+fn left_sections(h: &Harness<'static, App>) -> (egui::Rect, egui::Rect) {
+    h.state()
+        .designer
+        .left_sections
+        .expect("the left pane was drawn")
+}
+
+/// The palette's share of the left pane.
+fn palette_share(h: &Harness<'static, App>) -> f32 {
+    let (palette, outline) = left_sections(h);
+    palette.height() / (palette.height() + outline.height())
+}
+
+/// The left pane starts split 50/50 between the palette and the outline; dragging the divider
+/// moves the split, and neither section gets smaller than its least height.
+#[test]
+fn the_palette_and_outline_split_the_left_pane_with_a_draggable_divider() {
+    use designer::ui::{OUTLINE_MIN_HEIGHT, PALETTE_MIN_HEIGHT};
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut h = designer_harness_for(look_copy("split"), false);
+    let (palette, outline) = left_sections(&h);
+    assert!(
+        (palette_share(&h) - 0.5).abs() < 0.01,
+        "50/50 at start: palette {palette:?}, outline {outline:?}"
+    );
+    assert!(
+        palette.height() > 500.0,
+        "no 240 pt cap: {}",
+        palette.height()
+    );
+    // Both headings are in their own section.
+    assert!(palette.contains(h.get_by_label("PALETTE").rect().center()));
+    assert!(outline.contains(h.get_by_label("OUTLINE").rect().center()));
+    let image = h.render().unwrap();
+    image
+        .save(out_dir().join("ui-designer-left-split.png"))
+        .unwrap();
+
+    // Down by 150 pt: the palette grows and the outline shrinks by as much.
+    let handle = egui::pos2(palette.center().x, palette.bottom());
+    let to = handle + egui::vec2(0.0, 150.0);
+    designer_drag(&mut h, handle, to);
+    designer_release(&mut h, to);
+    let (after, after_outline) = left_sections(&h);
+    assert!(
+        (after.height() - (palette.height() + 150.0)).abs() < 3.0,
+        "the drag moved the divider: {} -> {}",
+        palette.height(),
+        after.height()
+    );
+    assert!((after_outline.bottom() - outline.bottom()).abs() < 0.5);
+    assert!(
+        (after_outline.height() - (outline.height() - 150.0)).abs() < 3.0,
+        "the outline gave up the room"
+    );
+
+    // Far up: the palette keeps its least height.
+    let handle = egui::pos2(after.center().x, after.bottom());
+    let to = egui::pos2(handle.x, 0.0);
+    designer_drag(&mut h, handle, to);
+    designer_release(&mut h, to);
+    let (top, _) = left_sections(&h);
+    assert!(
+        (top.height() - PALETTE_MIN_HEIGHT).abs() < 1.0,
+        "the palette keeps {PALETTE_MIN_HEIGHT} pt: {}",
+        top.height()
+    );
+    assert!(h.get_by_label("PALETTE").rect().bottom() < top.bottom());
+
+    // Far down: the outline keeps its least height, and its heading stays in view.
+    let handle = egui::pos2(top.center().x, top.bottom());
+    let to = egui::pos2(handle.x, 1299.0);
+    designer_drag(&mut h, handle, to);
+    designer_release(&mut h, to);
+    let (_, bottom) = left_sections(&h);
+    assert!(
+        (bottom.height() - OUTLINE_MIN_HEIGHT).abs() < 1.0,
+        "the outline keeps {OUTLINE_MIN_HEIGHT} pt: {}",
+        bottom.height()
+    );
+    assert!(bottom.contains(h.get_by_label("OUTLINE").rect().center()));
+
+    // A shorter window keeps both least heights too.
+    h.set_size(egui::vec2(1500.0, 420.0));
+    h.run_steps(3);
+    let (palette, outline) = left_sections(&h);
+    assert!(palette.height() >= PALETTE_MIN_HEIGHT - 0.5, "{palette:?}");
+    assert!(outline.height() >= OUTLINE_MIN_HEIGHT - 0.5, "{outline:?}");
+    assert!(outline.bottom() <= 420.0 + 0.5);
 }
 
 /// Cmd-click on the canvas and in the outline builds a selection; the inspector shows what they

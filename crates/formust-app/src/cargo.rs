@@ -317,6 +317,8 @@ impl crate::App {
 
     /// Stop: kills the cargo run in flight (and a program it started). Its outcome follows.
     pub(crate) fn stop_cargo(&mut self) {
+        // Stop also ends Live Run, with its window.
+        self.end_live("Live Run is off.\n");
         if self.stop_form_prep() {
             return;
         }

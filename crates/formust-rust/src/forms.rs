@@ -111,6 +111,42 @@ pub fn widget_forms(id: WidgetId) -> WidgetForms {
     }
 }
 
+/// The `egui::RichText` method a text widget with only a `ui` shorthand puts on its text, for the
+/// one form that needs a widget value: `ui.add_sized(s, egui::Label::new(egui::RichText::new(t).heading()))`
+/// is a sized `ui.heading(t)`. Strong and Monospace have none: `.strong()` and `.monospace()` are
+/// a Label's own Bold and Monospace, so that form would read back as a Label.
+pub fn text_style(id: WidgetId) -> Option<&'static str> {
+    match id {
+        WidgetId::Heading => Some("heading"),
+        WidgetId::Small => Some("small"),
+        WidgetId::Weak => Some("weak"),
+        WidgetId::Label
+        | WidgetId::Strong
+        | WidgetId::Monospace
+        | WidgetId::Button
+        | WidgetId::Link
+        | WidgetId::Hyperlink
+        | WidgetId::Checkbox
+        | WidgetId::ToggleValue
+        | WidgetId::RadioValue
+        | WidgetId::SelectableValue
+        | WidgetId::TextEditSingleline
+        | WidgetId::TextEditMultiline
+        | WidgetId::Slider
+        | WidgetId::DragValue
+        | WidgetId::ProgressBar
+        | WidgetId::Spinner
+        | WidgetId::Separator
+        | WidgetId::AddSpace
+        | WidgetId::ComboBox
+        | WidgetId::EndRow
+        | WidgetId::Image
+        | WidgetId::ColorEdit
+        | WidgetId::ColorEditRgb
+        | WidgetId::RangeSlider => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ContainerForms {
     /// `ui.<method>(args, |ui| { .. })`.

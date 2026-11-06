@@ -16,11 +16,14 @@ use super::preview::{self, Options};
 use super::viewport::{self, TITLE_BAR, View};
 use super::{DesignForm, Designer, node_title, show_value};
 use crate::style::{Palette, hline, pill, segment};
-use eframe::egui::{self, Color32, Frame, Margin, Rect, RichText, Sense, Stroke, StrokeKind, vec2};
+use eframe::egui::{
+    self, Color32, Frame, Margin, Rect, RichText, Sense, Stroke, StrokeKind, pos2, vec2,
+};
 use formust_model::{
     ALIGN2, ALL_ANCHORS, Anchor, ContainerId, DefaultValue, EventId, Form, Node, NodeId, NodeKind,
     PropDef, PropKind, PropRole, PropValue, WidgetId, container_def, parse_vec2,
-    parse_window_anchor, resize_axes, vec2_text, widget_def, window_anchor_text, wrapper_anchor,
+    parse_window_anchor, resize_axes, resize_from_start, vec2_text, widget_def, window_anchor_text,
+    wrapper_anchor,
 };
 use formust_rust::{Conflict, Origin};
 
@@ -47,6 +50,12 @@ pub enum Action {
     /// Turn extended import (`ImportOptions::extended`) on or off and read the file again.
     Extended(bool),
     ShowDiff(Prompt),
+    /// "Save into .rs": work out what would be written and ask for a confirmation.
+    SaveIntoSource,
+    /// The confirmation's answer: write this into the `.rs`.
+    WriteIntoSource(export::IntoSource),
+    /// The "source changed" answer during Save into .rs: keep the designer's form, then go on.
+    KeepIntoSource(String),
 }
 
 /// Draws the designer. `read` gives a file's current text (its tab's, else the disk's).
@@ -84,11 +93,7 @@ pub fn show(
                 .fill(pal.sidebar)
                 .inner_margin(Margin::symmetric(8, 8)),
         )
-        .show(ui, |ui| {
-            palette(d, ui, pal);
-            ui.add_space(6.0);
-            outline(d, ui, pal);
-        });
+        .show(ui, |ui| left_pane(d, ui, pal));
     egui::Panel::right("designer-properties")
         .resizable(true)
         .default_size(290.0)
@@ -264,10 +269,25 @@ fn top_bar(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
                 }
                 if ui
                     .add_enabled(dirty, egui::Button::new("Save form").small())
-                    .on_hover_text("Export to the .frm.rs (Cmd+S). The .rs is never written.")
+                    .on_hover_text("Export to the .frm.rs (Cmd+S). The .rs is not written.")
                     .clicked()
                 {
                     d.actions.push(Action::Save { overwrite: false });
+                }
+                let into_rs = d.loaded.as_ref().is_some_and(|l| {
+                    l.error.is_none()
+                        && !l.forms.is_empty()
+                        && formust_rust::file_kind(&l.path) == formust_rust::FileKind::Source
+                });
+                if ui
+                    .add_enabled(into_rs, egui::Button::new("Save into .rs…").small())
+                    .on_hover_text(
+                        "Write the forms into the .rs itself, replacing only their functions. Shows what changes and asks first. The .frm.rs is left as it is.",
+                    )
+                    .on_disabled_hover_text("Open the .rs (not the .frm.rs) to save its forms into it")
+                    .clicked()
+                {
+                    d.actions.push(Action::SaveIntoSource);
                 }
                 if let Some(f) = d.current() {
                     if let Some(note) =
@@ -347,8 +367,84 @@ fn conflict_note(f: &DesignForm) -> Option<&'static str> {
 
 // ---- Palette -------------------------------------------------------------------------------
 
+/// The least height of the palette and of the outline in the left pane, so the divider between
+/// them can't make either vanish.
+pub const PALETTE_MIN_HEIGHT: f32 = 100.0;
+pub const OUTLINE_MIN_HEIGHT: f32 = 100.0;
+
+/// The palette's height range in a left pane `total` points high: each section keeps its least
+/// height, or half the pane when the pane is too short for both.
+fn palette_height_range(total: f32) -> (f32, f32) {
+    let min = PALETTE_MIN_HEIGHT.min(total * 0.5).max(0.0);
+    let max = (total - OUTLINE_MIN_HEIGHT).max(min);
+    (min, max)
+}
+
+/// The left pane: the palette above a draggable divider, the outline below it. Each starts at half
+/// the pane. The divider keeps the palette's share of the pane (`Designer::palette_share`), so a
+/// taller window grows both; the share is kept for the session, not saved, so a new start is
+/// 50/50 again.
+fn left_pane(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
+    let full = ui.available_rect_before_wrap();
+    let total = full.height();
+    let (min, max) = palette_height_range(total);
+    // The divider's drag is read first (as egui's resizable panels do), so it moves this frame;
+    // its hit area is registered after the contents below, on top of the scroll areas.
+    let divider_id = ui.scope_id().with("designer-palette-divider");
+    if let Some(r) = ui.ctx().read_response(divider_id)
+        && r.dragged()
+        && let Some(p) = r.interact_pointer_pos()
+        && total > 0.0
+    {
+        d.palette_share = Some((p.y - full.top()).clamp(min, max) / total);
+    }
+    let height = (total * d.palette_share.unwrap_or(0.5)).clamp(min, max);
+    let line_y = full.top() + height;
+    let top = Rect::from_min_max(full.min, pos2(full.right(), line_y));
+    let rest = Rect::from_min_max(pos2(full.left(), line_y), full.max);
+    // Each section in its own child ui, clipped to its rect, so neither can spill over the other.
+    let mut section = |rect: Rect,
+                       salt: &str,
+                       d: &mut Designer,
+                       draw: fn(&mut Designer, &mut egui::Ui, &Palette)| {
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(salt)
+                .max_rect(rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        child.shrink_clip_rect(rect);
+        draw(d, &mut child, pal);
+    };
+    section(
+        Rect::from_min_max(top.min, pos2(top.right(), top.bottom() - 6.0)),
+        "designer-palette-section",
+        d,
+        palette,
+    );
+    section(
+        Rect::from_min_max(pos2(rest.left(), rest.top() + 6.0), rest.max),
+        "designer-outline-section",
+        d,
+        outline,
+    );
+    ui.allocate_rect(full, Sense::hover());
+    let grab = ui.style().interaction.resize_grab_radius_side;
+    let handle = Rect::from_x_y_ranges(full.x_range(), (line_y - grab)..=(line_y + grab));
+    let r = ui
+        .interact(handle, divider_id, Sense::drag())
+        .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+    let stroke = if r.dragged() || r.hovered() {
+        Stroke::new(1.5, pal.accent)
+    } else {
+        Stroke::new(1.0, pal.separator)
+    };
+    ui.painter().hline(full.x_range(), line_y, stroke);
+    d.left_sections = Some((top, rest));
+}
+
 /// The palette: a filter box and the items by group (each group can be closed), in a scroll area
-/// of at most 240 pt, so every item can be reached and the outline keeps its room.
+/// that fills the palette's part of the left pane, so every item can be reached.
 /// A click adds the item into the selected container or after the selected widget; a drag drops it
 /// where the indicator line shows.
 fn palette(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
@@ -384,13 +480,12 @@ fn palette(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
         .filter(|i| edit::matches_filter(*i, &d.palette_filter))
         .collect();
     let filtering = !d.palette_filter.trim().is_empty();
-    // At most 240 pt (or 40% of a short panel): the outline below keeps its room, and the
-    // palette scrolls.
-    let max_height = (ui.available_height() * 0.4).clamp(120.0, 240.0);
+    // The list fills the palette's part of the pane (above the divider) and scrolls.
     egui::ScrollArea::vertical()
         .id_salt("designer-palette")
-        .max_height(max_height)
-        .auto_shrink([false, true])
+        .auto_shrink([false, false])
+        // Less than egui's 64 pt, so the list fits the palette's least height (`PALETTE_MIN_HEIGHT`).
+        .min_scrolled_height(32.0)
         .show(ui, |ui| {
             if items.is_empty() {
                 ui.label(
@@ -2252,10 +2347,12 @@ fn canvas(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
     let dark = d.dark.unwrap_or(pal.dark);
     window_chrome(ui, &view, area, &form.id(), dark);
     let also = d.also_selected();
-    let handles = d
+    let (handles, handles_from_start) = d
         .selected
         .and_then(|s| form.find(s))
-        .map_or((false, false), resize_axes);
+        .map_or(((false, false), (false, false)), |n| {
+            (d.handles_of(n), resize_from_start(n))
+        });
     // The pages around the selection are the ones shown, and the menus around it are open.
     let open_menus = shown_parts(d, &form);
     let base_dir = d
@@ -2268,6 +2365,7 @@ fn canvas(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
         hovered: d.hovered,
         also: &also,
         handles,
+        handles_from_start,
         accent: pal.accent,
         stash_accesskit: !d.open_accesskit,
         pages: &d.tab_pages,
@@ -2281,6 +2379,7 @@ fn canvas(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
     d.client = Some(view.client());
     if pass.kept {
         d.rects = pass.rects;
+        d.insets = pass.insets;
         d.tab_buttons = pass.tab_buttons;
         let content = pass.content;
         if (content - d.content).length() > 0.5 {
@@ -2459,7 +2558,8 @@ fn resize_handles(
         d.cancel_resize();
         return active;
     };
-    let edges = resize_axes(node);
+    let edges = d.handles_of(node);
+    let from_start = resize_from_start(node);
     let rect = match (&d.resize, d.rects.get(&id)) {
         // The handles stay on the rect the drag started from until it ends.
         (Some(r), _) if r.id == id => r.start,
@@ -2480,7 +2580,10 @@ fn resize_handles(
             i.pointer.any_down(),
         )
     });
-    for (k, square) in preview::handle_rects(rect, edges).into_iter().enumerate() {
+    for (k, square) in preview::handle_rects(rect, edges, from_start)
+        .into_iter()
+        .enumerate()
+    {
         let Some(square) = square else { continue };
         if !area.intersects(square) {
             continue;
@@ -3374,6 +3477,14 @@ fn prompt_dialog(d: &mut Designer, ctx: &egui::Context) {
             format!("{} changed outside the designer", path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())),
             "The form file is not what the designer read. Overwrite it with the designer's edits, reload it (the designer's edits are dropped), or look at the difference first.".to_string(),
         ),
+        Prompt::IntoSourceChanged { form } => (
+            format!("The source of {form} has changed"),
+            "The .rs form body is not what the designer read, so Save into .rs would overwrite those changes. Keep the designer's form and go on to the confirmation, re-import the form from the .rs (the designer's version is replaced), or look at the difference first.".to_string(),
+        ),
+        Prompt::IntoSource(plan) => (
+            format!("Write the forms into {}?", file_name(&plan.path)),
+            into_source_detail(plan),
+        ),
     };
     let mut answer: Option<Option<Action>> = None;
     crate::style::dialog(ctx, "designer-conflict", None, 460.0, |ui| {
@@ -3404,6 +3515,20 @@ fn prompt_dialog(d: &mut Designer, ctx: &egui::Context) {
                             answer = Some(Some(Action::Reload));
                         }
                     }
+                    Prompt::IntoSourceChanged { form } => {
+                        if crate::style::primary_button(ui, "Keep mine").clicked() {
+                            answer = Some(Some(Action::KeepIntoSource(form.clone())));
+                        }
+                        if crate::style::secondary_button(ui, "Re-import").clicked() {
+                            answer = Some(Some(Action::Reimport(form.clone())));
+                        }
+                    }
+                    Prompt::IntoSource(plan) => {
+                        let label = format!("Write {}", file_name(&plan.path));
+                        if crate::style::primary_button(ui, &label).clicked() {
+                            answer = Some(Some(Action::WriteIntoSource(plan.clone())));
+                        }
+                    }
                 }
                 if crate::style::secondary_button(ui, "Cancel").clicked() {
                     answer = Some(None);
@@ -3423,6 +3548,39 @@ fn prompt_dialog(d: &mut Designer, ctx: &egui::Context) {
         Some(None) => d.prompt = None,
         None => {}
     }
+}
+
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+}
+
+/// The confirmation's text for "Save into .rs": which functions are replaced, what stays, and the
+/// form file and a changed source when they apply.
+pub fn into_source_detail(plan: &export::IntoSource) -> String {
+    let rs = file_name(&plan.path);
+    let mut text = format!(
+        "This overwrites {rs}, your source. Only the functions of {} are replaced (and, for new widgets, a state struct, a field and its initialisers are added); everything else stays byte for byte. Show diff shows every change.",
+        plan.forms.join(", ")
+    );
+    if plan.changed_since_read {
+        text.push_str(&format!(
+            "\n\n{rs} changed on disk since the designer read it, outside these forms. Those changes are kept; the difference is against {rs} as it is now."
+        ));
+    }
+    if !plan.skipped.is_empty() {
+        text.push_str(&format!(
+            "\n\nNot written, because {rs} doesn't have them: {}.",
+            plan.skipped.join(", ")
+        ));
+    }
+    if let Some(frm) = &plan.companion {
+        text.push_str(&format!(
+            "\n\n{} is not changed or deleted. It will be older than {rs}; the designer then shows {rs} until you Save to the form file again.",
+            file_name(frm)
+        ));
+    }
+    text
 }
 
 fn diff_window(d: &mut Designer, ctx: &egui::Context, pal: &Palette) {

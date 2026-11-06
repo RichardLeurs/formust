@@ -651,10 +651,17 @@ pub enum SizeTarget {
     Square(&'static str),
     /// `.fit_to_exact_size(egui::vec2(w, h))`, both axes at once (an Image).
     ExactSize,
+    /// A pair property, `.default_size(egui::vec2(w, h))` of a Window: only the dragged axes
+    /// change, the other keeps its written number.
+    Pair(&'static str),
 }
 
 /// The properties a resize of `node` writes, per axis; `None` on an axis that falls back to
 /// `ui.add_sized([w, h], ..)` when the widget has it, or can't be resized at all.
+///
+/// The sizes are those of the node's rect on the canvas, except for the body statements of a
+/// container with a margin (Frame, Group, Indent, CollapsingHeader): those size the body, and the
+/// designer takes the margin it measured off the dragged size first.
 pub fn resize_targets(node: &Node) -> (Option<SizeTarget>, Option<SizeTarget>) {
     use SizeTarget::*;
     match &node.kind {
@@ -689,63 +696,177 @@ pub fn resize_targets(node: &Node) -> (Option<SizeTarget>, Option<SizeTarget>) {
             // An image keeps its aspect ratio inside `.fit_to_exact_size(..)`, written as a pair.
             WidgetId::Image => (Some(ExactSize), Some(ExactSize)),
         },
-        NodeKind::Container {
-            def: ContainerId::ScrollArea,
-            ..
-        } => (Some(Float("max_width")), Some(Float("max_height"))),
-        // A layout with no margin of its own: its rect is its `Ui`'s, which the body's
-        // `ui.set_min_width(..)` and `ui.set_min_height(..)` grow. A frame, group or indent adds a
-        // margin around that `Ui`, so a drag would be off by it: their sizes are typed in.
-        NodeKind::Container { def, .. } if is_plain_layout(*def) => {
-            (Some(Float("set_min_width")), Some(Float("set_min_height")))
+        NodeKind::Container { def, props, .. } => {
+            let body = (Some(Float("set_min_width")), Some(Float("set_min_height")));
+            match def {
+                ContainerId::ScrollArea => (Some(Float("max_width")), Some(Float("max_height"))),
+                // A layout with no margin of its own: its rect is its `Ui`'s, which the body's
+                // `ui.set_min_width(..)` and `ui.set_min_height(..)` grow.
+                ContainerId::Horizontal
+                | ContainerId::HorizontalWrapped
+                | ContainerId::Vertical
+                | ContainerId::VerticalCentered
+                | ContainerId::HorizontalCentered
+                | ContainerId::HorizontalTop
+                | ContainerId::VerticalCenteredJustified
+                | ContainerId::CenteredAndJustified
+                | ContainerId::Scope
+                | ContainerId::WithLayout
+                | ContainerId::AddEnabledUi => body,
+                // Their body sits inside a margin (an indent's is to its left, outside its rect).
+                ContainerId::Group | ContainerId::Indent | ContainerId::CollapsingHeader => body,
+                // Only margins and a stroke the preview draws as at runtime: an expression margin
+                // (`egui::Margin::symmetric(8, 4)`) would put the drag off by what it adds.
+                ContainerId::Frame if frame_margins_known(props) => body,
+                ContainerId::Frame => (None, None),
+                // The panel's outer size, margins included, on the axis it grows along.
+                ContainerId::PanelLeft | ContainerId::PanelRight => match panel_size_prop(props) {
+                    Some(name) => (Some(Float(name)), None),
+                    None => (None, None),
+                },
+                ContainerId::PanelTop | ContainerId::PanelBottom => match panel_size_prop(props) {
+                    Some(name) => (None, Some(Float(name))),
+                    None => (None, None),
+                },
+                // `.height(h)`: the row's least height; it always takes the full width.
+                ContainerId::Sides => (None, Some(Float("height"))),
+                ContainerId::Window => window_targets(props),
+                // The central panel is what the other panels leave; the root is the preview's
+                // width (the canvas grip); a column, side, tab page, row or cell is sized by its
+                // holder; a grid by its cells (its column widths are per column); a menu button
+                // by its text (its body statements size the open menu); a menu bar takes the
+                // full width; a modal's preview frame has another margin than at runtime; a
+                // dialog helper's frame and size are the helper's own code; tabs and tables are
+                // written by hand with no overall size; control flow is locked code.
+                ContainerId::CentralPanel
+                | ContainerId::Root
+                | ContainerId::Grid
+                | ContainerId::Columns
+                | ContainerId::Column
+                | ContainerId::Side
+                | ContainerId::MenuButton
+                | ContainerId::MenuBar
+                | ContainerId::Modal
+                | ContainerId::DialogCall
+                | ContainerId::Tabs
+                | ContainerId::TabsVertical
+                | ContainerId::TabPage
+                | ContainerId::Table
+                | ContainerId::TableRow
+                | ContainerId::TableCell
+                | ContainerId::Flow
+                | ContainerId::FlowGroup => (None, None),
+            }
         }
-        NodeKind::Container { .. } | NodeKind::Custom { .. } => (None, None),
+        NodeKind::Custom { .. } => (None, None),
     }
 }
 
-/// A container whose rect is exactly its body's `Ui`.
-fn is_plain_layout(def: ContainerId) -> bool {
-    match def {
-        ContainerId::Horizontal
-        | ContainerId::HorizontalWrapped
-        | ContainerId::Vertical
-        | ContainerId::VerticalCentered
-        | ContainerId::HorizontalCentered
-        | ContainerId::HorizontalTop
-        | ContainerId::VerticalCenteredJustified
-        | ContainerId::CenteredAndJustified
-        | ContainerId::Scope
-        | ContainerId::WithLayout
-        | ContainerId::AddEnabledUi => true,
-        ContainerId::Root
-        | ContainerId::Grid
-        | ContainerId::ScrollArea
-        | ContainerId::CollapsingHeader
-        | ContainerId::Group
-        | ContainerId::Indent
-        | ContainerId::PanelTop
-        | ContainerId::PanelBottom
-        | ContainerId::PanelLeft
-        | ContainerId::PanelRight
-        | ContainerId::CentralPanel
-        | ContainerId::MenuButton
-        | ContainerId::Frame
-        | ContainerId::Columns
-        | ContainerId::Column
-        | ContainerId::Sides
-        | ContainerId::Side
-        | ContainerId::Window
-        | ContainerId::DialogCall
-        | ContainerId::Flow
-        | ContainerId::FlowGroup
-        | ContainerId::MenuBar
-        | ContainerId::Modal
-        | ContainerId::Tabs
-        | ContainerId::TabsVertical
-        | ContainerId::TabPage
-        | ContainerId::Table
-        | ContainerId::TableRow
-        | ContainerId::TableCell => false,
+/// Which edges carry the handles: `(left, top)` instead of `(right, bottom)`. A right panel grows
+/// leftwards and a bottom panel upwards, so their handle is on the edge towards the form.
+pub fn resize_from_start(node: &Node) -> (bool, bool) {
+    match &node.kind {
+        NodeKind::Container {
+            def: ContainerId::PanelRight,
+            ..
+        } => (true, false),
+        NodeKind::Container {
+            def: ContainerId::PanelBottom,
+            ..
+        } => (false, true),
+        _ => (false, false),
+    }
+}
+
+/// Does the designer take a measured margin off the dragged size before writing it (the body
+/// statements of a container whose rect is larger than its body)?
+pub fn resize_body_inset(node: &Node) -> bool {
+    matches!(
+        &node.kind,
+        NodeKind::Container {
+            def: ContainerId::Group
+                | ContainerId::Indent
+                | ContainerId::CollapsingHeader
+                | ContainerId::Frame,
+            ..
+        }
+    )
+}
+
+/// A Frame whose margins and stroke are plain numbers (or egui's own for its variant).
+fn frame_margins_known(props: &Props) -> bool {
+    let number = |name: &str| matches!(props.get(name), None | Some(PropValue::Float(_)));
+    number("inner_margin")
+        && number("outer_margin")
+        && matches!(props.get("stroke"), None | Some(PropValue::Stroke { .. }))
+}
+
+/// The panel property a drag writes: `exact_size` when the panel has a literal one, else
+/// `default_size` (its first size; `resizable` stays as written). `None` when an `exact_size`
+/// expression decides the size.
+fn panel_size_prop(props: &Props) -> Option<&'static str> {
+    match props.get("exact_size") {
+        None => Some("default_size"),
+        Some(PropValue::Float(_)) => Some("exact_size"),
+        Some(_) => None,
+    }
+}
+
+/// The range a panel's size is clamped to, from its literal `min_size`, `max_size` and
+/// `size_range` in the order egui applies them; open ends are infinite.
+pub fn panel_size_range(props: &Props) -> (f64, f64) {
+    let (mut lo, mut hi) = (f64::NEG_INFINITY, f64::INFINITY);
+    if let Some(PropValue::Float(v)) = props.get("min_size") {
+        lo = *v;
+        hi = hi.max(*v);
+    }
+    if let Some(PropValue::Float(v)) = props.get("max_size") {
+        hi = *v;
+        lo = lo.min(*v);
+    }
+    if let Some(PropValue::Expr(text)) = props.get("size_range")
+        && let Some((a, b)) = literal_range(text)
+    {
+        (lo, hi) = (a, b);
+    }
+    (lo, hi)
+}
+
+/// `10.0..=300.0` or `10.0..300.0` as its two numbers.
+pub fn literal_range(text: &str) -> Option<(f64, f64)> {
+    let (a, b) = text.split_once("..=").or_else(|| text.split_once(".."))?;
+    Some((number(a)?, number(b)?))
+}
+
+/// A Window's outer size, which egui 0.37 counts with its frame and title bar. The width is the
+/// window's at runtime: its title bar spans the width it is given. The height is only when a
+/// scroll area fills the window (`vscroll` or `hscroll`); otherwise egui sizes it to its content.
+/// `auto_sized` windows have no size; a pair that is no literal can't be rewritten one axis at a
+/// time.
+fn window_targets(props: &Props) -> (Option<SizeTarget>, Option<SizeTarget>) {
+    use SizeTarget::*;
+    if props.get("auto_sized") == Some(&PropValue::Bool(true)) {
+        return (None, None);
+    }
+    let scrolls = ["vscroll", "hscroll"]
+        .iter()
+        .any(|n| props.get(n) == Some(&PropValue::Bool(true)));
+    // `fixed_size` comes last in the chain, so it wins over `default_size`, which wins over
+    // `default_width` and `default_height`.
+    match ["fixed_size", "default_size"]
+        .into_iter()
+        .find(|n| props.contains_key(n))
+    {
+        Some(name) => match props.get(name) {
+            Some(PropValue::Expr(t)) if parse_vec2(t).is_some() => {
+                (Some(Pair(name)), scrolls.then_some(Pair(name)))
+            }
+            _ => (None, None),
+        },
+        None => (
+            Some(Float("default_width")),
+            scrolls.then_some(Float("default_height")),
+        ),
     }
 }
 
@@ -754,7 +875,8 @@ fn has_add_sized(node: &Node) -> bool {
     matches!(&node.kind, NodeKind::Widget { def, .. } if widget_def(*def).prop("add_sized").is_some())
 }
 
-/// Which edges of `node` can be dragged: (right, bottom).
+/// Which axes of `node` can be dragged: (width, height). The handles are on the right and bottom
+/// edges, or the left and top ones ([`resize_from_start`]).
 pub fn resize_axes(node: &Node) -> (bool, bool) {
     let (w, h) = resize_targets(node);
     let sized = has_add_sized(node);
@@ -789,13 +911,40 @@ impl Form {
             && (sized_set
                 || (req.change_width && wt.is_none())
                 || (req.change_height && ht.is_none()));
+        // A panel's first size is clamped by egui to its size range: written clamped, the number
+        // says what the panel shows.
+        let panel_range = match &node.kind {
+            NodeKind::Container { def, props, .. } if container_def(*def).is_panel => {
+                Some(panel_size_range(props))
+            }
+            _ => None,
+        };
+        // The number a pair keeps on the axis the drag leaves alone.
+        let pair_now = |name: &str| match &node.kind {
+            NodeKind::Container { props, .. } => match props.get(name) {
+                Some(PropValue::Expr(t)) => parse_vec2(t),
+                _ => None,
+            },
+            _ => None,
+        };
+        let pairs: Vec<(&'static str, Option<(f64, f64)>)> = [wt, ht]
+            .into_iter()
+            .flatten()
+            .filter_map(|t| match t {
+                SizeTarget::Pair(n) => Some((n, pair_now(n))),
+                _ => None,
+            })
+            .collect();
         let backup = self.clone();
         let path = self.egui_path.clone();
         let result = (|| {
             if use_sized {
                 for target in [wt, ht].into_iter().flatten() {
                     let name = match target {
-                        SizeTarget::Float(n) | SizeTarget::Rows(n) | SizeTarget::Square(n) => n,
+                        SizeTarget::Float(n)
+                        | SizeTarget::Rows(n)
+                        | SizeTarget::Square(n)
+                        | SizeTarget::Pair(n) => n,
                         SizeTarget::MinSize => "min_size",
                         SizeTarget::ExactSize => "fit_to_exact_size",
                     };
@@ -814,8 +963,21 @@ impl Form {
                 };
                 match target {
                     SizeTarget::Float(name) => {
+                        let value = match panel_range {
+                            Some((lo, hi)) if name == "default_size" => value.max(lo).min(hi),
+                            _ => value,
+                        };
                         self.set_prop(id, name, PropValue::Float(value))?;
                     }
+                    SizeTarget::Pair(name) if !min_size_done => {
+                        min_size_done = true;
+                        let now = pairs.iter().find(|(n, _)| *n == name).and_then(|(_, v)| *v);
+                        let (w0, h0) = now.unwrap_or((req.width, req.height));
+                        let w = if req.change_width { req.width } else { w0 };
+                        let h = if req.change_height { req.height } else { h0 };
+                        self.set_prop(id, name, PropValue::Expr(vec2_text(&path, w, h)))?;
+                    }
+                    SizeTarget::Pair(_) => {}
                     SizeTarget::Rows(name) => {
                         let rows = req.rows.unwrap_or(1).max(1);
                         self.set_prop(id, name, PropValue::Int(rows))?;
@@ -1357,7 +1519,7 @@ mod tests {
         let text = add(&mut form, root, WidgetId::TextEditMultiline);
         let label = add(&mut form, root, WidgetId::Label);
         let button = add(&mut form, root, WidgetId::Button);
-        let heading = add(&mut form, root, WidgetId::Heading);
+        let strong = add(&mut form, root, WidgetId::Strong);
         let req = |w: f64, h: f64, cw: bool, ch: bool| SizeRequest {
             width: w,
             height: h,
@@ -1379,7 +1541,8 @@ mod tests {
             props_of(&form, button).get("min_size"),
             Some(&PropValue::Expr("egui::vec2(80.0, 30.0)".into()))
         );
-        assert_eq!(resize_axes(form.find(heading).unwrap()), (false, false));
+        // Strong text has no sized form (it would read back as a bold Label).
+        assert_eq!(resize_axes(form.find(strong).unwrap()), (false, false));
         // A filled button sized with the mouse gets a fixed add_sized, and its min_size goes.
         form.set_fill(button, true).unwrap();
         form.resize(button, req(90.0, 30.0, true, false)).unwrap();
@@ -1396,6 +1559,272 @@ mod tests {
         );
         form.reset_size(text).unwrap();
         assert!(!props_of(&form, text).contains_key("desired_rows"));
+    }
+
+    fn req(w: f64, h: f64, cw: bool, ch: bool) -> SizeRequest {
+        SizeRequest {
+            width: w,
+            height: h,
+            rows: None,
+            change_width: cw,
+            change_height: ch,
+        }
+    }
+
+    fn add_container(form: &mut Form, parent: NodeId, def: ContainerId) -> NodeId {
+        let node = form.new_container(def);
+        let id = node.id;
+        form.insert(parent, usize::MAX, node).unwrap();
+        id
+    }
+
+    /// Every widget and container has handles exactly where a size can be written: the audit as a
+    /// table, so a change to it is a deliberate one.
+    #[test]
+    fn the_resize_axes_of_every_registry_entry() {
+        use crate::registry::{ALL_CONTAINERS, ALL_WIDGETS};
+        let mut form = Form::new("F", "ui");
+        let none = [
+            WidgetId::Strong,
+            WidgetId::Monospace,
+            WidgetId::ToggleValue,
+            WidgetId::RadioValue,
+            WidgetId::SelectableValue,
+            WidgetId::AddSpace,
+            WidgetId::EndRow,
+            WidgetId::ColorEdit,
+            WidgetId::ColorEditRgb,
+        ];
+        for &w in ALL_WIDGETS {
+            let node = form.new_widget(w);
+            let want = if none.contains(&w) {
+                (false, false)
+            } else if w == WidgetId::ComboBox {
+                // `.width(..)`; its height is egui's.
+                (true, false)
+            } else {
+                (true, true)
+            };
+            assert_eq!(resize_axes(&node), want, "{w:?}");
+        }
+        for &c in ALL_CONTAINERS {
+            let node = form.new_container(c);
+            let want = match c {
+                ContainerId::PanelLeft | ContainerId::PanelRight => (true, false),
+                ContainerId::PanelTop | ContainerId::PanelBottom => (false, true),
+                ContainerId::Sides => (false, true),
+                // Only the width, until a scroll area fills its height.
+                ContainerId::Window => (true, false),
+                ContainerId::Horizontal
+                | ContainerId::HorizontalWrapped
+                | ContainerId::Vertical
+                | ContainerId::VerticalCentered
+                | ContainerId::HorizontalCentered
+                | ContainerId::HorizontalTop
+                | ContainerId::VerticalCenteredJustified
+                | ContainerId::CenteredAndJustified
+                | ContainerId::Scope
+                | ContainerId::WithLayout
+                | ContainerId::AddEnabledUi
+                | ContainerId::ScrollArea
+                | ContainerId::Group
+                | ContainerId::Indent
+                | ContainerId::CollapsingHeader
+                | ContainerId::Frame => (true, true),
+                _ => (false, false),
+            };
+            assert_eq!(resize_axes(&node), want, "{c:?}");
+            assert_eq!(
+                resize_from_start(&node),
+                match c {
+                    ContainerId::PanelRight => (true, false),
+                    ContainerId::PanelBottom => (false, true),
+                    _ => (false, false),
+                },
+                "{c:?}"
+            );
+        }
+    }
+
+    /// A panel's drag writes its first size (`default_size`), or its `exact_size` when it has one,
+    /// clamped to its literal size range; `resizable` is left as written.
+    #[test]
+    fn a_panel_resize_writes_its_default_or_exact_size() {
+        let mut form = Form::new("F", "ui");
+        let root = form.root.id;
+        let left = add_container(&mut form, root, ContainerId::PanelLeft);
+        let bottom = add_container(&mut form, root, ContainerId::PanelBottom);
+        form.set_prop(left, "resizable", PropValue::Bool(false))
+            .unwrap();
+        form.resize(left, req(220.0, 500.0, true, false)).unwrap();
+        let p = props_of(&form, left);
+        assert_eq!(p.get("default_size"), Some(&PropValue::Float(220.0)));
+        assert_eq!(p.get("resizable"), Some(&PropValue::Bool(false)));
+        assert_eq!(p.len(), 3, "the id, resizable and the size: {p:?}");
+        // Clamped to the size range egui would clamp it to.
+        form.set_prop(left, "max_size", PropValue::Float(300.0))
+            .unwrap();
+        form.resize(left, req(400.0, 500.0, true, false)).unwrap();
+        assert_eq!(
+            props_of(&form, left).get("default_size"),
+            Some(&PropValue::Float(300.0))
+        );
+        form.set_prop(left, "size_range", PropValue::Expr("120.0..=260.0".into()))
+            .unwrap();
+        form.resize(left, req(40.0, 500.0, true, false)).unwrap();
+        assert_eq!(
+            props_of(&form, left).get("default_size"),
+            Some(&PropValue::Float(120.0))
+        );
+        // A bottom panel: its height; an exact size stays exact.
+        form.set_prop(bottom, "exact_size", PropValue::Float(40.0))
+            .unwrap();
+        form.resize(bottom, req(600.0, 64.0, false, true)).unwrap();
+        let p = props_of(&form, bottom);
+        assert_eq!(p.get("exact_size"), Some(&PropValue::Float(64.0)));
+        assert!(!p.contains_key("default_size"));
+        // An exact size that is an expression decides the size: no handles.
+        form.set_prop(bottom, "exact_size", PropValue::Expr("self.h".into()))
+            .unwrap();
+        assert_eq!(resize_axes(form.find(bottom).unwrap()), (false, false));
+        form.reset_size(left).unwrap();
+        assert_eq!(
+            props_of(&form, left).len(),
+            2,
+            "the id and resizable are left"
+        );
+        assert_eq!(literal_range("10..20.5"), Some((10.0, 20.5)));
+        assert_eq!(literal_range("self.r"), None);
+    }
+
+    /// A Window's width is `default_width`, or the dragged axis of its `default_size` or
+    /// `fixed_size` pair; its height only when a scroll area fills it.
+    #[test]
+    fn a_window_resize_writes_its_outer_size() {
+        let mut form = Form::new("D", "show");
+        form.context_root = true;
+        let root = form.root.id;
+        let window = add_container(&mut form, root, ContainerId::Window);
+        form.resize(window, req(380.0, 200.0, true, false)).unwrap();
+        assert_eq!(
+            props_of(&form, window).get("default_width"),
+            Some(&PropValue::Float(380.0))
+        );
+        form.set_prop(window, "vscroll", PropValue::Bool(true))
+            .unwrap();
+        assert_eq!(resize_axes(form.find(window).unwrap()), (true, true));
+        form.resize(window, req(380.0, 260.0, true, true)).unwrap();
+        assert_eq!(
+            props_of(&form, window).get("default_height"),
+            Some(&PropValue::Float(260.0))
+        );
+        // A pair keeps the number on the axis the drag leaves alone.
+        form.set_prop(
+            window,
+            "default_size",
+            PropValue::Expr("[300.0, 150.0]".into()),
+        )
+        .unwrap();
+        form.resize(window, req(410.0, 999.0, true, false)).unwrap();
+        assert_eq!(
+            props_of(&form, window).get("default_size"),
+            Some(&PropValue::Expr("egui::vec2(410.0, 150.0)".into()))
+        );
+        form.set_prop(
+            window,
+            "fixed_size",
+            PropValue::Expr("egui::vec2(200.0, 100.0)".into()),
+        )
+        .unwrap();
+        form.resize(window, req(999.0, 120.0, false, true)).unwrap();
+        let p = props_of(&form, window);
+        assert_eq!(
+            p.get("fixed_size"),
+            Some(&PropValue::Expr("egui::vec2(200.0, 120.0)".into()))
+        );
+        assert_eq!(
+            p.get("default_size"),
+            Some(&PropValue::Expr("egui::vec2(410.0, 150.0)".into())),
+            "the pair that loses to fixed_size is left alone"
+        );
+        form.set_prop(window, "fixed_size", PropValue::Expr("self.size".into()))
+            .unwrap();
+        assert_eq!(resize_axes(form.find(window).unwrap()), (false, false));
+        form.clear_prop(window, "fixed_size").unwrap();
+        form.set_prop(window, "auto_sized", PropValue::Bool(true))
+            .unwrap();
+        assert_eq!(resize_axes(form.find(window).unwrap()), (false, false));
+        form.reset_size(window).unwrap();
+        let p = props_of(&form, window);
+        for name in ["default_width", "default_height", "default_size"] {
+            assert!(!p.contains_key(name), "{name}");
+        }
+    }
+
+    /// A Frame, Group, Indent and CollapsingHeader write their body's least size (the designer
+    /// takes the margin off first); a Frame whose margin is an expression has no handles. Sides
+    /// write their height.
+    #[test]
+    fn framed_containers_and_sides_resize_their_body() {
+        let mut form = Form::new("F", "ui");
+        let root = form.root.id;
+        for def in [
+            ContainerId::Frame,
+            ContainerId::Group,
+            ContainerId::Indent,
+            ContainerId::CollapsingHeader,
+        ] {
+            let c = add_container(&mut form, root, def);
+            assert!(resize_body_inset(form.find(c).unwrap()), "{def:?}");
+            form.resize(c, req(150.0, 60.0, true, true)).unwrap();
+            let p = props_of(&form, c);
+            assert_eq!(
+                p.get("set_min_width"),
+                Some(&PropValue::Float(150.0)),
+                "{def:?}"
+            );
+            assert_eq!(
+                p.get("set_min_height"),
+                Some(&PropValue::Float(60.0)),
+                "{def:?}"
+            );
+        }
+        let frame = add_container(&mut form, root, ContainerId::Frame);
+        form.set_prop(frame, "inner_margin", PropValue::Float(8.0))
+            .unwrap();
+        assert_eq!(resize_axes(form.find(frame).unwrap()), (true, true));
+        form.set_prop(
+            frame,
+            "inner_margin",
+            PropValue::Expr("egui::Margin::symmetric(8, 4)".into()),
+        )
+        .unwrap();
+        assert_eq!(resize_axes(form.find(frame).unwrap()), (false, false));
+        let sides = add_container(&mut form, root, ContainerId::Sides);
+        assert!(!resize_body_inset(form.find(sides).unwrap()));
+        form.resize(sides, req(500.0, 36.0, false, true)).unwrap();
+        assert_eq!(
+            props_of(&form, sides).get("height"),
+            Some(&PropValue::Float(36.0))
+        );
+    }
+
+    /// Heading, Small and Weak are sized with `add_sized`, as a Label is.
+    #[test]
+    fn the_heading_family_resizes_with_add_sized() {
+        let mut form = Form::new("F", "ui");
+        let root = form.root.id;
+        for def in [WidgetId::Heading, WidgetId::Small, WidgetId::Weak] {
+            let id = add(&mut form, root, def);
+            form.resize(id, req(160.0, 32.0, true, false)).unwrap();
+            assert_eq!(
+                props_of(&form, id).get("add_sized"),
+                Some(&PropValue::Expr("[160.0, 32.0]".into())),
+                "{def:?}"
+            );
+            form.reset_size(id).unwrap();
+            assert!(!props_of(&form, id).contains_key("add_sized"));
+        }
     }
 
     /// A `with_layout` with spacing or size statements is no anchor: removing it as one would lose

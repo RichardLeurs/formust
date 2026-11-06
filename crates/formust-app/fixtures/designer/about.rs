@@ -130,7 +130,7 @@ fn icon(ctx: &egui::Context) -> egui::TextureHandle {
     if let Some(t) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
         return t;
     }
-    let img = image::load_from_memory(include_bytes!("../assets/formust-icon.png"))
+    let img = image::load_from_memory(include_bytes!("../../assets/formust-icon.png"))
         .expect("the embedded icon is a PNG");
     let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];

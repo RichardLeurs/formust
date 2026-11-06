@@ -3,7 +3,8 @@
 //! one runs the copy after its source changed, one shows a free dialog, one starts a dialog open that
 //! its flag keeps closed, one runs a free `fn(ui)` under the caret, and Run on a Rust file with a
 //! form starts Run Form (in the designer or in code view), Run on a Rust file with no form runs the
-//! project's own program. Also the cleaning of old program folders.
+//! project's own program. Also the cleaning of old program folders, and Live Run rebuilding after an
+//! edit (headless), its failed build placed in the form file.
 
 use super::*;
 use formust_build::Event;
@@ -464,6 +465,87 @@ fn the_main_program_runs_the_headless_frame_or_the_window() {
     assert!(main.contains("owner::formust_run::app()"), "{main}");
 }
 
+/// The window has no native title bar but keeps its buttons; the program draws a strip of the
+/// native bar's height in its place, with the title, the window drag and the Light/Dark switch, and
+/// the form below it. Its start theme comes from the environment.
+#[test]
+fn the_main_program_draws_a_title_strip_with_a_theme_switch() {
+    let main = main_rs("Login::ui");
+    for needle in [
+        ".with_fullsize_content_view(true)",
+        ".with_titlebar_shown(false)",
+        ".with_title_shown(false)",
+        ".with_titlebar_buttons_shown(true)",
+        "egui::Panel::top(\"formust_title_strip\")",
+        "const STRIP: f32 = 28.0;",
+        "const TITLE: &str = \"Login::ui\";",
+        "egui::ViewportCommand::StartDrag",
+        "egui::ViewportCommand::Maximized(!maximized)",
+        "selectable_label(current == egui::Theme::Dark, \"Dark\")",
+        "selectable_label(current == egui::Theme::Light, \"Light\")",
+        "ui.ctx().set_theme(theme);",
+        "cc.egui_ctx.set_theme(start_theme());",
+        "strip(ui);\n        self.form.ui(ui, frame);",
+        "headless_strip();",
+    ] {
+        assert!(main.contains(needle), "{needle} is missing:\n{main}");
+    }
+    // The program reads the same variables and prints the same line as the IDE expects.
+    assert!(main.contains(&format!("std::env::var(\"{THEME_VAR}\")")));
+    assert!(main.contains(&format!("std::env::var_os(\"{THEME_REPORT_VAR}\")")));
+    assert!(main.contains(&format!("println!(\"{THEME_LINE}{{}}\"")));
+    for theme in [RunTheme::Light, RunTheme::Dark] {
+        assert!(main.contains(&format!("\"{}\" =>", theme.as_str())));
+    }
+    // A title that needs escaping stays one string literal.
+    assert!(main_rs("A \"quoted\" form").contains(r#"const TITLE: &str = "A \"quoted\" form";"#));
+}
+
+/// The theme variable: light, dark or system, whatever the case and spaces; anything else is unknown
+/// (the program then follows the system). A reported line gives its theme; other lines none.
+#[test]
+fn the_theme_variable_and_the_reported_line_are_read() {
+    assert_eq!(RunTheme::parse("light"), Some(RunTheme::Light));
+    assert_eq!(RunTheme::parse(" Dark\n"), Some(RunTheme::Dark));
+    assert_eq!(RunTheme::parse("SYSTEM"), Some(RunTheme::System));
+    assert_eq!(RunTheme::parse(""), None);
+    assert_eq!(RunTheme::parse("dim"), None);
+    for theme in [RunTheme::Light, RunTheme::Dark, RunTheme::System] {
+        assert_eq!(RunTheme::parse(theme.as_str()), Some(theme));
+    }
+    assert_eq!(
+        RunTheme::from_line("formust-theme: dark"),
+        Some(RunTheme::Dark)
+    );
+    assert_eq!(
+        RunTheme::from_line("formust-theme: light"),
+        Some(RunTheme::Light)
+    );
+    assert_eq!(RunTheme::from_line("theme: dark"), None);
+    assert_eq!(RunTheme::from_line("formust-theme: dim"), None);
+    assert_eq!(RunTheme::from_line("drawn: Dark | Light"), None);
+}
+
+/// The window starts in the canvas's theme: its own choice, else the IDE's, which it follows.
+#[test]
+fn the_window_starts_in_the_canvas_theme() {
+    assert_eq!(RunTheme::of_canvas(Some(true), false), RunTheme::Dark);
+    assert_eq!(RunTheme::of_canvas(Some(false), true), RunTheme::Light);
+    assert_eq!(RunTheme::of_canvas(None, true), RunTheme::Dark);
+    assert_eq!(RunTheme::of_canvas(None, false), RunTheme::Light);
+    let mut app = crate::App::bare(None);
+    let ctx = egui::Context::default();
+    ctx.set_visuals(egui::Visuals::light());
+    app.designer.dark = None;
+    assert_eq!(app.canvas_theme(&ctx), RunTheme::Light, "follows the IDE");
+    app.designer.dark = Some(true);
+    assert_eq!(
+        app.canvas_theme(&ctx),
+        RunTheme::Dark,
+        "the canvas's own choice"
+    );
+}
+
 #[test]
 fn a_source_whose_type_has_no_default_is_refused_at_its_impl_line() {
     let owner = format!("// the login form\n{LOGIN}");
@@ -738,6 +820,8 @@ fn the_headless_run_draws_an_unsaved_designer_edit() {
     plan.request
         .env
         .push(("FORMUST_RUN_FORM_TEST".into(), "1".into()));
+    let mut dark = plan.request.clone();
+    plan.request.env.push((THEME_VAR.into(), "light".into()));
     let (stdout, outcome) = run_to_end(plan.request);
     assert!(
         outcome.result.success,
@@ -745,6 +829,36 @@ fn the_headless_run_draws_an_unsaved_designer_edit() {
         outcome.result.raw_output
     );
     assert_eq!(outcome.code, Some(0), "{stdout:?}");
+    // The title strip: the title and the switch, in the theme asked for; a click on its other side
+    // switches the theme.
+    let line = |prefix: &str, stdout: &[String]| {
+        stdout
+            .iter()
+            .find(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix:?} line: {stdout:?}"))
+            .clone()
+    };
+    let strip = line("strip: ", &stdout);
+    assert!(
+        strip.contains("Login::ui") && strip.contains("Light") && strip.contains("Dark"),
+        "{strip}"
+    );
+    assert_eq!(line("theme: ", &stdout), "theme: light");
+    assert_eq!(
+        line("theme after a click: ", &stdout),
+        "theme after a click: dark"
+    );
+    assert!(
+        !stdout.iter().any(|l| l.starts_with(THEME_LINE)),
+        "Run Form does not ask for the theme report: {stdout:?}"
+    );
+    dark.env.push((THEME_VAR.into(), "dark".into()));
+    let (dark_out, _) = run_to_end(dark);
+    assert_eq!(line("theme: ", &dark_out), "theme: dark");
+    assert_eq!(
+        line("theme after a click: ", &dark_out),
+        "theme after a click: light"
+    );
     let drawn = stdout
         .iter()
         .find(|l| l.starts_with("drawn: "))
@@ -1110,4 +1224,121 @@ fn a_free_ui_function_under_the_caret_runs_through_cargo_headless() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert!(app.building.is_none(), "Stop ends the run");
+}
+
+/// Polls Live Run until its (headless) program has drawn its frame and ended: the `drawn:` line.
+fn live_drawn(app: &mut crate::App, ctx: &egui::Context) -> String {
+    let started = std::time::Instant::now();
+    while !app.console.contains("The Live Run window closed")
+        && started.elapsed() < std::time::Duration::from_secs(900)
+    {
+        app.poll_live(ctx);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    app.console
+        .lines()
+        .find(|l| l.starts_with("drawn: "))
+        .unwrap_or_else(|| panic!("no drawn line:\n{}", app.console))
+        .to_string()
+}
+
+/// Live Run through cargo, headless: the first build draws the saved label; an edit of the label
+/// in the designer rebuilds the program after the quiet time, and the new program draws the new
+/// text. Nothing is written in the project.
+#[test]
+fn live_run_rebuilds_after_an_edit_through_cargo_headless() {
+    let dir = form_project("live");
+    let file = dir.join("src/login.rs");
+    let mut app = designer_app(&file);
+    // The canvas is light: the first window starts light.
+    app.designer.dark = Some(false);
+    let ctx = egui::Context::default();
+    let mut live = live::Live::new(file.clone());
+    live.target = Some(shared_target());
+    live.cargo_args.push("--offline".into());
+    live.child_env
+        .push(("FORMUST_RUN_FORM_TEST".into(), "1".into()));
+    app.start_live(&ctx, live);
+    assert!(
+        app.live_on() && app.live_busy(),
+        "the first build starts at once"
+    );
+    assert!(
+        !app.working(),
+        "Live Run is not a Run: Check and Build stay"
+    );
+    let first = live_drawn(&mut app, &ctx);
+    assert!(first.contains("Name") && first.contains("Go"), "{first}");
+    assert!(app.console.contains("rebuilt in"), "{}", app.console);
+    // The headless window starts in the canvas's theme and its switch is clicked to dark: it
+    // reports that, and the report stays out of Output.
+    assert!(app.console.contains("\ntheme: light\n"), "{}", app.console);
+    assert!(
+        app.console.contains("\ntheme after a click: dark\n"),
+        "{}",
+        app.console
+    );
+    assert!(!app.console.contains(THEME_LINE), "{}", app.console);
+
+    let form = app.designer.current().unwrap().form().clone();
+    let mut label = None;
+    form.root.walk(&mut |n| {
+        if let NodeKind::Widget {
+            def: WidgetId::Label,
+            ..
+        } = &n.kind
+        {
+            label.get_or_insert(n.id);
+        }
+    });
+    let label = label.expect("the form has a label");
+    app.designer
+        .edit(None, |f| {
+            f.set_prop(label, "text", PropValue::Text("Edited live".into()))
+        })
+        .unwrap();
+    app.console.clear();
+    let second = live_drawn(&mut app, &ctx);
+    assert!(second.contains("Edited live"), "{second}");
+    // The next window starts in the theme chosen in the last one, not the canvas's.
+    assert!(app.console.contains("\ntheme: dark\n"), "{}", app.console);
+    assert!(!second.contains("Name"), "{second}");
+    assert!(app.live_on(), "Live Run stays on after its window closed");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        LOGIN_SOURCE,
+        "the source is not written"
+    );
+
+    // An edit that does not compile: the build fails, its error is placed in the form file, and
+    // Live Run stays on for the next change.
+    app.designer
+        .edit(None, |f| {
+            f.set_prop(label, "text", PropValue::Expr("no_such_value".into()))
+        })
+        .unwrap();
+    app.console.clear();
+    let started = std::time::Instant::now();
+    while !app.console.contains("keeps the last build that worked")
+        && started.elapsed() < std::time::Duration::from_secs(900)
+    {
+        app.poll_live(&ctx);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        app.console.contains("keeps the last build that worked"),
+        "{}",
+        app.console
+    );
+    let error = app
+        .diagnostics
+        .iter()
+        .find(|d| d.severity == formust_build::Severity::Error)
+        .expect("the build's error is in Problems");
+    assert_eq!(error.file, dir.join("src/login.frm.rs"), "{error:?}");
+    assert!(error.line > 0, "{error:?}");
+    assert!(app.live_on() && !app.live_busy());
+
+    app.stop_cargo();
+    assert!(!app.live_on(), "Stop turns Live Run off");
 }

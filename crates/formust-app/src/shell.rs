@@ -119,6 +119,7 @@ impl App {
         self.poll_assistant(ctx);
         self.poll_external(ctx);
         self.sync_designer(false);
+        self.poll_live(ctx);
         self.run_menu_actions(ctx);
         if frame.is_some() {
             chrome::align_window_buttons(TOOLBAR_H.into());
@@ -267,6 +268,7 @@ impl App {
                 MenuAction::ToggleAssistant => self.toggle_assistant(),
                 MenuAction::Open => self.pick_file(),
                 MenuAction::Save => self.save_active(),
+                MenuAction::SaveIntoSource => self.save_into_source(),
                 MenuAction::Format => self.format_active(true),
                 MenuAction::Check => self.start_cargo(ctx, Action::Check),
                 MenuAction::Build => self.start_cargo(ctx, Action::Build),
@@ -288,7 +290,9 @@ impl App {
 
     /// One line saying what the IDE is doing, and its colour.
     pub(crate) fn activity(&self, pal: &Palette) -> (String, egui::Color32) {
-        if self.working() {
+        if self.live_busy() && !self.working() {
+            ("Live Run: building...".into(), pal.accent)
+        } else if self.working() {
             let label = match (&self.form_prep, &self.build_progress) {
                 (Some(_), _) => "Preparing Run Form...",
                 (None, Some(p)) => p.label.as_str(),
@@ -404,6 +408,30 @@ impl App {
                                 && can_build
                             {
                                 self.run_active(ctx);
+                            }
+                        }
+                        // Live Run: on while a form's window follows the edits.
+                        let live = self.live_on();
+                        if run_form || live {
+                            let text = RichText::new("Live").size(12.0).color(if live {
+                                pal.text
+                            } else {
+                                pal.text_secondary
+                            });
+                            let tip = if live {
+                                "Live Run is on: each change rebuilds the form's program and swaps its window. Click (or Stop) to turn it off."
+                            } else {
+                                "Live Run: rebuild and relaunch the form's window 0.5 s after each change"
+                            };
+                            if hover(
+                                ui.add(
+                                    egui::Button::selectable(live, text).min_size(vec2(0.0, 22.0)),
+                                ),
+                                tip,
+                            )
+                            .clicked()
+                            {
+                                self.toggle_live(ctx);
                             }
                         }
                     });

@@ -805,6 +805,31 @@ fn plain_widget_call(
             args_text(args, wdef.props, props, cx)
         );
     }
+    // A sized heading, small or weak text: `egui::Label::new(egui::RichText::new(t).heading())`,
+    // which `ui.heading(t)` is, inside `ui.add_sized(..)` (see `forms::text_style`).
+    if let Some(style) = forms::text_style(def)
+        && props.contains_key("add_sized")
+    {
+        let built = |ui: &str| {
+            let cx = &Cx { ui, ..*cx };
+            let text = wdef
+                .prop("text")
+                .and_then(|d| {
+                    let v = props
+                        .get("text")
+                        .cloned()
+                        .or_else(|| d.default.to_value())?;
+                    Some(value_text(&v, d.kind, cx))
+                })
+                .unwrap_or_default();
+            let rich = rich_chain(wdef.props, props, cx);
+            format!(
+                "{p}Label::new({p}RichText::new({text}){rich}.{style}())",
+                p = cx.path
+            )
+        };
+        return wrap_add(&built, wdef.props, props, ident, cx);
+    }
     let Some((ty, ctors)) = shapes.builder else {
         // Only widgets with no builder arrive here, and they have no chain methods to lose. Enabled
         // and visible wrap the shorthand in a `Ui` of its own.

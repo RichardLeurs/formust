@@ -1,6 +1,6 @@
 //! Export: the designer's forms to their `.frm.rs`, a standalone copy of the `.rs` with the forms in
 //! it (`formust_rust::copy`). The first save copies the `.rs`; later saves patch the copy, so what
-//! the user wrote in it stays. The `.rs` is never written and never refers to the copy. Before
+//! the user wrote in it stays. Save never writes the `.rs`, which never refers to the copy. Before
 //! writing, two checks can stop the export and ask the user:
 //!
 //! - **The source changed:** a form's source body no longer has the token hash the form is based on
@@ -11,6 +11,12 @@
 //!   difference.
 //!
 //! A `.frm.rs` that doesn't parse is never overwritten (`formust_rust::write_frm` refuses too).
+//!
+//! "Save into .rs" is a separate action, never what Save does: [`plan_into_source`] makes the `.rs`
+//! with the forms in it (the copy's text without header lines) and refuses or asks as above (unsaved
+//! text in the `.rs` tab, a changed form body); the app always asks for a confirmation, which can
+//! show the difference, and [`write_into_source`] writes it only while the disk still has the text
+//! the plan was made from. The form file is left as it is.
 
 use std::path::{Path, PathBuf};
 
@@ -30,6 +36,43 @@ pub enum Prompt {
     SourceChanged { form: String },
     /// The form file is not what the designer read.
     FormFileChanged { path: PathBuf },
+    /// "Save into .rs": the source body of `form` changed since the designer read it. The user
+    /// keeps the designer's form (and goes on to the confirmation), re-imports it, or looks first.
+    IntoSourceChanged { form: String },
+    /// "Save into .rs": the confirmation, with what would be written.
+    IntoSource(IntoSource),
+}
+
+/// What "Save into .rs" would write: the `.rs` with the designer's forms in it, the same text the
+/// `.frm.rs` copy has, without its header lines (`formust_rust::update_source`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntoSource {
+    /// The `.rs`.
+    pub path: PathBuf,
+    /// Its text on disk now; the write refuses when the disk no longer has exactly this.
+    pub old: String,
+    pub new: String,
+    /// The source ids of the forms whose functions are replaced.
+    pub forms: Vec<String>,
+    /// Forms the `.rs` doesn't have (only in the form file): not written.
+    pub skipped: Vec<String>,
+    /// The `.rs` on disk is not the text the designer read (the forms' bodies are; that is checked
+    /// before): the confirmation says so.
+    pub changed_since_read: bool,
+    /// The form file beside the `.rs`, if there is one. It is not written or deleted.
+    pub companion: Option<PathBuf>,
+}
+
+/// What "Save into .rs" can do now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IntoSourceOutcome {
+    /// Nothing to write; the text says why.
+    Nothing(String),
+    /// Ask before writing (always: this overwrites the user's source).
+    Confirm(IntoSource),
+    /// A form's source body changed since it was read: ask first.
+    Ask(Prompt),
+    Failed(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -285,6 +328,119 @@ pub fn export(
     }
 }
 
+/// "Save into .rs", first step: what writing the designer's forms into the `.rs` of `loaded` would
+/// do. Nothing is written here. `disk` reads a file from the disk (not from a tab), `tab_unsaved`
+/// says the `.rs` has unsaved text in its tab.
+///
+/// Refused: a load that isn't a `.rs` (a `.frm.rs` tab, a file with an error), unsaved text in the
+/// `.rs` tab, a `.rs` that can't be read or doesn't parse, and forms the `.rs` can't take (see
+/// `formust_rust::update_source`). A form whose source body changed since the designer read it asks
+/// first ([`Prompt::IntoSourceChanged`]). Forms the `.rs` already has as the designer has them are
+/// left out, and so are forms only the form file has.
+pub fn plan_into_source(
+    loaded: &Loaded,
+    disk: &dyn Fn(&Path) -> Option<String>,
+    tab_unsaved: bool,
+) -> IntoSourceOutcome {
+    let name = |p: &Path| {
+        p.file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+    };
+    let rs = name(&loaded.path);
+    if let Some(e) = &loaded.error {
+        return IntoSourceOutcome::Failed(e.clone());
+    }
+    if file_kind(&loaded.path) != FileKind::Source {
+        return IntoSourceOutcome::Failed(format!(
+            "{rs} is not a .rs source; open the .rs in the designer to save its forms into it"
+        ));
+    }
+    if loaded.forms.is_empty() {
+        return IntoSourceOutcome::Nothing(format!("{rs} has no forms"));
+    }
+    if tab_unsaved {
+        return IntoSourceOutcome::Failed(format!(
+            "{rs} has unsaved changes in the code editor; save or revert them first"
+        ));
+    }
+    let Some(old) = disk(&loaded.path) else {
+        return IntoSourceOutcome::Failed(format!("{rs} can't be read"));
+    };
+    let source = match formust_rust::import(&old) {
+        Ok(s) => s,
+        Err(e) => {
+            return IntoSourceOutcome::Failed(format!(
+                "{rs} doesn't parse at line {}, column {}: {}",
+                e.line, e.column, e.message
+            ));
+        }
+    };
+    let mut forms: Vec<(Form, Option<Header>)> = Vec::new();
+    let mut skipped = Vec::new();
+    for f in &loaded.forms {
+        let id = f.source_id();
+        let Some(now) = source.form(&id) else {
+            skipped.push(id);
+            continue;
+        };
+        if formust_rust::emit_fn(f.form()) == formust_rust::emit_fn(&now.form) {
+            continue;
+        }
+        if let Some(base) = f.base_hash()
+            && base != now.src_hash
+        {
+            return IntoSourceOutcome::Ask(Prompt::IntoSourceChanged { form: id });
+        }
+        forms.push((f.form().clone(), f.header.clone()));
+    }
+    let nothing = || {
+        IntoSourceOutcome::Nothing(format!(
+            "{rs} already has the designer's forms; nothing to write"
+        ))
+    };
+    if forms.is_empty() {
+        return nothing();
+    }
+    let update = match formust_rust::update_source(&old, &forms) {
+        Ok(u) => u,
+        Err(e) => return IntoSourceOutcome::Failed(format!("{rs}: {e}")),
+    };
+    if update.written.is_empty() {
+        return nothing();
+    }
+    let changed_since_read = loaded.stale || loaded.source_seen != Some(super::text_hash(&old));
+    let companion = loaded
+        .companion
+        .clone()
+        .filter(|c| file_kind(c) == FileKind::Form)
+        .or_else(|| form_path_for(&loaded.path, |p| p.exists()).map(|f| f.path))
+        .filter(|p| p.exists());
+    IntoSourceOutcome::Confirm(IntoSource {
+        path: loaded.path.clone(),
+        old,
+        new: update.text,
+        forms: update.written,
+        skipped,
+        changed_since_read,
+        companion,
+    })
+}
+
+/// "Save into .rs", after the confirmation: writes `plan.new` over the `.rs`, atomically, only while
+/// the disk still has exactly `plan.old` (`formust_rust::write_source`).
+pub fn write_into_source(plan: &IntoSource) -> Result<(), String> {
+    let name = plan
+        .path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    formust_rust::write_source(&plan.path, &plan.old, &plan.new).map_err(|e| match e {
+        formust_rust::SourceWriteError::ChangedOnDisk => format!(
+            "{name} changed on disk after the confirmation; it was not overwritten. Try again to see the new difference."
+        ),
+        e => format!("{name}: {e}"),
+    })
+}
+
 /// The two sides of a prompt: the source's form against the designer's (source changed), or the
 /// form file as it is against what the designer would write (form file changed).
 pub fn diff_for(
@@ -293,13 +449,23 @@ pub fn diff_for(
     read: &dyn Fn(&Path) -> Option<String>,
     exists: &dyn Fn(&Path) -> bool,
 ) -> Option<super::Diff> {
-    let t = target(loaded, exists).ok()?;
     let name = |p: &Path| {
         p.file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
     };
+    if let Prompt::IntoSource(plan) = prompt {
+        return Some(super::Diff {
+            title: format!("{}: on disk and after Save into .rs", name(&plan.path)),
+            old_label: format!("{} now", name(&plan.path)),
+            old: plan.old.clone(),
+            new_label: "what Save into .rs would write".to_string(),
+            new: plan.new.clone(),
+        });
+    }
+    let t = target(loaded, exists).ok()?;
     match prompt {
-        Prompt::SourceChanged { form } => {
+        Prompt::IntoSource(_) => None,
+        Prompt::SourceChanged { form } | Prompt::IntoSourceChanged { form } => {
             let source = t.source.as_deref()?;
             let now = formust_rust::import(&read(source)?).ok()?;
             let theirs = formust_rust::emit_form_item(&now.form(form)?.form);
@@ -633,6 +799,150 @@ mod tests {
             },
         );
         assert!(matches!(out, Outcome::Written { .. }), "{out:?}");
+    }
+
+    fn plan(d: &Designer, tab_unsaved: bool) -> IntoSourceOutcome {
+        plan_into_source(d.loaded.as_ref().unwrap(), &disk, tab_unsaved)
+    }
+
+    /// Save into .rs: the plan is the `.rs` with the edited function replaced and nothing else; the
+    /// write replaces the file, which reads back to the same form; a second plan has nothing to do.
+    #[test]
+    fn save_into_source_writes_the_edited_function_into_the_rs() {
+        let dir = dir("into-rs");
+        let rs = dir.join("login.rs");
+        let src = format!("// Top comment.\n{LOGIN}\nfn helper() {{  }}\n");
+        std::fs::write(&rs, &src).unwrap();
+        let mut d = opened(&rs);
+        assert!(matches!(plan(&d, false), IntoSourceOutcome::Nothing(_)));
+        add_separator(&mut d);
+        let IntoSourceOutcome::Confirm(p) = plan(&d, false) else {
+            panic!("{:?}", plan(&d, false))
+        };
+        assert_eq!(p.path, rs);
+        assert_eq!(p.old, src);
+        assert_eq!(p.forms, ["Login::ui"]);
+        assert!(!p.changed_since_read && p.companion.is_none() && p.skipped.is_empty());
+        assert_eq!(
+            p.new,
+            src.replace(
+                "ui.label(\"Name\");\n",
+                "ui.label(\"Name\");\n        ui.separator();\n"
+            )
+        );
+        // Nothing was written by planning.
+        assert_eq!(std::fs::read_to_string(&rs).unwrap(), src);
+        write_into_source(&p).unwrap();
+        assert_eq!(std::fs::read_to_string(&rs).unwrap(), p.new);
+        assert!(!dir.join("login.frm.rs").exists(), "no form file is made");
+        // Read again from the new .rs: the same form, and nothing left to write.
+        let again = opened(&rs);
+        assert_eq!(
+            formust_rust::emit_fn(again.forms()[0].form()),
+            formust_rust::emit_fn(d.forms()[0].form())
+        );
+        assert!(matches!(plan(&again, false), IntoSourceOutcome::Nothing(_)));
+    }
+
+    #[test]
+    fn save_into_source_refuses_or_asks_when_the_rs_is_not_as_read() {
+        let dir = dir("into-rs-conflicts");
+        let rs = dir.join("login.rs");
+        std::fs::write(&rs, LOGIN).unwrap();
+        let mut d = opened(&rs);
+        add_separator(&mut d);
+        // Unsaved text in the .rs tab.
+        assert!(
+            matches!(plan(&d, true), IntoSourceOutcome::Failed(m) if m.contains("unsaved changes")),
+        );
+        // Changed outside the form: confirmed with a note.
+        let outside = format!("{LOGIN}\nfn added_on_disk() {{}}\n");
+        std::fs::write(&rs, &outside).unwrap();
+        let IntoSourceOutcome::Confirm(p) = plan(&d, false) else {
+            panic!()
+        };
+        assert!(p.changed_since_read);
+        assert!(p.new.contains("fn added_on_disk() {}") && p.new.contains("ui.separator();"));
+        // The disk changes again before the answer: the write refuses and the file stays.
+        std::fs::write(&rs, LOGIN).unwrap();
+        assert!(
+            write_into_source(&p)
+                .unwrap_err()
+                .contains("changed on disk")
+        );
+        assert_eq!(std::fs::read_to_string(&rs).unwrap(), LOGIN);
+        // The form's own body changed: asked first.
+        std::fs::write(&rs, LOGIN.replace("\"Name\"", "\"Your name\"")).unwrap();
+        assert_eq!(
+            plan(&d, false),
+            IntoSourceOutcome::Ask(Prompt::IntoSourceChanged {
+                form: "Login::ui".into()
+            })
+        );
+        let Some(diff) = diff_for(
+            d.loaded.as_ref().unwrap(),
+            &Prompt::IntoSourceChanged {
+                form: "Login::ui".into(),
+            },
+            &disk,
+            &|p| p.exists(),
+        ) else {
+            panic!()
+        };
+        assert!(diff.old.contains("Your name") && diff.new.contains("ui.separator();"));
+        // Keeping the designer's form takes the new hash; then the plan goes on.
+        d.keep_form("Login::ui", &disk);
+        assert!(matches!(plan(&d, false), IntoSourceOutcome::Confirm(_)));
+    }
+
+    /// A `.frm.rs` tab is not a source; a companion form file is named in the plan and left alone.
+    #[test]
+    fn save_into_source_names_the_form_file_and_never_writes_it() {
+        let dir = dir("into-rs-companion");
+        let rs = dir.join("login.rs");
+        std::fs::write(&rs, LOGIN).unwrap();
+        let mut d = opened(&rs);
+        add_separator(&mut d);
+        let Outcome::Written { path: frm, text } = export(
+            d.loaded.as_mut().unwrap(),
+            &disk,
+            &|p| p.exists(),
+            Decisions::default(),
+        ) else {
+            panic!()
+        };
+        // From the .frm.rs tab: refused.
+        let from_frm = opened(&frm);
+        assert!(
+            matches!(plan(&from_frm, false), IntoSourceOutcome::Failed(m) if m.contains("not a .rs source"))
+        );
+        // From the .rs: the copy's form (from the form file) goes into the .rs.
+        let d = opened(&rs);
+        assert_eq!(d.forms()[0].origin, Some(Origin::Frm));
+        let IntoSourceOutcome::Confirm(p) = plan(&d, false) else {
+            panic!()
+        };
+        assert_eq!(p.companion.as_deref(), Some(frm.as_path()));
+        let Some(shown) = diff_for(
+            d.loaded.as_ref().unwrap(),
+            &Prompt::IntoSource(p.clone()),
+            &disk,
+            &|p| p.exists(),
+        ) else {
+            panic!()
+        };
+        assert_eq!(
+            (shown.old.as_str(), shown.new.as_str()),
+            (LOGIN, p.new.as_str())
+        );
+        write_into_source(&p).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&frm).unwrap(),
+            text,
+            "the form file is left as it is"
+        );
+        let (_, rest) = text.split_once('\n').unwrap();
+        assert_eq!(p.new, rest, "the .rs is the copy without its header line");
     }
 
     #[test]

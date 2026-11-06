@@ -15,8 +15,9 @@ pub use form::{
 pub use layout::{
     ALIGN2, ALL_ANCHORS, Anchor, FillWay, MAX_COLUMNS, SizeRequest, SizeTarget,
     available_width_prop, fill_way, is_fill, is_fill_size, is_fill_text, is_fill_value,
-    is_focusable, is_plain_ui, is_ui_text, num, number, parse_vec2, parse_window_anchor,
-    resize_axes, resize_targets, split_pair, vec2_text, window_anchor_text, wrapper_anchor,
+    is_focusable, is_plain_ui, is_ui_text, literal_range, num, number, panel_size_range,
+    parse_vec2, parse_window_anchor, resize_axes, resize_body_inset, resize_from_start,
+    resize_targets, split_pair, vec2_text, window_anchor_text, wrapper_anchor,
 };
 pub use registry::{
     ALL_CONTAINERS, ALL_EVENTS, ALL_WIDGETS, ContainerDef, ContainerId, DefaultValue, EventId,

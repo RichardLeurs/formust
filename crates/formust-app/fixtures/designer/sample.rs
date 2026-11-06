@@ -43,7 +43,7 @@ impl Sample {
                 ui.radio_value(&mut self.size, Size::Small, "Small radio");
                 ui.selectable_value(&mut self.size, Size::Large, "Large choice");
                 if ui.button("Sign in").clicked() {
-                    self.sign_in();
+               //     self.sign_in();
                 }
                 ui.end_row();
             });

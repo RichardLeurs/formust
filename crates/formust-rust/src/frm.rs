@@ -403,6 +403,16 @@ pub fn write_frm(path: &Path, text: &str) -> Result<(), WriteError> {
         Err(e) => return Err(WriteError::Io(e)),
     }
     parse_frm(text).map_err(WriteError::NewDoesNotParse)?;
+    write_atomic(path, text, None).map_err(WriteError::Io)
+}
+
+/// Writes `text` to `.<name>.tmp` beside `path`, with `permissions` when given, then renames it over
+/// `path`. A failure removes the temporary file and leaves `path` as it was.
+pub(crate) fn write_atomic(
+    path: &Path,
+    text: &str,
+    permissions: Option<std::fs::Permissions>,
+) -> std::io::Result<()> {
     let mut temp = PathBuf::from(path);
     let name = path
         .file_name()
@@ -413,11 +423,15 @@ pub fn write_frm(path: &Path, text: &str) -> Result<(), WriteError> {
     temp.set_file_name(temp_name);
     let result = std::fs::File::create(&temp)
         .and_then(|mut f| f.write_all(text.as_bytes()).and_then(|()| f.sync_all()))
+        .and_then(|()| match permissions {
+            Some(p) => std::fs::set_permissions(&temp, p),
+            None => Ok(()),
+        })
         .and_then(|()| std::fs::rename(&temp, path));
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
-    result.map_err(WriteError::Io)
+    result
 }
 
 #[cfg(test)]

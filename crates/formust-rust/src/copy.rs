@@ -1,8 +1,11 @@
 //! The `.frm.rs` copy: the complete text of the source file with the designer's forms in it. Each
 //! exported form replaces its function in the copy, byte ranges from the importer show where, and
 //! everything else (the struct, other impls, helpers, `use` and `mod` lines, comments) stays byte for
-//! byte. A header line per form goes at the top. The copy compiles and runs by itself; the source is
-//! never written and needs no line for it.
+//! byte. A header line per form goes at the top. The copy compiles and runs by itself; Save never
+//! writes the source and the source needs no line for it.
+//!
+//! "Save into .rs" (an explicit action of its own) writes the same text into the source itself,
+//! without the header lines: [`update_source`] makes it and [`write_source`] writes it.
 //!
 //! New state (the fields that new stateful widgets bind to as `self.form.<field>`) goes into the copy
 //! too: a `#[derive(Default)]` state struct after the owner's struct, a `form: LoginForm` field in the
@@ -11,6 +14,7 @@
 //! the field, and literals inside macros or in other files are not seen.
 
 use std::ops::Range;
+use std::path::Path;
 
 use formust_model::Form;
 use syn::visit::Visit;
@@ -26,6 +30,13 @@ use crate::import::{
 /// own) and is appended at the end when the copy doesn't have it; the copy's other forms and all its
 /// other text stay. `parse_frm(x).emit() == x` for a file this wrote.
 pub fn update_frm(base: &FrmFile, forms: &[(Form, Option<Header>)]) -> String {
+    patch(base, forms, true)
+}
+
+/// The forms written into `base` (see [`update_frm`]). `headers`: the copy's header block is
+/// rewritten; without it (the `.rs` itself, see [`update_source`]) header lines are neither written
+/// nor removed.
+fn patch(base: &FrmFile, forms: &[(Form, Option<Header>)], headers: bool) -> String {
     let text = base.text.as_str();
     let nl = if text.contains("\r\n") {
         "\r\n"
@@ -114,6 +125,9 @@ pub fn update_frm(base: &FrmFile, forms: &[(Form, Option<Header>)]) -> String {
         }
     }
 
+    if !headers {
+        return finish(text, edits, tail_items, &appended, forms, nl);
+    }
     // The header lines: the old ones go, the new block is the first lines of the file.
     for range in &base.header_lines {
         edits.push((range.clone(), String::new()));
@@ -152,7 +166,19 @@ pub fn update_frm(base: &FrmFile, forms: &[(Form, Option<Header>)]) -> String {
         0
     };
     edits.push((start..start, block));
+    finish(text, edits, tail_items, &appended, forms, nl)
+}
 
+/// `edits` applied to `text`, then the items that had no place in it (`tail_items`, the forms of
+/// `appended`) at the end.
+fn finish(
+    text: &str,
+    edits: Vec<(Range<usize>, String)>,
+    tail_items: Vec<String>,
+    appended: &[usize],
+    forms: &[(Form, Option<Header>)],
+    nl: &str,
+) -> String {
     let mut out = apply(text, edits);
     let mut tail: Vec<String> = tail_items;
     tail.extend(appended.iter().map(|&i| emit_form_item(&forms[i].0)));
@@ -184,6 +210,180 @@ pub fn standalone_base(
         (None, Some(src)) => parse_frm(src),
         (None, None) => parse_frm(""),
     }
+}
+
+/// What [`update_source`] made of a `.rs`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceUpdate {
+    /// The new text of the `.rs`.
+    pub text: String,
+    /// The source id (`owner::method`) of each form whose function was replaced, in the order the
+    /// forms were given. Empty when the `.rs` already has every form as given.
+    pub written: Vec<String>,
+}
+
+/// Why forms can't be written into a `.rs`. Nothing is written then.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceError {
+    /// The `.rs` doesn't parse.
+    Parse(ImportError),
+    /// The `.rs` has no function for this form (its source id).
+    Missing(String),
+    /// The form has state (`self.form.<field>`) but its owner has no struct with named fields in
+    /// this file to take the field. `owner` is the owner's name, or the function's for a free one.
+    NoStateField { owner: String },
+    /// The new text doesn't read back to the forms given: a bug here.
+    NotIdempotent(String),
+}
+
+impl std::fmt::Display for SourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SourceError::Parse(e) => write!(
+                f,
+                "the .rs doesn't parse at line {}, column {}: {}",
+                e.line, e.column, e.message
+            ),
+            SourceError::Missing(id) => write!(f, "the .rs has no {id}"),
+            SourceError::NoStateField { owner } => write!(
+                f,
+                "{owner} has new state (self.form.…) but no struct with named fields in this file to hold it"
+            ),
+            SourceError::NotIdempotent(what) => write!(
+                f,
+                "the new text doesn't read back to the same forms ({what}); nothing was written"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SourceError {}
+
+/// The text of the `.rs` itself with `forms` written into it: what the `.frm.rs` copy is, without
+/// its header lines. Each form whose function differs from the one in `source` (matched by the
+/// header's id, else the form's own) replaces it; a form the `.rs` has as given is left alone, so an
+/// unedited legacy `update` stays `update`. New state goes in as in the copy (a state struct after
+/// the owner's struct, the owner's field, its struct literals). Everything else stays byte for byte.
+///
+/// The result is checked before it is returned: it parses, and each replaced function reads back as
+/// the form's text, so importing the result gives the same forms.
+pub fn update_source(
+    source: &str,
+    forms: &[(Form, Option<Header>)],
+) -> Result<SourceUpdate, SourceError> {
+    let base = parse_frm(source).map_err(SourceError::Parse)?;
+    let mut chosen: Vec<(Form, Option<Header>)> = Vec::new();
+    let mut written = Vec::new();
+    for (form, header) in forms {
+        let id = header.as_ref().map_or_else(|| form.id(), |h| h.id.clone());
+        let Some(there) = base.forms.iter().find(|f| f.source_id() == id) else {
+            return Err(SourceError::Missing(id));
+        };
+        if emit_fn(form) == emit_fn(&there.imported.form) {
+            continue;
+        }
+        chosen.push((form.clone(), header.clone()));
+        written.push(id);
+    }
+    if chosen.is_empty() {
+        return Ok(SourceUpdate {
+            text: source.to_string(),
+            written,
+        });
+    }
+    // State needs the owner's struct here, with named fields; the copy would append the struct at
+    // the end and leave `self.form` undeclared, which a source must not get.
+    let sites = sites_of(source);
+    let mut owners: Vec<&str> = Vec::new();
+    for (form, _) in &chosen {
+        let owner = form.owner.as_str();
+        if owners.contains(&owner) {
+            continue;
+        }
+        owners.push(owner);
+        let same: Vec<&Form> = chosen
+            .iter()
+            .map(|(f, _)| f)
+            .filter(|f| f.owner == owner)
+            .collect();
+        if state_struct(&same).is_none() {
+            continue;
+        }
+        let fields = sites
+            .structs
+            .iter()
+            .find(|s| !owner.is_empty() && s.name == owner)
+            .and_then(|s| s.fields.as_ref());
+        if fields.is_none() {
+            return Err(SourceError::NoStateField {
+                owner: if owner.is_empty() {
+                    form.method.clone()
+                } else {
+                    owner.to_string()
+                },
+            });
+        }
+    }
+    let text = patch(&base, &chosen, false);
+    let back = crate::import::import(&text)
+        .map_err(|e| SourceError::NotIdempotent(format!("it doesn't parse: {e}")))?;
+    for (form, _) in &chosen {
+        let want = emit_fn(form);
+        if !back
+            .forms
+            .iter()
+            .any(|f| text.get(f.fn_range.clone()) == Some(want.as_str()))
+        {
+            return Err(SourceError::NotIdempotent(form.id()));
+        }
+    }
+    Ok(SourceUpdate { text, written })
+}
+
+/// Why [`write_source`] didn't write.
+#[derive(Debug)]
+pub enum SourceWriteError {
+    /// The file is not the text the new one was made from: it changed since.
+    ChangedOnDisk,
+    /// It isn't text.
+    NotText,
+    /// What was to be written doesn't parse. A bug; the file stays.
+    NewDoesNotParse(ImportError),
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for SourceWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SourceWriteError::ChangedOnDisk => {
+                write!(f, "the file changed on disk; it was not overwritten")
+            }
+            SourceWriteError::NotText => write!(f, "the file is not text; it was not overwritten"),
+            SourceWriteError::NewDoesNotParse(e) => write!(
+                f,
+                "the new text has a syntax error ({e}); nothing was written"
+            ),
+            SourceWriteError::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for SourceWriteError {}
+
+/// Writes `text` over the `.rs` at `path`, but only while the file is still exactly `expected` (the
+/// text `text` was made from) and only if `text` parses. A symlink is followed, so the file it
+/// points to is written and the link stays. The write goes to a temporary file beside it, which
+/// takes the old file's permissions, and is renamed over it, so a failure leaves the old one whole.
+pub fn write_source(path: &Path, expected: &str, text: &str) -> Result<(), SourceWriteError> {
+    let path = std::fs::canonicalize(path).map_err(SourceWriteError::Io)?;
+    let bytes = std::fs::read(&path).map_err(SourceWriteError::Io)?;
+    let now = String::from_utf8(bytes).map_err(|_| SourceWriteError::NotText)?;
+    if now != expected {
+        return Err(SourceWriteError::ChangedOnDisk);
+    }
+    crate::import::import(text).map_err(SourceWriteError::NewDoesNotParse)?;
+    let permissions = std::fs::metadata(&path).map(|m| m.permissions()).ok();
+    crate::frm::write_atomic(&path, text, permissions).map_err(SourceWriteError::Io)
 }
 
 fn migrate(old: &FrmFile, src: &str) -> Result<FrmFile, ImportError> {
@@ -529,6 +729,149 @@ mod tests {
         );
         assert!(out.ends_with("    }\n}\n"), "{out}");
         assert_eq!(parse_frm(&out).unwrap().emit(), out);
+    }
+
+    /// The copy's text without its header lines.
+    fn without_headers(copy: &str) -> String {
+        copy.split_inclusive('\n')
+            .filter(|l| !l.starts_with("// formust "))
+            .collect()
+    }
+
+    const TWO: &str = "use eframe::egui;\n\n/// The owner.\npub struct A {\n    name: String,\n}\n\nimpl A {\n    pub fn new() -> Self {\n        Self { name: String::new() }\n    }\n\n    pub fn ui(&mut self, ui: &mut egui::Ui) {\n        ui.label(\"x\"); // keep this comment\n    }\n\n    pub fn other(&mut self, ui: &mut egui::Ui) {\n        ui.label(\"y\");\n    }\n}\n\nfn helper() -> u32 {   42 }\n";
+
+    /// Save into .rs writes what the copy holds, without the headers: the edited function and the
+    /// new state, nothing else changed, and the other form left as it was.
+    #[test]
+    fn into_source_is_the_copy_without_headers_and_keeps_the_rest() {
+        let source = import(TWO).unwrap();
+        let mut form = source.forms[0].form.clone();
+        let node = form.new_bound_widget(WidgetId::TextEditSingleline, "email");
+        form.insert(form.root.id, 1, node).unwrap();
+        let header = Some(Header::for_source("a.rs", &source.forms[0]));
+        let other = (source.forms[1].form.clone(), None);
+        let out = update_source(TWO, &[(form.clone(), header.clone()), other]).unwrap();
+        assert_eq!(out.written, ["A::ui"], "the unedited form is not written");
+        let copy = update_frm(&parse_frm(TWO).unwrap(), &[(form.clone(), header)]);
+        assert_eq!(out.text, without_headers(&copy));
+        assert!(!out.text.contains("// formust"), "{}", out.text);
+        assert!(
+            out.text
+                .contains("ui.text_edit_singleline(&mut self.form.email);")
+                && out.text.contains("form: AForm,")
+                && out
+                    .text
+                    .contains("Self { name: String::new(), form: Default::default() }")
+                && out
+                    .text
+                    .contains("#[derive(Default)] pub struct AForm { pub email: String }"),
+            "{}",
+            out.text
+        );
+        // Byte for byte outside the edits.
+        assert!(out.text.starts_with(
+            "use eframe::egui;\n\n/// The owner.\npub struct A {\n    name: String,\n"
+        ));
+        assert!(out.text.ends_with("    pub fn other(&mut self, ui: &mut egui::Ui) {\n        ui.label(\"y\");\n    }\n}\n\nfn helper() -> u32 {   42 }\n"));
+        assert!(out.text.contains("ui.label(\"x\"); // keep this comment"));
+
+        // Re-imported, the forms are the same, and writing them again changes nothing.
+        let back = import(&out.text).unwrap();
+        assert_eq!(emit_fn(&back.forms[0].form), emit_fn(&form));
+        let again: Vec<(Form, Option<Header>)> =
+            back.forms.iter().map(|f| (f.form.clone(), None)).collect();
+        let second = update_source(&out.text, &again).unwrap();
+        assert!(second.written.is_empty());
+        assert_eq!(second.text, out.text);
+    }
+
+    #[test]
+    fn into_source_leaves_an_unedited_legacy_update_alone_and_renames_an_edited_one() {
+        let src = "pub struct Old { n: u32 }\nimpl eframe::App for Old {\n    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {\n        egui::CentralPanel::default().show(ctx, |ui| {\n            ui.label(\"a\");\n        });\n    }\n}\n";
+        let source = import(src).unwrap();
+        let form = source.forms[0].form.clone();
+        let out = update_source(src, &[(form.clone(), None)]).unwrap();
+        assert!(out.written.is_empty());
+        assert_eq!(out.text, src, "byte for byte");
+
+        let mut edited = form;
+        let node = edited.new_widget(WidgetId::Separator);
+        let root = edited.widget_root();
+        edited.insert(root, 0, node).unwrap();
+        let out = update_source(src, &[(edited.clone(), None)]).unwrap();
+        assert_eq!(out.written, ["Old::update"]);
+        assert!(
+            out.text.contains("fn ui(&mut self, ui: &mut egui::Ui"),
+            "{}",
+            out.text
+        );
+        assert!(!out.text.contains("fn update("), "{}", out.text);
+        let back = import(&out.text).unwrap();
+        assert_eq!(emit_fn(&back.forms[0].form), emit_fn(&edited));
+    }
+
+    #[test]
+    fn into_source_refuses_what_it_cannot_write() {
+        // State for a tuple owner has nowhere to go.
+        let src = "pub struct T(u32);\nimpl T {\n    fn ui(&mut self, ui: &mut egui::Ui) { ui.label(\"x\"); }\n}\n";
+        let source = import(src).unwrap();
+        let mut form = source.forms[0].form.clone();
+        let node = form.new_bound_widget(WidgetId::Checkbox, "on");
+        form.insert(form.root.id, 0, node).unwrap();
+        assert_eq!(
+            update_source(src, &[(form, None)]),
+            Err(SourceError::NoStateField { owner: "T".into() })
+        );
+        // A form the source doesn't have.
+        let other = import(TWO).unwrap().forms[1].form.clone();
+        let mut renamed = other.clone();
+        renamed.owner = "Nobody".into();
+        assert_eq!(
+            update_source(src, &[(renamed, None)]),
+            Err(SourceError::Missing("Nobody::other".into()))
+        );
+        assert!(matches!(
+            update_source("fn (", &[]),
+            Err(SourceError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn write_source_checks_the_disk_and_keeps_permissions_and_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("formust-write-source-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rs = dir.join("a.rs");
+        std::fs::write(&rs, TWO).unwrap();
+        std::fs::set_permissions(&rs, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let new = TWO.replace("\"x\"", "\"z\"");
+        // Not what the new text was made from: refused, the file stays.
+        assert!(matches!(
+            write_source(&rs, "something else", &new),
+            Err(SourceWriteError::ChangedOnDisk)
+        ));
+        assert_eq!(std::fs::read_to_string(&rs).unwrap(), TWO);
+        // A new text that doesn't parse: refused.
+        assert!(matches!(
+            write_source(&rs, TWO, "fn ("),
+            Err(SourceWriteError::NewDoesNotParse(_))
+        ));
+        // Through a symlink: the file is written, the link stays a link.
+        let link = dir.join("link.rs");
+        std::os::unix::fs::symlink(&rs, &link).unwrap();
+        write_source(&link, TWO, &new).unwrap();
+        assert_eq!(std::fs::read_to_string(&rs).unwrap(), new);
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let mode = std::fs::metadata(&rs).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+        assert!(!dir.join(".a.rs.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

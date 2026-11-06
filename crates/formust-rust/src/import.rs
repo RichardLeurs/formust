@@ -3114,7 +3114,15 @@ impl<'a> BodyCx<'a> {
             return Err(format!("ui method with unexpected arguments: ui.{method}"));
         }
         let builder = &call.args[expected - 1];
-        let mut parts = self.builder(builder, ident)?;
+        let styled = if method == "add_sized" {
+            self.styled_label(builder, ident)
+        } else {
+            None
+        };
+        let mut parts = match styled {
+            Some(parts) => parts,
+            None => self.builder(builder, ident)?,
+        };
         if expected == 2 {
             let role = match method {
                 "add_sized" => PropRole::AddSized,
@@ -3133,6 +3141,45 @@ impl<'a> BodyCx<'a> {
                 .insert(prop.name, self.value(&call.args[0], prop));
         }
         Ok(parts)
+    }
+
+    /// A sized heading, small or weak text: `egui::Label::new(egui::RichText::new(t)<styles>.heading())`
+    /// with nothing after the constructor (see `forms::text_style`). Anything else is `None`, and
+    /// reads as a Label.
+    fn styled_label(&mut self, expr: &Expr, ident: &str) -> Option<WidgetParts> {
+        let Expr::Call(call) = expr else { return None };
+        let Expr::Path(path) = &*call.func else {
+            return None;
+        };
+        let (prefix, ty, ctor) = type_path(&path.path)?;
+        if ty != "Label" || ctor != "new" || call.args.len() != 1 || !call.attrs.is_empty() {
+            return None;
+        }
+        let Expr::MethodCall(styled) = &call.args[0] else {
+            return None;
+        };
+        if !styled.args.is_empty() || styled.turbofish.is_some() {
+            return None;
+        }
+        let def = ALL_WIDGETS
+            .iter()
+            .copied()
+            .find(|w| forms::text_style(*w) == Some(styled.method.to_string().as_str()))?;
+        let wdef = widget_def(def);
+        let text_prop = wdef.prop("text")?;
+        let (text, styles, rich_prefix) =
+            self.rich_text(wdef.props, text_prop, &styled.receiver)?;
+        let mut props = styles;
+        props.insert(text_prop.name, text);
+        self.first_path.get_or_insert(prefix);
+        self.first_path.get_or_insert(rich_prefix);
+        Some(WidgetParts {
+            def,
+            props,
+            extra_chain: Vec::new(),
+            response_chain: Vec::new(),
+            recv: ident.to_string(),
+        })
     }
 
     /// `Widget::ctor(args).chain()`.

@@ -45,6 +45,8 @@ pub struct Options<'a> {
     pub also: &'a [NodeId],
     /// The selected node's resize handles: (right edge, bottom edge); the corner when both.
     pub handles: (bool, bool),
+    /// The handles are on the left and top edges instead (`formust_model::resize_from_start`).
+    pub handles_from_start: (bool, bool),
     /// The IDE's accent colour, for the selection marks.
     pub accent: Color32,
     /// Hold AccessKit actions back from the preview. Always on; off only in a test's control run.
@@ -73,6 +75,11 @@ pub struct Pass {
     /// The tab buttons of every Tabs bar drawn, with the page each one shows: a click there shows
     /// that page. They are no nodes of their own.
     pub tab_buttons: Vec<(Rect, NodeId)>,
+    /// How much larger a container's rect is than its body (unclipped), for the containers whose
+    /// body statements a resize writes around a margin: a Frame, Group, Indent, or an open
+    /// CollapsingHeader (its header and indent only; nothing trails the body). A resize takes it
+    /// off the dragged size.
+    pub insets: HashMap<NodeId, Vec2>,
 }
 
 /// The shield's interaction this pass, on the parent layer.
@@ -249,13 +256,21 @@ fn begin_focus_guard(
 
 // ---- Marks ---------------------------------------------------------------------------------
 
-/// Where the resize handles of a selected node's rect are: right edge, bottom edge, corner.
-pub fn handle_rects(r: Rect, (right, bottom): (bool, bool)) -> [Option<Rect>; 3] {
+/// Where the resize handles of a selected node's rect are: the width's edge, the height's edge and
+/// their corner. The right and bottom edges, or the left and top ones where `from_start` says so (a
+/// right or bottom panel).
+pub fn handle_rects(
+    r: Rect,
+    (width, height): (bool, bool),
+    (left, top): (bool, bool),
+) -> [Option<Rect>; 3] {
     let size = vec2(HANDLE, HANDLE);
+    let x = if left { r.left() } else { r.right() };
+    let y = if top { r.top() } else { r.bottom() };
     [
-        right.then(|| Rect::from_center_size(r.right_center(), size)),
-        bottom.then(|| Rect::from_center_size(r.center_bottom(), size)),
-        (right && bottom).then(|| Rect::from_center_size(r.right_bottom(), size)),
+        width.then(|| Rect::from_center_size(egui::pos2(x, r.center().y), size)),
+        height.then(|| Rect::from_center_size(egui::pos2(r.center().x, y), size)),
+        (width && height).then(|| Rect::from_center_size(egui::pos2(x, y), size)),
     ]
 }
 
@@ -284,7 +299,10 @@ fn paint_marks(ui: &Ui, pass: &Pass, o: &Options<'_>) {
         painter.rect_stroke(*r, 2.0, Stroke::new(2.0, o.accent), StrokeKind::Outside);
         let resizable = o.handles.0 || o.handles.1;
         let squares: Vec<Rect> = if resizable {
-            handle_rects(*r, o.handles).into_iter().flatten().collect()
+            handle_rects(*r, o.handles, o.handles_from_start)
+                .into_iter()
+                .flatten()
+                .collect()
         } else {
             [
                 r.left_top(),
@@ -439,6 +457,12 @@ fn kids(ui: &mut Ui, n: &Node, cx: &mut Cx) {
     for c in children {
         node(ui, c, cx);
     }
+}
+
+/// The children in the container's body `Ui`, and the rect that body took.
+fn body_rect(ui: &mut Ui, n: &Node, cx: &mut Cx) -> Rect {
+    kids(ui, n, cx);
+    ui.min_rect()
 }
 
 /// An empty container gets a dashed box at design time, so it can be seen and selected: the one
@@ -904,10 +928,11 @@ fn widget(
             }
             put(ui, sized, l)
         }
-        WidgetId::Heading => ui.heading(styled()),
-        WidgetId::Small => ui.small(styled()),
+        // `ui.heading(t)` is `Label::new(t.heading())`; sized, as the export writes it.
+        WidgetId::Heading => put(ui, sized, Label::new(styled().heading())),
+        WidgetId::Small => put(ui, sized, Label::new(styled().small())),
         WidgetId::Strong => ui.strong(styled()),
-        WidgetId::Weak => ui.weak(styled()),
+        WidgetId::Weak => put(ui, sized, Label::new(styled().weak())),
         WidgetId::Monospace => ui.monospace(styled()),
         WidgetId::Button => {
             let mut b = Button::new(styled());
@@ -1367,8 +1392,20 @@ fn container(
             ui.centered_and_justified(|ui| kids(ui, n, cx)).response
         }
         ContainerId::Scope => ui.scope(|ui| kids(ui, n, cx)).response,
-        ContainerId::Group => ui.group(|ui| kids(ui, n, cx)).response,
-        ContainerId::Indent => ui.indent(salt, |ui| kids(ui, n, cx)).response,
+        ContainerId::Group => {
+            let out = ui.group(|ui| body_rect(ui, n, cx));
+            cx.pass
+                .insets
+                .insert(id, out.response.rect.size() - out.inner.size());
+            out.response
+        }
+        ContainerId::Indent => {
+            let out = ui.indent(salt, |ui| body_rect(ui, n, cx));
+            cx.pass
+                .insets
+                .insert(id, out.response.rect.size() - out.inner.size());
+            out.response
+        }
         ContainerId::Grid => {
             let mut g = Grid::new(salt);
             if let Some(x) = as_f64(container_prop(props, c, "num_columns")) {
@@ -1414,10 +1451,20 @@ fn container(
             let out = CollapsingHeader::new(title)
                 .id_salt(salt)
                 .default_open(open)
-                .show(ui, |ui| kids(ui, n, cx));
+                .show(ui, |ui| body_rect(ui, n, cx));
             let mut rect = out.header_response.rect;
             if let Some(body) = &out.body_response {
                 rect |= body.rect;
+            }
+            // The header above the body and the indent left of it; the header may be wider than
+            // the body, so only the leading offsets count.
+            match out.body_returned {
+                Some(body) => {
+                    cx.pass.insets.insert(id, body.min - rect.min);
+                }
+                None => {
+                    cx.pass.insets.remove(&id);
+                }
             }
             cx.rec(ui, id, &out.header_response, rect);
             return;
@@ -1434,15 +1481,33 @@ fn container(
             };
             // Inert: a resize drag must not move the panel's edge.
             p = p.resizable(false);
-            if let Some(x) = as_f64(container_prop(props, c, "default_size")) {
-                p = p.default_size(x as f32);
-            }
-            if let Some(x) = as_f64(container_prop(props, c, "exact_size")) {
-                p = p.exact_size(x as f32);
-            }
             if let Some(b) = as_bool(container_prop(props, c, "show_separator_line")) {
                 p = p.show_separator_line(b);
             }
+            // The size methods in the order the export writes them, so egui clamps as at runtime.
+            let float = |name: &str| as_f64(container_prop(props, c, name)).map(|v| v as f32);
+            if let Some(x) = float("default_size") {
+                p = p.default_size(x);
+            }
+            if let Some(x) = float("min_size") {
+                p = p.min_size(x);
+            }
+            if let Some(x) = float("max_size") {
+                p = p.max_size(x);
+            }
+            if let Some(x) = float("exact_size") {
+                p = p.exact_size(x);
+            }
+            if let Some(PropValue::Expr(t)) = props.get("size_range")
+                && let Some((lo, hi)) = formust_model::literal_range(t)
+            {
+                p = p.size_range(lo as f32..=hi as f32);
+            }
+            // The size the panel shows is its first one: egui would otherwise keep the size it
+            // stored on an earlier pass (a panel's size persists), and a new default_size would
+            // never show. The panel's id is its parent's scope id with the salt.
+            ui.ctx()
+                .data_mut(|d| d.remove::<egui::PanelState>(ui.scope_id().with(salt)));
             p.show(ui, |ui| kids(ui, n, cx)).response
         }
         ContainerId::CentralPanel => {
@@ -1537,7 +1602,11 @@ fn container(
             if as_bool(container_prop(props, c, "invisible")) == Some(true) {
                 f = f.invisible();
             }
-            f.show(ui, |ui| kids(ui, n, cx)).response
+            let out = f.show(ui, |ui| body_rect(ui, n, cx));
+            cx.pass
+                .insets
+                .insert(id, out.response.rect.size() - out.inner.size());
+            out.response
         }
         ContainerId::Window | ContainerId::DialogCall => {
             // A real Window is an Area on a registered layer of its own, which would escape the
@@ -1551,9 +1620,26 @@ fn container(
                 _ => as_text(container_prop(props, c, "title")).unwrap_or_default(),
             };
             let style = ui.style().clone();
+            let frame = Frame::window(&style);
+            // A Window is as wide as egui makes it (its title bar spans that width), and as high
+            // when a scroll area fills it; the sizes are outer ones, frame included. A dialog
+            // helper's size is its own code.
+            let size = match c {
+                ContainerId::Window => window_size(props),
+                _ => None,
+            };
+            let margin = frame.total_margin().sum();
             let draw = |ui: &mut Ui| {
-                Frame::window(&style)
+                frame
                     .show(ui, |ui| {
+                        if let Some((w, h)) = size {
+                            let w = (w - margin.x).max(0.0);
+                            ui.set_max_width(w);
+                            ui.set_min_width(w);
+                            if let Some(h) = h {
+                                ui.set_min_height((h - margin.y).max(0.0));
+                            }
+                        }
                         ui.strong(title);
                         ui.separator();
                         kids(ui, n, cx);
@@ -1782,6 +1868,59 @@ impl Cx<'_> {
             self.pass.rects.insert(id, visible);
         }
     }
+}
+
+/// egui 0.37's own outer size of a Window, and its least one (`Window::new`).
+const WINDOW_DEFAULT: Vec2 = vec2(340.0, 420.0);
+const WINDOW_MIN: Vec2 = vec2(96.0, 32.0);
+
+/// A Window's outer width at runtime, and its height when a scroll area fills it (`vscroll` or
+/// `hscroll`; otherwise egui fits the height to the content). `None` for an `auto_sized` window,
+/// which fits its content. The chain's order decides: `default_width`, then `default_size`, then
+/// `fixed_size`; the least and largest sizes clamp it.
+fn window_size(props: &Props) -> Option<(f32, Option<f32>)> {
+    if props.get("auto_sized") == Some(&PropValue::Bool(true)) {
+        return None;
+    }
+    let float = |name: &str| as_f64(props.get(name).cloned()).map(|v| v as f32);
+    let pair = |name: &str| as_vec2(props.get(name).cloned());
+    let mut size = WINDOW_DEFAULT;
+    let (mut min, mut max) = (WINDOW_MIN, Vec2::INFINITY);
+    if let Some(w) = float("default_width") {
+        size.x = w;
+    }
+    if let Some(h) = float("default_height") {
+        size.y = h;
+    }
+    if let Some(v) = float("min_width") {
+        min.x = v;
+    }
+    if let Some(v) = float("min_height") {
+        min.y = v;
+    }
+    if let Some(v) = float("max_width") {
+        max.x = v;
+    }
+    if let Some(v) = float("max_height") {
+        max.y = v;
+    }
+    if let Some(v) = pair("default_size") {
+        size = v;
+    }
+    if let Some(v) = pair("min_size") {
+        min = v;
+    }
+    if let Some(v) = pair("max_size") {
+        max = v;
+    }
+    if let Some(v) = pair("fixed_size") {
+        (size, min, max) = (v, v, v);
+    }
+    let size = size.max(min).min(max);
+    let scrolls = ["vscroll", "hscroll"]
+        .iter()
+        .any(|n| props.get(*n) == Some(&PropValue::Bool(true)));
+    Some((size.x, scrolls.then_some(size.y)))
 }
 
 /// The layout that puts a Window where its `.anchor(egui::Align2::X, ..)` says.

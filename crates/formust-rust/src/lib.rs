@@ -1,5 +1,6 @@
 //! Formust's Rust importer and emitter. `.rs` and `.frm.rs` text go through one `syn` importer, and
-//! the `.frm.rs` written back is a standalone copy of the `.rs` with the designer's forms in it.
+//! the `.frm.rs` written back is a standalone copy of the `.rs` with the designer's forms in it. On
+//! request ("Save into .rs") the same forms go into the `.rs` itself ([`update_source`]).
 //! Unrecognised code stays as a locked custom block, a byte slice of the source; an unedited node
 //! is emitted verbatim. No UI dependencies.
 
@@ -15,6 +16,7 @@ pub mod stats;
 pub mod tokens;
 pub mod usage;
 
+pub use copy::{SourceError, SourceUpdate, SourceWriteError, update_source, write_source};
 pub use emit::{emit_body, emit_fn, emit_form_item, emit_node};
 pub use frm::{
     Conflict, FrmFile, FrmForm, Header, MergedForm, Origin, WriteError, check_conflict, merge,

@@ -14,6 +14,10 @@
 //! (see [`formust_rust::run::open_flags`]). A headless run (`FORMUST_RUN_FORM_TEST=1`) draws one frame
 //! instead and prints the texts it drew; the tests use it.
 //!
+//! The window has no native title bar: the program draws a strip in its place with the title and a
+//! Light/Dark switch on the right (see [`MAIN`]). It starts in the designer canvas's theme, passed in
+//! [`THEME_VAR`]; Live Run also keeps the theme last chosen in its window (see [`live`]).
+//!
 //! Each run also removes old program folders of other sources under `<target>/formust-run/` (see
 //! [`clean_old`]); nothing outside that folder is removed.
 //!
@@ -614,30 +618,244 @@ pub fn harness(owner_type: &str, method: &str, kind: Kind, opened: &[String]) ->
         .replace("@HEADLESS@", &headless)
 }
 
-/// The generated `main.rs`: the headless run when `FORMUST_RUN_FORM_TEST` is set, else the window.
-pub fn main_rs(title: &str) -> String {
-    format!(
-        "//! Formust's Run Form program: one form in one window. Generated in a temporary folder.
+// ---- the window's theme ---------------------------------------------------------------------------
+
+/// The environment variable that gives the program its start theme: `light`, `dark` or `system`
+/// (anything else is `system`). Run Form and Live Run set it from the designer's canvas.
+pub const THEME_VAR: &str = "FORMUST_RUN_FORM_THEME";
+/// When set, the program prints [`THEME_LINE`] and the theme each time the Light/Dark switch is used.
+/// Live Run sets it, reads the line from the program's output and starts the next window in that
+/// theme.
+pub const THEME_REPORT_VAR: &str = "FORMUST_RUN_FORM_THEME_REPORT";
+/// The start of the line the program prints when its theme is switched (see [`THEME_REPORT_VAR`]).
+pub const THEME_LINE: &str = "formust-theme: ";
+
+/// The theme a Run Form window starts in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunTheme {
+    Light,
+    Dark,
+    System,
+}
+
+impl RunTheme {
+    /// Its value for [`THEME_VAR`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunTheme::Light => "light",
+            RunTheme::Dark => "dark",
+            RunTheme::System => "system",
+        }
+    }
+
+    /// A value of [`THEME_VAR`], as the program reads it: case and spaces don't count; `None` for an
+    /// unknown value (the program then follows the system).
+    pub fn parse(text: &str) -> Option<RunTheme> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "light" => Some(RunTheme::Light),
+            "dark" => Some(RunTheme::Dark),
+            "system" => Some(RunTheme::System),
+            _ => None,
+        }
+    }
+
+    /// The theme of the designer's canvas: its own choice (`canvas`, `Some(true)` for dark), else
+    /// the IDE's (`ide_dark`), which it follows then.
+    pub fn of_canvas(canvas: Option<bool>, ide_dark: bool) -> RunTheme {
+        if canvas.unwrap_or(ide_dark) {
+            RunTheme::Dark
+        } else {
+            RunTheme::Light
+        }
+    }
+
+    /// The theme a line of the program's output reports (see [`THEME_LINE`]); `None` for any other
+    /// line.
+    pub fn from_line(line: &str) -> Option<RunTheme> {
+        RunTheme::parse(line.strip_prefix(THEME_LINE)?)
+    }
+}
+
+/// The generated `main.rs`. `@TITLE@` is the window's title. The native title bar is hidden (its
+/// close, minimise and zoom buttons stay), and a strip of the same height drawn by the program takes
+/// its place: it shows the title, drags the window, zooms it on a double-click, and holds the
+/// Light/Dark switch on the right. The form is drawn below it, in the space it had under the native
+/// title bar. The headless run (`FORMUST_RUN_FORM_TEST`) prints the form's texts (`drawn:`), then the
+/// strip's (`strip:`), its start theme (`theme:`) and its theme after a click on the switch's other
+/// side (`theme after a click:`).
+const MAIN: &str = r#"//! Formust's Run Form program: one form in one window, under a title strip with a Light/Dark
+//! switch. Generated in a temporary folder.
 #[allow(dead_code, unused)]
 mod owner;
 
-fn main() {{
-    if std::env::var_os(\"FORMUST_RUN_FORM_TEST\").is_some() {{
-        println!(\"drawn: {{}}\", owner::formust_run::headless().join(\" | \"));
+use eframe::egui;
+
+/// The window's title, drawn in the strip: the native title bar is hidden.
+const TITLE: &str = @TITLE@;
+/// The strip's height: the native macOS title bar's.
+const STRIP: f32 = 28.0;
+/// Room on the left for the close, minimise and zoom buttons.
+const BUTTONS: f32 = 78.0;
+
+/// The start theme, from FORMUST_RUN_FORM_THEME: light, dark, else the system's.
+fn start_theme() -> egui::ThemePreference {
+    let value = std::env::var("FORMUST_RUN_FORM_THEME").unwrap_or_default();
+    match value.trim().to_ascii_lowercase().as_str() {
+        "light" => egui::ThemePreference::Light,
+        "dark" => egui::ThemePreference::Dark,
+        _ => egui::ThemePreference::System,
+    }
+}
+
+fn theme_name(theme: egui::Theme) -> &'static str {
+    match theme {
+        egui::Theme::Light => "light",
+        egui::Theme::Dark => "dark",
+    }
+}
+
+/// The title strip at the top of `ui`. Returns the rects of the switch's Light and Dark sides.
+fn strip(ui: &mut egui::Ui) -> (egui::Rect, egui::Rect) {
+    egui::Panel::top("formust_title_strip")
+        .exact_size(STRIP)
+        .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(8, 0)))
+        .show(ui, |ui| {
+            let bar = ui.max_rect();
+            // Registered first, so the switch keeps its clicks: the empty strip drags the window
+            // and a double-click zooms it, as the native title bar does.
+            let drag = ui.interact(bar, egui::Id::new("formust_title_drag"), egui::Sense::click_and_drag());
+            if drag.drag_started() {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            if drag.double_clicked() {
+                let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+            let title = ui.painter().layout_no_wrap(
+                TITLE.to_string(),
+                egui::FontId::proportional(13.0),
+                ui.visuals().strong_text_color(),
+            );
+            // Centred, but never under the window's buttons.
+            let left = (bar.center().x - title.size().x / 2.0).max(bar.left() + BUTTONS);
+            let at = egui::pos2(left, bar.center().y - title.size().y / 2.0);
+            ui.painter().galley(at, title, ui.visuals().strong_text_color());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let current = ui.ctx().theme();
+                let dark = ui
+                    .selectable_label(current == egui::Theme::Dark, "Dark")
+                    .on_hover_text("Show the form in dark mode");
+                let light = ui
+                    .selectable_label(current == egui::Theme::Light, "Light")
+                    .on_hover_text("Show the form in light mode");
+                for (side, theme) in [(&light, egui::Theme::Light), (&dark, egui::Theme::Dark)] {
+                    if side.clicked() && current != theme {
+                        ui.ctx().set_theme(theme);
+                        // Live Run reads this, so its next window starts in the same theme.
+                        if std::env::var_os("FORMUST_RUN_FORM_THEME_REPORT").is_some() {
+                            println!("formust-theme: {}", theme_name(theme));
+                        }
+                    }
+                }
+                (light.rect, dark.rect)
+            })
+            .inner
+        })
+        .inner
+}
+
+/// The form below the title strip.
+struct Shell {
+    form: Box<dyn eframe::App>,
+}
+
+impl eframe::App for Shell {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        strip(ui);
+        self.form.ui(ui, frame);
+    }
+}
+
+/// The strip headless: its texts and theme, then a click on the switch's other side.
+fn headless_strip() {
+    fn texts(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+            _ => {}
+        }
+    }
+    let ctx = egui::Context::default();
+    ctx.set_theme(start_theme());
+    let pass = |events: Vec<egui::Event>| {
+        let input = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let mut sides = (egui::Rect::NOTHING, egui::Rect::NOTHING);
+        let mut full = ctx.run_ui(input, |ui| sides = strip(ui));
+        // No renderer takes the font texture here.
+        full.textures_delta.clear();
+        let mut out = Vec::new();
+        for clipped in &full.shapes {
+            texts(&clipped.shape, &mut out);
+        }
+        (out, sides)
+    };
+    pass(Vec::new());
+    let (drawn, sides) = pass(Vec::new());
+    println!("strip: {}", drawn.join(" | "));
+    println!("theme: {}", theme_name(ctx.theme()));
+    let other = if ctx.theme() == egui::Theme::Dark { sides.0 } else { sides.1 };
+    let pos = other.center();
+    let button = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::default(),
+    };
+    pass(vec![egui::Event::PointerMoved(pos)]);
+    pass(vec![button(true)]);
+    pass(vec![button(false)]);
+    pass(Vec::new());
+    println!("theme after a click: {}", theme_name(ctx.theme()));
+}
+
+fn main() {
+    if std::env::var_os("FORMUST_RUN_FORM_TEST").is_some() {
+        println!("drawn: {}", owner::formust_run::headless().join(" | "));
+        headless_strip();
         return;
-    }}
+    }
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false)
+            .with_title_shown(false)
+            .with_titlebar_buttons_shown(true),
+        ..Default::default()
+    };
     let result = eframe::run_native(
-        {title:?},
-        eframe::NativeOptions::default(),
-        Box::new(|_cc| Ok(owner::formust_run::app())),
+        TITLE,
+        options,
+        Box::new(|cc| {
+            cc.egui_ctx.set_theme(start_theme());
+            Ok(Box::new(Shell {
+                form: owner::formust_run::app(),
+            }))
+        }),
     );
-    if let Err(error) = result {{
-        eprintln!(\"The window could not open: {{error}}\");
+    if let Err(error) = result {
+        eprintln!("The window could not open: {error}");
         std::process::exit(1);
-    }}
-}}
-"
-    )
+    }
+}
+"#;
+
+/// The generated `main.rs` (see [`MAIN`]): the headless run when `FORMUST_RUN_FORM_TEST` is set,
+/// else the window, under its title strip, in the theme of [`THEME_VAR`].
+pub fn main_rs(title: &str) -> String {
+    MAIN.replace("@TITLE@", &format!("{title:?}"))
 }
 
 /// The generated package for `input`, or the problems that stop it: a free function that is no
@@ -794,6 +1012,28 @@ pub fn clean_old(
 /// `target` replaces the project's target folder (the tests use a shared one). Runs on a worker thread:
 /// cargo's `metadata` takes a moment.
 pub fn prepare(input: Inputs, target: Option<PathBuf>) -> Result<Plan, Vec<Diagnostic>> {
+    prepare_for(input, target, Action::Run, None).map(|(plan, _)| plan)
+}
+
+/// What `cargo metadata` said about a project, kept by Live Run so that a rebuild with the same
+/// `Cargo.toml` (same path, same text) does not ask cargo again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectCache {
+    pub manifest: PathBuf,
+    pub manifest_text: String,
+    pub workspace_root: PathBuf,
+    pub target_directory: PathBuf,
+}
+
+/// [`prepare`] with the cargo `action` of the request (Run Form runs, Live Run only builds) and
+/// what an earlier call read about the project: `cargo metadata` runs only when `cache` is for
+/// another manifest or its text changed. Returns the plan and what to keep for the next call.
+pub fn prepare_for(
+    input: Inputs,
+    target: Option<PathBuf>,
+    action: Action,
+    cache: Option<ProjectCache>,
+) -> Result<(Plan, ProjectCache), Vec<Diagnostic>> {
     let owner = input.owner.clone();
     let io = |message: String| vec![problem(&owner, 0, message)];
     let manifest = formust_build::manifest_for(&owner).map_err(|e| {
@@ -802,19 +1042,31 @@ pub fn prepare(input: Inputs, target: Option<PathBuf>) -> Result<Plan, Vec<Diagn
             file_name(&owner)
         ))
     })?;
-    let meta = formust_build::metadata(None, &manifest)
-        .map_err(|e| io(format!("Run Form could not read the project: {e}")))?;
     let manifest_text = std::fs::read_to_string(&manifest).map_err(|e| {
         io(format!(
             "Run Form could not read {}: {e}",
             manifest.display()
         ))
     })?;
+    let cache = match cache.filter(|c| c.manifest == manifest && c.manifest_text == manifest_text) {
+        Some(cache) => cache,
+        None => {
+            let meta = formust_build::metadata(None, &manifest)
+                .map_err(|e| io(format!("Run Form could not read the project: {e}")))?;
+            ProjectCache {
+                manifest: manifest.clone(),
+                manifest_text: manifest_text.clone(),
+                workspace_root: meta.workspace_root,
+                target_directory: meta.target_directory,
+            }
+        }
+    };
+    let workspace_root = cache.workspace_root.clone();
     let project = ProjectInfo {
-        workspace: std::fs::read_to_string(meta.workspace_root.join("Cargo.toml"))
+        workspace: std::fs::read_to_string(workspace_root.join("Cargo.toml"))
             .ok()
-            .map(|t| (meta.workspace_root.clone(), t)),
-        lock: std::fs::read_to_string(meta.workspace_root.join("Cargo.lock")).ok(),
+            .map(|t| (workspace_root.clone(), t)),
+        lock: std::fs::read_to_string(workspace_root.join("Cargo.lock")).ok(),
         manifest,
         manifest_text,
     };
@@ -824,7 +1076,7 @@ pub fn prepare(input: Inputs, target: Option<PathBuf>) -> Result<Plan, Vec<Diagn
         .flatten()
         .collect();
     let note = (!notes.is_empty()).then(|| notes.join("\n"));
-    let target_dir = target.unwrap_or(meta.target_directory);
+    let target_dir = target.unwrap_or_else(|| cache.target_directory.clone());
     let dir = dir_for(&target_dir, &owner);
     write(&dir, &package)
         .map_err(|e| io(format!("Run Form could not write {}: {e}", dir.display())))?;
@@ -842,15 +1094,18 @@ pub fn prepare(input: Inputs, target: Option<PathBuf>) -> Result<Plan, Vec<Diagn
         dir: dir.clone(),
         owner_real: owner,
     };
-    let mut request = Request::new(Action::Run, dir.join("Cargo.toml"));
+    let mut request = Request::new(action, dir.join("Cargo.toml"));
     request.env = vec![("CARGO_TARGET_DIR".into(), target_dir.into_os_string())];
-    Ok(Plan {
-        request,
-        places,
-        form_id: input.form_id,
-        dir,
-        note,
-    })
+    Ok((
+        Plan {
+            request,
+            places,
+            form_id: input.form_id,
+            dir,
+            note,
+        },
+        cache,
+    ))
 }
 
 // ---- the App ------------------------------------------------------------------------------------
@@ -862,6 +1117,11 @@ impl crate::App {
     /// (`cargo run`); a Rust file with no form says why in Output.
     pub(crate) fn run_active(&mut self, ctx: &egui::Context) {
         if self.working() {
+            return;
+        }
+        // Live Run shows this tab's form: Run rebuilds it now rather than start a second window.
+        if self.live_follows_active() {
+            self.live_rebuild(ctx);
             return;
         }
         let rust = self
@@ -924,6 +1184,12 @@ impl crate::App {
             rx,
             stopping: false,
         });
+    }
+
+    /// The theme of the designer's canvas, which a Run Form or Live Run window starts in: the
+    /// canvas's own Light/Dark choice, else the IDE's theme, which the canvas follows then.
+    pub(crate) fn canvas_theme(&self, ctx: &egui::Context) -> RunTheme {
+        RunTheme::of_canvas(self.designer.dark, ctx.global_style().visuals.dark_mode)
     }
 
     /// The caret's line in code view (1-based); `None` while the designer shows the form.
@@ -1082,7 +1348,11 @@ impl crate::App {
 
     /// Starts the prepared program: the same build session as Run, with its diagnostics placed in the
     /// project's files.
-    fn begin_run_form(&mut self, ctx: &egui::Context, plan: Plan) {
+    fn begin_run_form(&mut self, ctx: &egui::Context, mut plan: Plan) {
+        // The window starts in the canvas's theme.
+        plan.request
+            .env
+            .push((THEME_VAR.into(), self.canvas_theme(ctx).as_str().into()));
         self.diagnostics.clear();
         self.marks.clear();
         self.console = format!(
@@ -1125,6 +1395,8 @@ impl crate::App {
         true
     }
 }
+
+pub mod live;
 
 #[cfg(test)]
 mod tests;

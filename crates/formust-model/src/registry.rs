@@ -698,6 +698,23 @@ const TEXT_ONLY: &[PropDef] = &[
     ENABLED,
     VISIBLE,
 ];
+/// Heading, Small and Weak: sized as `ui.add_sized(s, egui::Label::new(RichText::new(t).heading()))`
+/// (see `formust_rust::forms::text_style`). Strong and Monospace can't be: their `RichText` method
+/// is the Label's own Bold and Monospace, so the sized form would read back as a Label.
+const SIZED_TEXT: &[PropDef] = &[
+    arg_text("text", "Text", "Text"),
+    FONT_SIZE,
+    TEXT_COLOR,
+    BOLD,
+    ITALIC,
+    UNDERLINE,
+    STRIKETHROUGH,
+    MONOSPACE,
+    TOOLTIP,
+    ADD_SIZED,
+    ENABLED,
+    VISIBLE,
+];
 
 const LABEL_PROPS: &[PropDef] = &[
     arg_text("text", "Text", "Label"),
@@ -1138,18 +1155,18 @@ const WIDGET_DEFS: &[WidgetDef] = &[
         id: WidgetId::Heading,
         name: "heading",
         label: "Heading",
-        props: TEXT_ONLY,
+        props: SIZED_TEXT,
         events: CLICKS,
-        size_props: &[],
+        size_props: &["add_sized"],
         state: None,
     },
     WidgetDef {
         id: WidgetId::Small,
         name: "small",
         label: "Small text",
-        props: TEXT_ONLY,
+        props: SIZED_TEXT,
         events: CLICKS,
-        size_props: &[],
+        size_props: &["add_sized"],
         state: None,
     },
     WidgetDef {
@@ -1165,9 +1182,9 @@ const WIDGET_DEFS: &[WidgetDef] = &[
         id: WidgetId::Weak,
         name: "weak",
         label: "Weak text",
-        props: TEXT_ONLY,
+        props: SIZED_TEXT,
         events: CLICKS,
-        size_props: &[],
+        size_props: &["add_sized"],
         state: None,
     },
     WidgetDef {

@@ -5,7 +5,8 @@
 //! egui widgets that never react to input. A click on the canvas or a row of the outline selects a
 //! node; the palette adds, drag and drop moves, the inspector edits (see [`edit`]), and saving
 //! exports the edited forms to the `.frm.rs`, a standalone copy of the `.rs` with the forms in it
-//! (see [`export`]). The `.rs` is never written and never refers to the copy.
+//! (see [`export`]). Save never writes the `.rs`, and the `.rs` never refers to the copy; only the
+//! separate "Save into .rs" action writes the forms into the `.rs` itself, after a confirmation.
 //!
 //! Edits live in the [`Loaded`] of their file until exported, with their undo history. Switching to
 //! another tab parks an edited file's state, so its edits survive until it is saved or discarded.
@@ -29,7 +30,7 @@ use std::path::{Path, PathBuf};
 use eframe::egui::{Rect, Vec2};
 use formust_model::{
     Anchor, ContainerId, EditError, Form, Node, NodeId, NodeKind, PropValue, SizeRequest,
-    container_def, is_fill, widget_def,
+    container_def, is_fill, resize_axes, resize_body_inset, resize_from_start, widget_def,
 };
 use formust_rust::{Conflict, FileKind, Header, ImportedForm, Origin, Severity, file_kind};
 
@@ -105,6 +106,17 @@ pub struct Loaded {
     pub history: edit::History,
     /// The file changed on disk or in its tab while this held unsaved edits, which were kept.
     pub stale: bool,
+    /// A fingerprint ([`text_hash`]) of the `.rs` text this was read from (the companion's for a
+    /// form file), so "Save into .rs" can tell that the source changed since.
+    pub source_seen: Option<u64>,
+}
+
+/// A fingerprint of a whole text, byte for byte.
+pub fn text_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
 }
 
 impl Loaded {
@@ -165,6 +177,10 @@ pub fn load_with(
     let mut out = Loaded {
         path: path.to_path_buf(),
         companion: companion.map(|(p, _)| p.to_path_buf()),
+        source_seen: match file_kind(path) {
+            FileKind::Form => companion.map(|(_, t)| text_hash(t)),
+            FileKind::Source | FileKind::Other => Some(text_hash(text)),
+        },
         ..Loaded::default()
     };
     let name = |p: &Path| {
@@ -332,6 +348,8 @@ pub struct Designer {
     pub scroll: Vec2,
     /// Node rects of the last kept preview pass, for hit-testing.
     pub rects: HashMap<NodeId, Rect>,
+    /// The margins around the bodies of the last kept pass (`preview::Pass::insets`).
+    pub insets: HashMap<NodeId, Vec2>,
     /// How big the form laid itself out in the last pass.
     pub content: Vec2,
     /// The outline should scroll the selected row into view (set by a canvas click).
@@ -357,6 +375,10 @@ pub struct Designer {
     pub drop: Option<edit::Drop>,
     /// The outline's rows as last drawn, for drops there.
     pub rows: Vec<edit::Row>,
+    /// `.rs` files the designer reads without their form file this session: "Save into .rs" wrote
+    /// them, so their own forms are newer than the form file's, which would otherwise win. A Save to
+    /// the form file ends it for that file.
+    pub source_only: std::collections::HashSet<PathBuf>,
     /// A question that stops the export until answered, and a difference being shown.
     pub prompt: Option<export::Prompt>,
     pub diff: Option<Diff>,
@@ -382,6 +404,12 @@ pub struct Designer {
     /// The palette's filter text and its closed categories.
     pub palette_filter: String,
     pub palette_closed: std::collections::HashSet<&'static str>,
+    /// The palette's share of the left pane's height, set by dragging the divider between the
+    /// palette and the outline; `None` is half. Kept for the session only.
+    pub palette_share: Option<f32>,
+    /// The palette and outline sections of the left pane as last drawn (above and below the
+    /// divider), for the tests.
+    pub left_sections: Option<(Rect, Rect)>,
     /// Canvas overlays, never exported: rulers in points, a grid of lines every so many points,
     /// and the distances from the selected node to its neighbours.
     pub rulers: bool,
@@ -396,6 +424,9 @@ pub struct Designer {
     pub spacing_value: Option<f32>,
     /// A row of the tab order list being dragged.
     pub tab_drag: Option<NodeId>,
+    /// Counts the committed changes to the forms: an edit that changed a form, an undo or redo,
+    /// and the end of a resize drag. Live Run rebuilds when it moves (see `run_form::live`).
+    pub revision: u64,
     /// The page each Tabs shows on the canvas, by Tabs id: the one last selected in or clicked.
     pub tab_pages: HashMap<NodeId, NodeId>,
     /// The tab buttons of the last kept pass, with the page each shows.
@@ -413,6 +444,11 @@ pub struct Resizing {
     pub before: Vec<Form>,
     /// A row-based height: the rows at the start and the height of one row.
     pub rows: Option<(i64, f32)>,
+    /// The handles are on the left and top edges (a right or bottom panel): a drag that way grows.
+    pub from_start: (bool, bool),
+    /// What the rect has around the body that the written size is for (a Frame's margin and
+    /// stroke, a collapsing header's header and indent), taken off the dragged size.
+    pub inset: Vec2,
 }
 
 /// The least size a resize gives.
@@ -475,6 +511,7 @@ impl Designer {
             self.hovered = None;
             self.scroll = Vec2::ZERO;
             self.rects.clear();
+            self.insets.clear();
         }
         let forms = self.forms();
         if self
@@ -485,6 +522,7 @@ impl Designer {
             self.form_id = forms.first().map(|f| f.form().id());
             self.selected = None;
             self.rects.clear();
+            self.insets.clear();
         }
         if let Some(s) = self.selected
             && self.current().is_none_or(|f| f.form().find(s).is_none())
@@ -533,6 +571,7 @@ impl Designer {
             self.selected = selected;
             self.hovered = None;
             self.rects.clear();
+            self.insets.clear();
             return;
         }
         self.set_loaded(loaded);
@@ -605,6 +644,7 @@ impl Designer {
         match &result {
             Ok(_) if loaded.forms[i].form() != &before[i] => {
                 loaded.history.checkpoint(key, || before);
+                self.revision += 1;
             }
             Ok(_) => {}
             Err(_) => loaded.forms[i].imported.form = before[i].clone(),
@@ -650,6 +690,7 @@ impl Designer {
         };
         let Some(state) = state else { return false };
         loaded.restore(state);
+        self.revision += 1;
         if let Some(s) = self.selected
             && self.current().is_none_or(|f| f.form().find(s).is_none())
         {
@@ -1215,6 +1256,16 @@ impl Designer {
         })
     }
 
+    /// The axes of `node`'s resize handles on the canvas: [`resize_axes`], except that a container
+    /// whose body sits in a margin needs that margin measured first (a collapsing header that is
+    /// closed has no body to size).
+    pub fn handles_of(&self, node: &Node) -> (bool, bool) {
+        if resize_body_inset(node) && !self.insets.contains_key(&node.id) {
+            return (false, false);
+        }
+        resize_axes(node)
+    }
+
     /// Removes every size property of the selected node.
     pub fn reset_size(&mut self) -> bool {
         let Some(id) = self.selected else {
@@ -1239,12 +1290,25 @@ impl Designer {
             }),
             _ => None,
         });
+        let (from_start, inset) = self.current().and_then(|f| f.form().find(id)).map_or(
+            ((false, false), Vec2::ZERO),
+            |n| {
+                let inset = if resize_body_inset(n) {
+                    self.insets.get(&id).copied().unwrap_or(Vec2::ZERO)
+                } else {
+                    Vec2::ZERO
+                };
+                (resize_from_start(n), inset)
+            },
+        );
         self.resize = Some(Resizing {
             id,
             edges,
             start,
             before: loaded.snapshot(),
             rows,
+            from_start,
+            inset,
         });
     }
 
@@ -1254,15 +1318,22 @@ impl Designer {
         let (Some(r), Some(i)) = (self.resize.clone(), self.current_index()) else {
             return;
         };
+        // A handle on the left or top edge grows the node when dragged left or up.
+        let delta = Vec2::new(
+            if r.from_start.0 { -delta.x } else { delta.x },
+            if r.from_start.1 { -delta.y } else { delta.y },
+        );
         let size = drag_size(r.start.size(), r.edges, delta, shift, alt);
         let rows = r.rows.map(|(rows0, row_h)| {
             let extra = ((size.y - r.start.height()) / row_h.max(1.0)).round() as i64;
             (rows0 + extra).max(1)
         });
+        // The body's size, for a container that has a margin around it.
+        let body = (size - r.inset).round().max(Vec2::ZERO);
         let mut form = r.before[i].clone();
         let request = SizeRequest {
-            width: f64::from(size.x),
-            height: f64::from(size.y),
+            width: f64::from(body.x),
+            height: f64::from(body.y),
             rows,
             change_width: r.edges.0,
             change_height: r.edges.1,
@@ -1285,6 +1356,7 @@ impl Designer {
             && l.snapshot() != r.before
         {
             l.history.checkpoint(None, || r.before);
+            self.revision += 1;
         }
     }
 
@@ -1361,6 +1433,7 @@ impl Designer {
         self.selected = None;
         self.prompt = None;
         self.rects.clear();
+        self.insets.clear();
         true
     }
 
@@ -1389,6 +1462,34 @@ impl Designer {
         self.selected = None;
     }
 
+    /// After "Save into .rs" wrote `text` to `path`: the forms are read again from the new `.rs`
+    /// alone (its form file, which wasn't written, is left out for the session; see
+    /// [`Designer::source_only`]), with a new history, as after a re-import. The form shown stays;
+    /// a legacy `X::update` written as `X::ui` is followed.
+    pub fn take_written_source(&mut self, path: &Path, text: &str) {
+        let loaded = load_with(path, text, None, self.extended);
+        if let Some(id) = self.form_id.clone()
+            && !loaded.forms.iter().any(|f| f.form().id() == id)
+            && let Some((owner, _)) = id.split_once("::")
+        {
+            let ui = format!("{owner}::ui");
+            if loaded.forms.iter().any(|f| f.form().id() == ui) {
+                self.form_id = Some(ui);
+            }
+        }
+        self.parked.remove(path);
+        self.source_only.insert(path.to_path_buf());
+        self.prompt = None;
+        self.selected = None;
+        self.multi.clear();
+        self.range_to = None;
+        self.resize = None;
+        self.hovered = None;
+        self.rects.clear();
+        self.insets.clear();
+        self.set_loaded(loaded);
+    }
+
     pub fn choose_form(&mut self, id: String) {
         if self.form_id.as_ref() != Some(&id) {
             self.form_id = Some(id);
@@ -1399,6 +1500,7 @@ impl Designer {
             self.hovered = None;
             self.scroll = Vec2::ZERO;
             self.rects.clear();
+            self.insets.clear();
         }
     }
 
@@ -2173,6 +2275,51 @@ impl About {
         assert_eq!(d.loaded.as_ref().unwrap().history.steps(), 1);
         assert!(d.undo());
         assert_eq!(width(&d), None);
+    }
+
+    /// The revision moves once per committed change: an edit that changed the form, an undo, a
+    /// redo, the end of a resize drag. A refused edit, an edit that changed nothing, the steps of a
+    /// drag and an Escape leave it.
+    #[test]
+    fn the_revision_counts_committed_changes_only() {
+        let mut d = Designer::default();
+        d.store(load(Path::new("/p/login.rs"), LOGIN, None), 1);
+        assert_eq!(d.revision, 0);
+        let row = d.current().unwrap().form().root.children()[0].id;
+        let field = d.current().unwrap().form().find(row).unwrap().children()[1].id;
+        d.edit(None, |f| {
+            let n = f.new_widget(formust_model::WidgetId::Separator);
+            f.insert(f.root.id, 0, n)
+        })
+        .unwrap();
+        assert_eq!(d.revision, 1, "an edit");
+        d.edit(None, |_| Ok(())).unwrap();
+        assert_eq!(d.revision, 1, "an edit that changed nothing");
+        let refused = d.edit(None, |f| {
+            let n = f.new_widget(formust_model::WidgetId::Separator);
+            f.insert(NodeId(9_999), 0, n)
+        });
+        assert!(refused.is_err());
+        assert_eq!(d.revision, 1, "a refused edit");
+        assert!(d.undo());
+        assert_eq!(d.revision, 2, "an undo");
+        assert!(d.redo());
+        assert_eq!(d.revision, 3, "a redo");
+        assert!(!d.redo());
+        assert_eq!(d.revision, 3, "nothing to redo");
+        d.select(Some(field), true);
+        let start = Rect::from_min_size(eframe::egui::pos2(10.0, 10.0), Vec2::new(280.0, 20.0));
+        d.begin_resize(field, (true, false), start, 16.0);
+        for dx in [10.0, 30.0] {
+            d.drag_resize(Vec2::new(dx, 0.0), false, false);
+        }
+        assert_eq!(d.revision, 3, "the steps of a drag");
+        d.end_resize();
+        assert_eq!(d.revision, 4, "the end of a drag");
+        d.begin_resize(field, (true, false), start, 16.0);
+        d.drag_resize(Vec2::new(-50.0, 0.0), false, false);
+        d.cancel_resize();
+        assert_eq!(d.revision, 4, "an Escape");
     }
 
     #[test]
