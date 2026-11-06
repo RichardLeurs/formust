@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Builds Pascoda.dmg: a disk image with Pascoda.app and an Applications shortcut to drag it to.
+# Builds Formust.dmg: a disk image with Formust.app and an Applications shortcut to drag it to.
 #
-# Usage: packaging/make-dmg.sh [output-dir]      (default: ~/Library/Caches/Pascoda/dist)
+# Usage: packaging/make-dmg.sh [output-dir]      (default: ~/Library/Caches/Formust/dist)
 #
 # Runs bundle.sh first, so the signing variables work the same way:
 #   CODESIGN_IDENTITY=<id>   also signs the disk image
@@ -9,24 +9,24 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-out="${1:-$HOME/Library/Caches/Pascoda/dist}"
-app="$out/Pascoda.app"
-dmg="$out/Pascoda.dmg"
+out="${1:-$HOME/Library/Caches/Formust/dist}"
+app="$out/Formust.app"
+dmg="$out/Formust.dmg"
 
 "$root/packaging/bundle.sh" "$out"
 
-version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/crates/pascoda-app/Cargo.toml" | head -1)"
+version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/crates/formust-app/Cargo.toml" | head -1)"
 work="$(mktemp -d)"
-stage="$work/Pascoda"
+stage="$work/Formust"
 mkdir -p "$stage"
 # ditto keeps the signature, symlinks and extended attributes intact.
-ditto "$app" "$stage/Pascoda.app"
+ditto "$app" "$stage/Formust.app"
 ln -s /Applications "$stage/Applications"
 
 rm -f "$dmg"
 # ULFO (LZFSE) is much smaller than zlib for the bundled sources. diskutil makes an APFS volume
 # (macOS 11 or later; the app itself needs macOS 14).
-diskutil image create from --format ULFO --volumeName "Pascoda $version" "$stage" "$dmg" >/dev/null
+diskutil image create from --format ULFO --volumeName "Formust $version" "$stage" "$dmg" >/dev/null
 rm -rf "$work"
 
 if [ -n "${CODESIGN_IDENTITY:-}" ]; then

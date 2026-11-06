@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["crates/pascoda-ai", "crates/pascoda-app", "crates/pascoda-dap", "crates/pascoda-forms", "crates/pascoda-fpc", "crates/pascoda-lsp", "crates/pascoda-project"]
+members = ["crates/formust-build", "crates/formust-model", "crates/formust-rust", "crates/formust-ai", "crates/formust-app", "crates/formust-lsp"]
 
 # The identity of the IDE app itself. packaging/bundle.sh writes these into the app's Info.plist (name, bundle_id,
 # copyright, min_macos; it also builds with MACOSX_DEPLOYMENT_TARGET = min_macos). The About panel reads name and
-# copyright at build time (crates/pascoda-app/build.rs). Generated apps use their own settings (lcl::MIN_MACOS or the
-# project's min_macos), not these.
-[workspace.metadata.pascoda]
-name = "Pascoda"
+# copyright at build time (crates/formust-app/build.rs). Generated apps use their own settings (the project's
+# min_macos), not these.
+[workspace.metadata.formust]
+name = "Formust"
 # A placeholder: replace it with the identifier of the real developer account.
-bundle_id = "com.richardleurs.pascoda"
+bundle_id = "com.richardleurs.formust"
 copyright = "Copyright © Richard Leurs 2026 | GNU GPL-3.0 License"
 min_macos = "11"

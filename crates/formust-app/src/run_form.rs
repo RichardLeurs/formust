@@ -1,0 +1,940 @@
+//! Run Form: Run on a Rust file with a form builds a small program that shows that one form in a
+//! window. Nothing is written into the project. The program is generated in the project's cargo
+//! target folder (`<target>/formust-run/<hash>/`): one Rust file, a `Cargo.toml` with the project's
+//! dependencies, and a `main.rs` that opens the window. Only that package is built, not the
+//! project's binary.
+//!
+//! The Rust file is the form file as Save would write it, with the unsaved edits: a standalone copy
+//! of the source, so nothing else is needed. While a form is unedited and has no form file, it is the
+//! source's text (an open tab's, unsaved). That text gets a `formust_run` module appended. It sits inside the owner's module, so
+//! it can use the owner's private items, and it calls the form's function every frame: a `Ui` form
+//! inside a `CentralPanel`, a dialog (a `Context` form) with the `ctx`, a free dialog as
+//! `owner::fn(ctx)`. A headless run (`FORMUST_RUN_FORM_TEST=1`) draws one frame instead and prints the
+//! texts it drew; the tests use it.
+//!
+//! The pure parts (manifest, copies, placement, the choice of form) are here and unit-tested. Reading
+//! the project and running cargo happen on a worker thread ([`prepare`]), so the window never waits
+//! for them.
+
+use std::ops::Range;
+use std::path::{Component, Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
+
+use crate::bottom;
+use crate::cargo::{self, Session};
+use crate::designer;
+use eframe::egui;
+use formust_build::{Action, Diagnostic, Request, Severity};
+use formust_model::Form;
+use formust_rust::{FileKind, Origin, file_kind};
+
+/// The folder under the target folder where the generated programs live.
+const FOLDER: &str = "formust-run";
+
+/// What the designer shows, as Run Form needs it. Built on the UI thread from the open tabs and the
+/// designer's state, so unsaved text is what the program gets.
+#[derive(Clone, Debug)]
+pub struct Inputs {
+    /// The file that runs, where the form's owner type lives: the form file (the copy), or the
+    /// source while the form is unedited and has no form file.
+    pub owner: PathBuf,
+    /// Its text: the copy as Save would write it, or the source's open tab, else the disk's.
+    pub owner_text: String,
+    /// The form's identity, `owner::method`.
+    pub form_id: String,
+    /// The owner type; empty for a free function (a dialog only, see [`Kind::FreeDialog`]).
+    pub owner_type: String,
+    pub method: String,
+    pub kind: Kind,
+}
+
+/// How the form is called.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// `fn m(&mut self, ui: &mut egui::Ui)`, drawn inside a `CentralPanel`.
+    Ui,
+    /// `fn m(&mut self, ctx: &egui::Context)`: a dialog, called every frame.
+    Context,
+    /// The old `fn update(&mut self, ctx, frame)`: called with the frame, in the window only.
+    Legacy,
+    /// `fn ui(&mut self, ui, frame)` of an `eframe::App` (a legacy `update` in the copy is one):
+    /// called through the trait with the frame, in the window only.
+    App,
+    /// A free dialog, `fn m(ctx: &egui::Context)` with no owner type: called as `owner::m(ctx)` every
+    /// frame. The copy keeps the function, so it must compile on its own (see [`crate_note`]).
+    FreeDialog,
+}
+
+/// The project as the generated manifest needs it.
+#[derive(Clone, Debug, Default)]
+pub struct ProjectInfo {
+    /// The project's `Cargo.toml`.
+    pub manifest: PathBuf,
+    pub manifest_text: String,
+    /// The workspace root and its `Cargo.toml`, for dependencies inherited from it.
+    pub workspace: Option<(PathBuf, String)>,
+    /// The `Cargo.lock` of the workspace, so the program builds with the project's versions.
+    pub lock: Option<String>,
+}
+
+/// The files of the generated package, before they are written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Package {
+    pub manifest: String,
+    pub lock: Option<String>,
+    pub main: String,
+    /// The file that runs, with the harness appended.
+    pub owner: String,
+}
+
+/// Where the copies stand for the real files, so that a diagnostic in a copy is shown in the project.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Places {
+    dir: PathBuf,
+    /// `dir` as cargo may report it (canonical).
+    canonical: PathBuf,
+    owner_real: PathBuf,
+}
+
+impl Places {
+    /// The source's file name, for messages.
+    pub fn owner_name(&self) -> String {
+        file_name(&self.owner_real)
+    }
+
+    /// The diagnostic with its file replaced by the project's. A message about the generated
+    /// `Cargo.toml` or `main.rs` has no place in the project: it goes to the source at line 0.
+    pub fn real(&self, mut d: Diagnostic) -> Diagnostic {
+        let rel = [&self.dir, &self.canonical]
+            .into_iter()
+            .find_map(|dir| d.file.strip_prefix(dir).ok().map(Path::to_path_buf));
+        let Some(rel) = rel else {
+            return d;
+        };
+        let rel = rel
+            .strip_prefix("src")
+            .map(Path::to_path_buf)
+            .unwrap_or(rel);
+        d.file = self.owner_real.clone();
+        if rel != Path::new("owner.rs") {
+            d.line = 0;
+            d.col = 0;
+        }
+        d
+    }
+}
+
+/// A prepared run: the request to start, and where its diagnostics go.
+pub struct Plan {
+    pub request: Request,
+    pub places: Places,
+    pub form_id: String,
+    pub dir: PathBuf,
+    /// A line for Output about the copy, when it may not build on its own (see [`crate_note`]).
+    pub note: Option<String>,
+}
+
+/// A run being prepared on a worker thread. `stopping` is set by Stop: the run is then not started.
+pub struct Prep {
+    pub rx: Receiver<Result<Plan, Vec<Diagnostic>>>,
+    pub stopping: bool,
+}
+
+// ---- what the messages say ----------------------------------------------------------------------
+
+fn needs_default(owner: &str) -> String {
+    format!(
+        "Run Form needs `impl Default for {owner}`: the window starts from `{owner}::default()`. Add `#[derive(Default)]` above `struct {owner}`, or write `impl Default for {owner}` by hand."
+    )
+}
+
+/// The note under the Output when a run fails: the copy is built on its own.
+pub fn own_build_note(source: &str) -> String {
+    format!(
+        "Run Form builds {source} on its own. If an error is about an item from the rest of the crate (a `mod`, or a `crate::` path), the form can't run this way yet: see Problems.\n"
+    )
+}
+
+/// Output's line when Run is pressed on a Rust file with no form: the project's program runs instead.
+pub const NO_FORM: &str = "no form in this file, running the project";
+
+/// Output's line for a file whose text uses `crate::` paths: it is built alone, so those paths don't
+/// resolve in it. `None` when it has none.
+pub fn crate_note(owner_text: &str) -> Option<String> {
+    owner_text.contains("crate::").then(|| {
+        "this form uses code from elsewhere in the project (crate::…); Run Form copies only this file."
+            .to_string()
+    })
+}
+
+// ---- pure generation ----------------------------------------------------------------------------
+
+/// The form's kind as the designer reads it.
+pub fn kind_of(form: &Form) -> Kind {
+    if form.context_root && form.owner.is_empty() {
+        Kind::FreeDialog
+    } else if form.context_root {
+        Kind::Context
+    } else if form.legacy_ctx.is_some() {
+        Kind::Legacy
+    } else if form.impl_header.contains(" for ")
+        && form.method == "ui"
+        && form.sig.contains("Frame")
+    {
+        Kind::App
+    } else {
+        Kind::Ui
+    }
+}
+
+/// The kind and method of the form as the copy has it: Save writes a legacy `update` as the
+/// `eframe::App` method `fn ui(&mut self, ui, frame)`; a dialog keeps its name and its `ctx`.
+pub fn in_copy(kind: Kind, method: &str) -> (Kind, String) {
+    match kind {
+        Kind::Legacy => (Kind::App, "ui".to_string()),
+        kind => (kind, method.to_string()),
+    }
+}
+
+/// The index of the form Run Form runs, in `ids` (the forms' ids, in order). `spans[i]` is the byte
+/// range of form `i`'s function in `text`, or `None` when it was read from the other file. In code
+/// view (`caret_line`, 1-based) the form whose function holds the caret's line; else the designer's
+/// form (`designer_id`) when it is one of them; else the first.
+pub fn pick_form(
+    ids: &[String],
+    spans: &[Option<Range<usize>>],
+    text: &str,
+    designer_id: Option<&str>,
+    caret_line: Option<u32>,
+) -> Option<usize> {
+    let under_caret = caret_line.and_then(|line| {
+        spans.iter().position(|span| {
+            span.as_ref().is_some_and(|s| {
+                line_of(text, s.start) <= line && line_of(text, s.end.saturating_sub(1)) >= line
+            })
+        })
+    });
+    under_caret
+        .or_else(|| designer_id.and_then(|id| ids.iter().position(|i| i == id)))
+        .or((!ids.is_empty()).then_some(0))
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+}
+
+/// An error with no more place than a file (and a line, 0 for none).
+fn problem(file: &Path, line: u32, message: String) -> Diagnostic {
+    Diagnostic {
+        file: file.to_path_buf(),
+        line,
+        col: 0,
+        severity: Severity::Error,
+        message,
+    }
+}
+
+/// The 1-based line of a byte offset.
+fn line_of(text: &str, at: usize) -> u32 {
+    text.get(..at)
+        .map_or(0, |t| t.matches('\n').count() as u32 + 1)
+}
+
+/// A stable 64-bit hash (FNV-1a), so a source always gets the same folder.
+fn fnv1a(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+/// The key of the program for `owner`: a stable hash of its path, which names its folder and package.
+fn key_of(owner: &Path) -> String {
+    format!("{:016x}", fnv1a(&owner.to_string_lossy()))
+}
+
+/// The folder of the program for `owner`, under the target folder.
+pub fn dir_for(target: &Path, owner: &Path) -> PathBuf {
+    target.join(FOLDER).join(key_of(owner))
+}
+
+/// The package name of the program for `owner`. Every copy declares its own `[workspace]`, so cargo
+/// keys its build by the name alone: with one shared name, a copy of another form whose own files
+/// look unchanged would run that form's binary. A name per source keeps the builds apart.
+pub fn package_name(owner: &Path) -> String {
+    format!("formust-run-{}", key_of(owner))
+}
+
+/// `path` with its `.` and `..` resolved in the text (nothing is read from the disk), so a path
+/// dependency reads `/p/mylib`, not `/p/app/../mylib`.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push(part);
+                }
+            }
+            Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn inherits(table: &toml::Table) -> bool {
+    table.get("workspace") == Some(&toml::Value::Boolean(true))
+}
+
+fn version_table(version: &str) -> toml::Table {
+    let mut t = toml::Table::new();
+    t.insert("version".into(), toml::Value::String(version.to_string()));
+    t
+}
+
+/// One dependency as the generated manifest writes it: a table, with a relative `path` made absolute
+/// (against `dir`, or the workspace's folder when inherited). `None` when the workspace has no entry.
+fn dependency(
+    name: &str,
+    value: &toml::Value,
+    dir: &Path,
+    workspace: Option<(&toml::Table, &Path)>,
+) -> Option<toml::Value> {
+    let mut table = match value {
+        toml::Value::Table(t) => t.clone(),
+        toml::Value::String(version) => version_table(version),
+        _ => return None,
+    };
+    let mut dir = dir.to_path_buf();
+    if inherits(&table) {
+        let (ws, ws_dir) = workspace?;
+        let inherited = ws.get("workspace")?.get("dependencies")?.get(name)?;
+        let mut merged = match inherited {
+            toml::Value::Table(t) => t.clone(),
+            toml::Value::String(version) => version_table(version),
+            _ => return None,
+        };
+        if let Some(toml::Value::String(path)) = merged.get("path").cloned() {
+            merged.insert(
+                "path".into(),
+                toml::Value::String(lexical(&ws_dir.join(path)).to_string_lossy().into_owned()),
+            );
+        }
+        for (key, value) in table {
+            if key == "workspace" {
+                continue;
+            }
+            // Features add to the inherited ones, as cargo merges them; other keys override.
+            let value = match (key.as_str(), merged.get(&key), &value) {
+                ("features", Some(toml::Value::Array(old)), toml::Value::Array(new)) => {
+                    let mut all = old.clone();
+                    all.extend(new.iter().cloned());
+                    toml::Value::Array(all)
+                }
+                _ => value,
+            };
+            merged.insert(key, value);
+        }
+        table = merged;
+        dir = ws_dir.to_path_buf();
+    }
+    if let Some(toml::Value::String(path)) = table.get("path").cloned() {
+        table.insert(
+            "path".into(),
+            toml::Value::String(lexical(&dir.join(path)).to_string_lossy().into_owned()),
+        );
+    }
+    Some(toml::Value::Table(table))
+}
+
+/// The manifest of the generated package: the project's `[dependencies]` (and `[patch]`) with relative
+/// paths made absolute, its edition, and `eframe` (at egui's version) when the project only has egui.
+pub fn manifest(project: &ProjectInfo, name: &str) -> Result<String, String> {
+    let file = file_name(&project.manifest);
+    let table: toml::Table = project
+        .manifest_text
+        .parse()
+        .map_err(|e| format!("Run Form could not read {file}: {e}"))?;
+    let dir = project.manifest.parent().unwrap_or(Path::new(""));
+    let workspace: Option<toml::Table> = project
+        .workspace
+        .as_ref()
+        .and_then(|(_, text)| text.parse().ok());
+    let ws = workspace
+        .as_ref()
+        .zip(project.workspace.as_ref().map(|(d, _)| d.as_path()));
+    let ws_package = |key: &str| {
+        workspace
+            .as_ref()?
+            .get("workspace")?
+            .get("package")?
+            .get(key)?
+            .as_str()
+            .map(str::to_string)
+    };
+    let edition = match table.get("package").and_then(toml::Value::as_table) {
+        Some(package) => match package.get("edition") {
+            Some(toml::Value::String(edition)) => Some(edition.clone()),
+            Some(toml::Value::Table(t)) if inherits(t) => ws_package("edition"),
+            _ => None,
+        },
+        None => None,
+    }
+    .unwrap_or_else(|| "2024".to_string());
+
+    let mut deps = toml::Table::new();
+    if let Some(list) = table.get("dependencies").and_then(toml::Value::as_table) {
+        for (name, value) in list {
+            let resolved = dependency(name, value, dir, ws).ok_or_else(|| {
+                format!(
+                    "Run Form could not resolve `{name}` in {file}: it is inherited from the workspace, which has no entry for it"
+                )
+            })?;
+            deps.insert(name.clone(), resolved);
+        }
+    }
+    if !deps.contains_key("eframe") {
+        let egui_version = deps
+            .get("egui")
+            .and_then(|v| v.get("version"))
+            .and_then(toml::Value::as_str)
+            .map(str::to_string);
+        let Some(version) = egui_version else {
+            return Err(format!(
+                "Run Form needs `eframe` in [dependencies] of {file}: add `eframe = \"0.37\"`, the version of the egui your form uses."
+            ));
+        };
+        deps.insert("eframe".into(), toml::Value::Table(version_table(&version)));
+    }
+
+    let mut out = toml::Table::new();
+    let mut own = toml::Table::new();
+    own.insert("name".into(), toml::Value::String(name.to_string()));
+    own.insert("version".into(), toml::Value::String("0.0.0".into()));
+    own.insert("edition".into(), toml::Value::String(edition));
+    own.insert("publish".into(), toml::Value::Boolean(false));
+    out.insert("package".into(), toml::Value::Table(own));
+    out.insert("dependencies".into(), toml::Value::Table(deps));
+    if let Some(patches) = table.get("patch").and_then(toml::Value::as_table) {
+        let mut patch = toml::Table::new();
+        for (registry, list) in patches {
+            let Some(list) = list.as_table() else {
+                continue;
+            };
+            let mut resolved = toml::Table::new();
+            for (name, value) in list {
+                if let Some(v) = dependency(name, value, dir, None) {
+                    resolved.insert(name.clone(), v);
+                }
+            }
+            patch.insert(registry.clone(), toml::Value::Table(resolved));
+        }
+        out.insert("patch".into(), toml::Value::Table(patch));
+    }
+    // An empty workspace: the generated package is not a member of the project's workspace.
+    out.insert("workspace".into(), toml::Value::Table(toml::Table::new()));
+    toml::to_string(&out).map_err(|e| format!("Run Form could not write the manifest: {e}"))
+}
+
+/// The harness appended to the copy of the source. `@...@` marks what depends on the form.
+const HARNESS: &str = r#"// Formust's Run Form harness, added to a temporary copy of this file. The project's file is not changed.
+#[doc(hidden)]
+#[allow(dead_code, unused)]
+pub mod formust_run {
+    use eframe::egui;
+
+    @STRUCT@
+
+    impl Runner {
+        fn new() -> Self {
+            @NEW@
+        }
+    }
+
+@DRAW@
+    impl eframe::App for Runner {
+        fn ui(&mut self, ui: &mut egui::Ui, @FRAME@: &mut eframe::Frame) {
+            @APP_BODY@
+        }
+    }
+
+    pub fn app() -> Box<dyn eframe::App> {
+        Box::new(Runner::new())
+    }
+
+    /// The texts one headless frame draws (FORMUST_RUN_FORM_TEST). Two passes: a layout needs one.
+    pub fn headless() -> Vec<String> {
+@HEADLESS@
+    }
+}
+"#;
+
+/// The headless drawing of a `Ui` or `Context` form: one frame, its texts. Two passes, and the texts
+/// of the second are kept, since a layout needs a pass.
+const HEADLESS_DRAW: &str = r#"        fn texts(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut app = Runner::new();
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            let mut full = ctx.run_ui(egui::RawInput::default(), |ui| draw(&mut app, ui));
+            // No renderer takes the font texture here.
+            full.textures_delta.clear();
+            out.clear();
+            for clipped in &full.shapes {
+                texts(&clipped.shape, &mut out);
+            }
+        }
+        out"#;
+
+/// The harness for `owner_type::method`. A `Ui` form is drawn inside a `CentralPanel`; a dialog is
+/// called with the `ctx` every frame; a free dialog is `super::method(ctx)` with no owner; a legacy
+/// `update` and an `eframe::App`'s `ui` are called with the frame from the window's
+/// `eframe::App::ui`, so they have no headless drawing.
+pub fn harness(owner_type: &str, method: &str, kind: Kind) -> String {
+    // `app.owner.m(args)`: the owner is the value `Runner::new` makes with `Default`.
+    let call = |recv: &str, args: &str| format!("{recv}.owner.{method}({args})");
+    let (structure, new) = if kind == Kind::FreeDialog {
+        ("pub struct Runner;".to_string(), "Runner".to_string())
+    } else {
+        (
+            format!("pub struct Runner {{\n        owner: super::{owner_type},\n    }}"),
+            format!("Runner {{ owner: super::{owner_type}::default() }}"),
+        )
+    };
+    let (draw, app_body, frame, headless) = match kind {
+        Kind::FreeDialog => (
+            format!(
+                "    fn draw(_app: &mut Runner, ui: &mut egui::Ui) {{\n        let _ = super::{method}(ui.ctx());\n    }}\n"
+            ),
+            "draw(self, ui);".to_string(),
+            "_frame",
+            HEADLESS_DRAW.to_string(),
+        ),
+        Kind::Ui => (
+            format!(
+                "    fn draw(app: &mut Runner, ui: &mut egui::Ui) {{\n        egui::CentralPanel::default().show(ui, |ui| {{\n            let _ = {};\n        }});\n    }}\n",
+                call("app", "ui")
+            ),
+            "draw(self, ui);".to_string(),
+            "_frame",
+            HEADLESS_DRAW.to_string(),
+        ),
+        Kind::Context => (
+            format!(
+                "    fn draw(app: &mut Runner, ui: &mut egui::Ui) {{\n        let _ = {};\n    }}\n",
+                call("app", "ui.ctx()")
+            ),
+            "draw(self, ui);".to_string(),
+            "_frame",
+            HEADLESS_DRAW.to_string(),
+        ),
+        Kind::Legacy => (
+            String::new(),
+            format!("let _ = {};", call("self", "ui.ctx(), frame")),
+            "frame",
+            "        Vec::new()".to_string(),
+        ),
+        Kind::App => (
+            String::new(),
+            "eframe::App::ui(&mut self.owner, ui, frame);".to_string(),
+            "frame",
+            "        Vec::new()".to_string(),
+        ),
+    };
+    HARNESS
+        .replace("@STRUCT@", &structure)
+        .replace("@NEW@", &new)
+        .replace("@DRAW@", &draw)
+        .replace("@FRAME@", frame)
+        .replace("@APP_BODY@", &app_body)
+        .replace("@HEADLESS@", &headless)
+}
+
+/// The generated `main.rs`: the headless run when `FORMUST_RUN_FORM_TEST` is set, else the window.
+pub fn main_rs(title: &str) -> String {
+    format!(
+        "//! Formust's Run Form program: one form in one window. Generated in a temporary folder.
+#[allow(dead_code, unused)]
+mod owner;
+
+fn main() {{
+    if std::env::var_os(\"FORMUST_RUN_FORM_TEST\").is_some() {{
+        println!(\"drawn: {{}}\", owner::formust_run::headless().join(\" | \"));
+        return;
+    }}
+    let result = eframe::run_native(
+        {title:?},
+        eframe::NativeOptions::default(),
+        Box::new(|_cc| Ok(owner::formust_run::app())),
+    );
+    if let Err(error) = result {{
+        eprintln!(\"The window could not open: {{error}}\");
+        std::process::exit(1);
+    }}
+}}
+"
+    )
+}
+
+/// The generated package for `input`, or the problems that stop it: a free function that is no
+/// dialog, a type with no `Default`, a manifest that can't be made.
+pub fn package(input: &Inputs, project: &ProjectInfo) -> Result<Package, Vec<Diagnostic>> {
+    let source = input.owner.as_path();
+    if input.owner_type.is_empty() && input.kind != Kind::FreeDialog {
+        return Err(vec![problem(
+            source,
+            0,
+            format!(
+                "Run Form runs a method of a type or a free dialog (`fn {m}(ctx: &egui::Context)`), and `{m}` is a free function that is not a dialog. Call it from a method of a type with `impl Default` (such as `ui`) and run that form instead.",
+                m = input.method
+            ),
+        )]);
+    }
+    if !input.owner_type.is_empty()
+        && formust_rust::usage::declares_type(&input.owner_text, &input.owner_type)
+        && !formust_rust::usage::has_default(&input.owner_text, &input.owner_type)
+    {
+        // Placed at the impl that holds the form, when the text imports.
+        let line = formust_rust::import(&input.owner_text)
+            .ok()
+            .and_then(|p| {
+                p.forms
+                    .iter()
+                    .find(|f| f.form.owner == input.owner_type && f.form.method == input.method)
+                    .map(|f| line_of(&input.owner_text, f.impl_range.start))
+            })
+            .unwrap_or(0);
+        return Err(vec![problem(
+            source,
+            line,
+            needs_default(&input.owner_type),
+        )]);
+    }
+
+    let name = package_name(source);
+    let manifest = manifest(project, &name).map_err(|m| vec![problem(&project.manifest, 0, m)])?;
+    let mut owner = input.owner_text.clone();
+    if !owner.ends_with('\n') {
+        owner.push('\n');
+    }
+    owner.push('\n');
+    owner.push_str(&harness(&input.owner_type, &input.method, input.kind));
+    Ok(Package {
+        manifest,
+        lock: project.lock.clone(),
+        main: main_rs(&input.form_id),
+        owner,
+    })
+}
+
+// ---- files and threads --------------------------------------------------------------------------
+
+fn write_if_changed(path: &Path, text: &str) -> std::io::Result<()> {
+    if std::fs::read_to_string(path).ok().as_deref() == Some(text) {
+        return Ok(());
+    }
+    std::fs::write(path, text)
+}
+
+/// Writes `package` into `dir`, with `src/` for the copies. Unchanged files are left alone, so cargo's
+/// build of an unchanged program stays fresh.
+pub fn write(dir: &Path, package: &Package) -> std::io::Result<()> {
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src)?;
+    write_if_changed(&dir.join("Cargo.toml"), &package.manifest)?;
+    if let Some(lock) = &package.lock {
+        write_if_changed(&dir.join("Cargo.lock"), lock)?;
+    }
+    write_if_changed(&src.join("main.rs"), &package.main)?;
+    write_if_changed(&src.join("owner.rs"), &package.owner)?;
+    Ok(())
+}
+
+/// Reads the project of `input`, asks cargo where its target folder is, and writes the program there.
+/// `target` replaces the project's target folder (the tests use a shared one). Runs on a worker thread:
+/// cargo's `metadata` takes a moment.
+pub fn prepare(input: Inputs, target: Option<PathBuf>) -> Result<Plan, Vec<Diagnostic>> {
+    let owner = input.owner.clone();
+    let io = |message: String| vec![problem(&owner, 0, message)];
+    let manifest = formust_build::manifest_for(&owner).map_err(|e| {
+        io(format!(
+            "Run Form could not find the Cargo.toml of {}: {e}",
+            file_name(&owner)
+        ))
+    })?;
+    let meta = formust_build::metadata(None, &manifest)
+        .map_err(|e| io(format!("Run Form could not read the project: {e}")))?;
+    let manifest_text = std::fs::read_to_string(&manifest).map_err(|e| {
+        io(format!(
+            "Run Form could not read {}: {e}",
+            manifest.display()
+        ))
+    })?;
+    let project = ProjectInfo {
+        workspace: std::fs::read_to_string(meta.workspace_root.join("Cargo.toml"))
+            .ok()
+            .map(|t| (meta.workspace_root.clone(), t)),
+        lock: std::fs::read_to_string(meta.workspace_root.join("Cargo.lock")).ok(),
+        manifest,
+        manifest_text,
+    };
+    let package = package(&input, &project)?;
+    let note = crate_note(&input.owner_text);
+    let target_dir = target.unwrap_or(meta.target_directory);
+    let dir = dir_for(&target_dir, &owner);
+    write(&dir, &package)
+        .map_err(|e| io(format!("Run Form could not write {}: {e}", dir.display())))?;
+    let places = Places {
+        canonical: dir.canonicalize().unwrap_or_else(|_| dir.clone()),
+        dir: dir.clone(),
+        owner_real: owner,
+    };
+    let mut request = Request::new(Action::Run, dir.join("Cargo.toml"));
+    request.env = vec![("CARGO_TARGET_DIR".into(), target_dir.into_os_string())];
+    Ok(Plan {
+        request,
+        places,
+        form_id: input.form_id,
+        dir,
+        note,
+    })
+}
+
+// ---- the App ------------------------------------------------------------------------------------
+
+impl crate::App {
+    /// Run (Cmd+R, the menu, the toolbar): Run Form for the form of the active Rust file, whether the
+    /// designer or the code view shows it. A Rust file with no form, and any other file, runs the
+    /// project's own program (`cargo run`); a Rust file with no form says why in Output.
+    pub(crate) fn run_active(&mut self, ctx: &egui::Context) {
+        if self.working() {
+            return;
+        }
+        let rust = self
+            .docs
+            .get(self.active)
+            .is_some_and(|d| designer::is_rust(&d.path));
+        if !rust {
+            self.start_cargo(ctx, Action::Run);
+            return;
+        }
+        // The designer reads the file now, so a file in code view has its forms too.
+        self.sync_designer(true);
+        if self.run_is_form() {
+            self.start_run_form(ctx);
+            return;
+        }
+        self.start_cargo(ctx, Action::Run);
+        self.console.insert_str(0, &format!("{NO_FORM}\n"));
+    }
+
+    /// Whether Run runs Run Form: the active tab is a Rust file, and the designer has read forms
+    /// from it. The toolbar and the menu name the button after this.
+    pub(crate) fn run_is_form(&self) -> bool {
+        self.docs.get(self.active).is_some_and(|doc| {
+            designer::is_rust(&doc.path)
+                && self
+                    .designer
+                    .loaded
+                    .as_ref()
+                    .is_some_and(|l| l.path == doc.path && !l.forms.is_empty())
+        })
+    }
+
+    /// Starts Run Form for the form of the active file (see `pick_form`). Nothing is saved: the unsaved text runs.
+    pub(crate) fn start_run_form(&mut self, ctx: &egui::Context) {
+        if self.working() {
+            return;
+        }
+        self.diagnostics.clear();
+        self.marks.clear();
+        self.build_progress = None;
+        let inputs = match self.run_form_inputs() {
+            Ok(inputs) => inputs,
+            Err(problem) => {
+                self.console = "Run Form did not start.\n".into();
+                self.refuse_run(ctx, vec![problem]);
+                return;
+            }
+        };
+        let form_id = inputs.form_id.clone();
+        self.console = format!("Preparing Run Form for {form_id}...\n");
+        self.auto_tab(ctx, bottom::BottomTab::Output);
+        let (tx, rx) = channel();
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(prepare(inputs, None));
+            repaint.request_repaint();
+        });
+        self.form_prep = Some(Prep {
+            rx,
+            stopping: false,
+        });
+    }
+
+    /// What the designer shows, for Run Form. A problem names the file it is about.
+    fn run_form_inputs(&self) -> Result<Inputs, Diagnostic> {
+        let doc = self.docs.get(self.active).ok_or_else(|| {
+            problem(
+                &self.root,
+                0,
+                "Run Form needs a form: open a Rust file with a form in the designer.".into(),
+            )
+        })?;
+        let fail = |message: &str| problem(&doc.path, 0, message.to_string());
+        let loaded = self
+            .designer
+            .loaded
+            .as_ref()
+            .filter(|l| l.path == doc.path)
+            .ok_or_else(|| fail("Run Form needs a form: this file has none."))?;
+        let ids: Vec<String> = loaded.forms.iter().map(|f| f.form().id()).collect();
+        // A form read from this file has its function's range in `doc.text`; one read from the other
+        // file of the pair has a range in that file, so it is not under the caret.
+        let here = if file_kind(&doc.path) == FileKind::Form {
+            Origin::Frm
+        } else {
+            Origin::Rs
+        };
+        let spans: Vec<Option<Range<usize>>> = loaded
+            .forms
+            .iter()
+            .map(|f| {
+                (f.origin.is_none() || f.origin == Some(here)).then(|| f.imported.fn_range.clone())
+            })
+            .collect();
+        let caret = (!self.form_showing()).then_some(self.cursor_pos.0 as u32);
+        let shown = pick_form(
+            &ids,
+            &spans,
+            &doc.text,
+            self.designer.form_id.as_deref(),
+            caret,
+        )
+        .ok_or_else(|| fail("Run Form needs a form: this file has none."))?;
+        let form = loaded.forms[shown].form();
+        let (path, text, companion) = self
+            .designer_inputs()
+            .ok_or_else(|| fail("Run Form needs a Rust file with a form."))?;
+        let source = if file_kind(&path) == FileKind::Form {
+            companion
+        } else {
+            Some((path.clone(), text))
+        };
+        let dirty = crate::designer::export::to_export(loaded).contains(&shown);
+        let (owner, owner_text, kind, method) = match source {
+            // Unedited and no form file: the source runs as it is.
+            Some((source, source_text)) if !dirty && loaded.frm_text.is_none() => {
+                (source, source_text, kind_of(form), form.method.clone())
+            }
+            source => {
+                let target = crate::designer::export::target(loaded, &|p| p.exists())
+                    .map_err(|e| fail(&e))?;
+                let copy = crate::designer::export::preview_text(
+                    loaded,
+                    shown,
+                    source.as_ref().map(|(_, t)| t.as_str()),
+                )
+                .map_err(|e| fail(&format!("Run Form could not write the form file: {e}")))?;
+                let (kind, method) = in_copy(kind_of(form), &form.method);
+                (target.frm, copy, kind, method)
+            }
+        };
+        Ok(Inputs {
+            owner,
+            owner_text,
+            form_id: form.id(),
+            owner_type: form.owner.clone(),
+            method,
+            kind,
+        })
+    }
+
+    /// Takes the preparation when its thread answers: starts the build, or says why it can't.
+    pub(crate) fn poll_form_prep(&mut self, ctx: &egui::Context) {
+        let Some(prep) = self.form_prep.as_ref() else {
+            return;
+        };
+        let result = match prep.rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(vec![problem(
+                &self.root,
+                0,
+                "Run Form stopped: its preparation ended without an answer.".into(),
+            )]),
+        };
+        let Some(prep) = self.form_prep.take() else {
+            return;
+        };
+        if prep.stopping {
+            self.console.push_str("Run Form stopped.\n");
+            return;
+        }
+        match result {
+            Ok(plan) => self.begin_run_form(ctx, plan),
+            Err(problems) => {
+                self.console = "Run Form did not start.\n".into();
+                self.refuse_run(ctx, problems);
+            }
+        }
+    }
+
+    /// Starts the prepared program: the same build session as Run, with its diagnostics placed in the
+    /// project's files.
+    fn begin_run_form(&mut self, ctx: &egui::Context, plan: Plan) {
+        self.diagnostics.clear();
+        self.marks.clear();
+        self.console = format!(
+            "Run Form: {} in a window. Only its generated package is built, in {}, not the project's binary. The project's files are not changed.\n",
+            plan.form_id,
+            plan.dir.display()
+        );
+        if let Some(note) = &plan.note {
+            self.console.push_str(note);
+            self.console.push('\n');
+        }
+        self.auto_tab(ctx, bottom::BottomTab::Output);
+        let manifest = plan.request.path.clone();
+        let repaint = ctx.clone();
+        let build = formust_build::start(plan.request, move || repaint.request_repaint());
+        self.building = Some(Session::new(build, Action::Run, manifest).with_places(plan.places));
+    }
+
+    /// Says why Run Form did not start: the messages in Output and the problems in Problems.
+    fn refuse_run(&mut self, ctx: &egui::Context, problems: Vec<Diagnostic>) {
+        for problem in &problems {
+            self.console.push_str(&problem.message);
+            self.console.push('\n');
+            cargo::push_problem(&mut self.diagnostics, problem.clone());
+        }
+        let marks = self.place_marks(&self.diagnostics);
+        self.marks = marks;
+        self.auto_tab(ctx, bottom::BottomTab::Problems);
+    }
+
+    /// Stop while Run Form is being prepared: the run is not started. Returns whether there was one.
+    pub(crate) fn stop_form_prep(&mut self) -> bool {
+        let Some(prep) = self.form_prep.as_mut() else {
+            return false;
+        };
+        if !prep.stopping {
+            prep.stopping = true;
+            self.console.push_str("Stopping...\n");
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests;

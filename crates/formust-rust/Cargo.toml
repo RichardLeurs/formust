@@ -1,0 +1,11 @@
+[package]
+name = "formust-rust"
+version = "0.1.0"
+edition = "2024"
+description = "Formust's Rust importer and emitter: source text to form models and back. No UI dependencies."
+
+[dependencies]
+formust-model = { path = "../formust-model" }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+syn = { version = "3", features = ["full", "visit"] }
