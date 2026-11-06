@@ -3,7 +3,7 @@
 //! Shown are how a program can use the copy, what Save does for the form's new state, and the
 //! handler stubs the form calls that the copy doesn't define yet (Formust doesn't write those).
 
-use formust_model::{Form, NodeKind};
+use formust_model::{ContainerId, Form, NodeKind, WidgetId};
 
 /// What the user may want to know or do, for one form.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,6 +17,9 @@ pub struct UseInCode {
     pub state: Option<String>,
     /// `impl Login { fn on_go_clicked(&mut self) {} }` for the handlers the copy doesn't define.
     pub stubs: Option<String>,
+    /// What the form's code needs from the program beyond egui itself: image loaders for an
+    /// image, the `egui_extras` dependency for a table. Formust adds neither.
+    pub requirements: Vec<String>,
 }
 
 /// The notes for `form`, exported to the copy `copy_path` (relative to the source's folder) of the
@@ -77,7 +80,32 @@ pub fn use_in_code(
         module,
         state,
         stubs,
+        requirements: requirements(form),
     }
+}
+
+/// What the program must provide for the form's code to work as designed.
+pub fn requirements(form: &Form) -> Vec<String> {
+    let (mut image, mut table) = (false, false);
+    form.root.walk(&mut |n| match &n.kind {
+        NodeKind::Widget {
+            def: WidgetId::Image,
+            ..
+        } => image = true,
+        NodeKind::Container {
+            def: ContainerId::Table,
+            ..
+        } => table = true,
+        _ => {}
+    });
+    let mut out = Vec::new();
+    if image {
+        out.push("Images: egui shows an image only once the program has installed image loaders, for example egui_extras::install_image_loaders(&cc.egui_ctx) with egui_extras's image features (\"file://\" also needs its \"file\" feature). Formust adds no dependency; an `include_image!` path is read relative to the source file.".to_string());
+    }
+    if table {
+        out.push("Tables: TableBuilder is in the egui_extras crate. Your Cargo.toml needs egui_extras at egui's version; Formust doesn't add it.".to_string());
+    }
+    out
 }
 
 /// `self.on_x_clicked()` calls with no arguments, the shape of a generated handler.

@@ -98,6 +98,16 @@ pub fn widget_forms(id: WidgetId) -> WidgetForms {
             )),
         },
         WidgetId::EndRow => text_only(&[("end_row", &[])]),
+        WidgetId::Image => WidgetForms {
+            shorthand: &[("image", &["source"])],
+            builder: Some(("Image", &[("new", &["source"]), ("from_uri", &["uri"])])),
+        },
+        WidgetId::ColorEdit => text_only(&[("color_edit_button_srgba", &["value"])]),
+        WidgetId::ColorEditRgb => text_only(&[("color_edit_button_rgb", &["value"])]),
+        WidgetId::RangeSlider => WidgetForms {
+            shorthand: &[],
+            builder: Some(("RangeSlider", &[("new", &["low", "high", "range"])])),
+        },
     }
 }
 
@@ -122,10 +132,33 @@ pub fn container_forms(id: ContainerId) -> ContainerForms {
     };
     match id {
         // A dialog helper call is any function; the importer reads it by shape (`dialog_call`).
+        // A column and a side have no call of their own: their holder writes them.
         ContainerId::Root
         | ContainerId::DialogCall
+        | ContainerId::Column
+        | ContainerId::Side
         | ContainerId::Flow
         | ContainerId::FlowGroup => NONE,
+        // Tabs are a bar and a `match`, read and written by hand (`import::tabs_at`, `emit`).
+        ContainerId::Tabs | ContainerId::TabsVertical | ContainerId::TabPage => NONE,
+        // `egui_extras::TableBuilder`, its rows and cells: read and written by hand.
+        ContainerId::Table | ContainerId::TableRow | ContainerId::TableCell => NONE,
+        // `egui::MenuBar::new().ui(ui, |ui| ..)`: shown with `ui`, not `show` (see `show_method`).
+        ContainerId::MenuBar => ContainerForms {
+            shorthand: None,
+            builder: Some(("MenuBar", &[("new", &[])])),
+        },
+        ContainerId::Modal => ContainerForms {
+            shorthand: None,
+            builder: Some(("Modal", &[("new", &["id"])])),
+        },
+        // `ui.columns(2, |cols| { cols[0].label(..); })`: read and written by hand around the columns.
+        ContainerId::Columns => method(("columns", &["count"])),
+        // `egui::Sides::new().show(ui, |ui| .., |ui| ..)`: two closures, read and written by hand.
+        ContainerId::Sides => ContainerForms {
+            shorthand: None,
+            builder: Some(("Sides", &[("new", &[])])),
+        },
         ContainerId::HorizontalCentered => method(("horizontal_centered", &[])),
         ContainerId::HorizontalTop => method(("horizontal_top", &[])),
         ContainerId::VerticalCenteredJustified => method(("vertical_centered_justified", &[])),
@@ -210,6 +243,15 @@ pub fn container_forms(id: ContainerId) -> ContainerForms {
                 ],
             )),
         },
+    }
+}
+
+/// The method that shows a builder container with its closure: `.ui(ui, ..)` for a MenuBar,
+/// `.show(ui, ..)` (or `.show(ctx, ..)`) for the others.
+pub fn show_method(id: ContainerId) -> &'static str {
+    match id {
+        ContainerId::MenuBar => "ui",
+        _ => "show",
     }
 }
 

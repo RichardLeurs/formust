@@ -88,6 +88,8 @@ struct App {
     /// The tabbed pane under the editor: selected tab and the terminal.
     bottom: bottom::BottomPane,
     lsp: Option<lsp::Handle>,
+    /// What rust-analyzer added to the Problems list.
+    lsp_problems: lsp::Published,
     /// The folder the language server was last started for (it follows the project folder).
     lsp_root: Option<PathBuf>,
     lsp_ready: bool,
@@ -222,6 +224,7 @@ impl App {
             bottom_height: 190.0,
             bottom: Default::default(),
             lsp: None,
+            lsp_problems: Default::default(),
             lsp_root: None,
             lsp_ready: false,
             menu: None,
@@ -334,6 +337,7 @@ impl App {
     /// (the Problems list, the squiggles and the live check) do not belong to it any more.
     fn clear_build_results(&mut self) {
         self.diagnostics.clear();
+        self.lsp_problems.clear_all(&mut self.diagnostics);
         self.marks.clear();
         self.build_texts.clear();
         // The Output pane's text belongs to the old project too.
@@ -601,10 +605,11 @@ impl App {
         if self.designer.loaded.as_ref().is_none_or(|l| l.path != path) {
             return;
         }
-        let key = designer::key_of(
+        let key = designer::load_key(
             &path,
             &text,
             companion.as_ref().map(|(p, t)| (p.as_path(), t.as_str())),
+            self.designer.extended,
         );
         self.designer.text_key = designer::key_of(&path, &text, None);
         if let Some(l) = self.designer.loaded.as_mut() {
@@ -636,6 +641,15 @@ impl App {
                 }
                 designer::ui::Action::Reload => {
                     self.designer.reload();
+                    self.sync_designer(true);
+                }
+                designer::ui::Action::Extended(on) => {
+                    // Refused with unsaved edits (the switch is disabled then): reading the file
+                    // again would only mark them stale, not apply the switch.
+                    if self.designer.is_dirty() {
+                        continue;
+                    }
+                    self.designer.extended = on;
                     self.sync_designer(true);
                 }
                 designer::ui::Action::ShowDiff(prompt) => {
@@ -734,7 +748,11 @@ impl App {
     }
 
     fn remove_doc(&mut self, i: usize) {
-        self.docs.remove(i);
+        let closed = self.docs.remove(i);
+        self.lsp_problems.clear(&mut self.diagnostics, &closed.path);
+        if let Some(lsp) = &self.lsp {
+            let _ = lsp.requests.send(lsp::Req::Close { path: closed.path });
+        }
         self.active = self.active.min(self.docs.len().saturating_sub(1));
         if !self.has_form() {
             self.form_view = false;
@@ -802,15 +820,19 @@ impl App {
                 .is_some_and(|d| designer::is_rust(&d.path))
     }
 
-    /// Shows the form designer for the active Rust file (`.rs` or `.frm.rs`).
+    /// Shows the form designer for the active Rust file (`.rs` or `.frm.rs`). Going back to the form
+    /// is a choice too: the file no longer prefers code (see `show_code`), so it opens in the form
+    /// again.
     fn show_form(&mut self) {
-        if !self
+        let Some(path) = self
             .docs
             .get(self.active)
-            .is_some_and(|d| designer::is_rust(&d.path))
-        {
+            .filter(|d| designer::is_rust(&d.path))
+            .map(|d| d.path.clone())
+        else {
             return;
-        }
+        };
+        self.code_preferred.remove(&path);
         self.auto_form = None;
         self.sync_designer(true);
         self.form_view = true;
@@ -874,9 +896,10 @@ impl App {
             return;
         };
         let companion = companion.as_ref().map(|(p, t)| (p.as_path(), t.as_str()));
-        let key = designer::key_of(&path, &text, companion);
+        let extended = self.designer.extended;
+        let key = designer::load_key(&path, &text, companion, extended);
         if !self.designer.is_loaded(&path, key) {
-            let loaded = designer::load(&path, &text, companion);
+            let loaded = designer::load_with(&path, &text, companion, extended);
             self.designer.store(loaded, key);
         }
     }
@@ -1316,6 +1339,7 @@ impl App {
         }
         self.lsp_root = Some(self.root.clone());
         self.lsp_ready = false;
+        self.lsp_problems.clear_all(&mut self.diagnostics);
         self.lsp = root_abs(&self.root).and_then(|r| lsp::spawn(&r, ctx.clone()));
         if self.lsp.is_none() {
             self.console
@@ -1330,6 +1354,13 @@ impl App {
         for resp in responses {
             match resp {
                 lsp::Resp::Ready => self.lsp_ready = true,
+                lsp::Resp::Closed => {}
+                lsp::Resp::Diagnostics { path, list } => {
+                    // A tab closed since the server published: nothing to show.
+                    if self.docs.iter().any(|d| d.path == path) {
+                        self.lsp_problems.set(&mut self.diagnostics, &path, &list);
+                    }
+                }
                 lsp::Resp::Completion(items) => {
                     let pending = self.pending_completion.take();
                     let auto = self.completion_auto;
@@ -1405,6 +1436,7 @@ impl App {
                     ));
                     self.lsp = None;
                     self.lsp_ready = false;
+                    self.lsp_problems.clear_all(&mut self.diagnostics);
                     return;
                 }
             }
@@ -2405,6 +2437,34 @@ mod tests {
             app.diagnostics.is_empty(),
             "the Problems of the old project are cleared"
         );
+    }
+
+    #[test]
+    fn server_problems_follow_the_tab_that_is_open() {
+        let mut app = App::bare(None);
+        let path = target_tmp().join("lsp-problems.rs");
+        app.docs.push(Doc {
+            path: path.clone(),
+            text: String::new(),
+            saved: String::new(),
+            editor_id: egui::Id::unique("lsp-problems"),
+        });
+        let list = vec![formust_lsp::Diagnostic {
+            line: 0,
+            col: 0,
+            end_line: 0,
+            end_col: 1,
+            severity: 1,
+            message: "expected item".into(),
+        }];
+        app.lsp_problems.set(&mut app.diagnostics, &path, &list);
+        assert_eq!(app.diagnostics.len(), 1);
+        assert_eq!(app.diagnostics[0].line, 1);
+        app.lsp_problems.set(&mut app.diagnostics, &path, &[]);
+        assert!(app.diagnostics.is_empty(), "republished empty");
+        app.lsp_problems.set(&mut app.diagnostics, &path, &list);
+        app.close_doc(0);
+        assert!(app.diagnostics.is_empty(), "closing the file clears them");
     }
 
     #[test]

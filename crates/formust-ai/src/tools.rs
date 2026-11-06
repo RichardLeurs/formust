@@ -456,6 +456,13 @@ fn describe_forms(rel: &str, abs: &Path, text: &str) -> Result<String, String> {
                 .map(|i| format!("{} => {}", i.value, value(&i.label)))
                 .collect::<Vec<_>>()
                 .join(", "),
+            P::Stroke { width, light, dark } => format!(
+                "stroke {width:?} {}",
+                value(&P::Color {
+                    light: *light,
+                    dark: *dark
+                })
+            ),
         }
     }
     fn node(n: &formust_model::Node, depth: usize, out: &mut String) {

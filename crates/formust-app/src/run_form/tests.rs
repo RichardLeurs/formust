@@ -1,8 +1,9 @@
 //! Run Form: the generated manifest and program, the placement of their diagnostics, the choice of
 //! form, and runs through cargo (headless, so no window opens): one shows an edit that is not saved,
-//! one runs the copy after its source changed, one shows a free dialog, and Run on a Rust file with a
+//! one runs the copy after its source changed, one shows a free dialog, one starts a dialog open that
+//! its flag keeps closed, one runs a free `fn(ui)` under the caret, and Run on a Rust file with a
 //! form starts Run Form (in the designer or in code view), Run on a Rust file with no form runs the
-//! project's own program.
+//! project's own program. Also the cleaning of old program folders.
 
 use super::*;
 use formust_build::Event;
@@ -117,7 +118,7 @@ fn inherited_dependencies_and_edition_come_from_the_workspace() {
 
 #[test]
 fn a_ui_form_is_drawn_inside_a_central_panel() {
-    let h = harness("Login", "ui", Kind::Ui);
+    let h = harness("Login", "ui", Kind::Ui, &[]);
     assert!(h.contains("egui::CentralPanel::default().show(ui"), "{h}");
     assert!(h.contains("let _ = app.owner.ui(ui);"), "{h}");
     assert!(h.contains("owner: super::Login,"), "{h}");
@@ -131,7 +132,7 @@ fn a_ui_form_is_drawn_inside_a_central_panel() {
 
 #[test]
 fn a_dialog_is_called_with_the_context_every_frame() {
-    let h = harness("Login", "show", Kind::Context);
+    let h = harness("Login", "show", Kind::Context, &[]);
     assert!(!h.contains("CentralPanel"), "{h}");
     assert!(h.contains("let _ = app.owner.show(ui.ctx());"), "{h}");
     assert!(h.contains("draw(self, ui);"), "{h}");
@@ -139,7 +140,7 @@ fn a_dialog_is_called_with_the_context_every_frame() {
 
 #[test]
 fn a_legacy_update_is_called_with_its_frame_and_has_no_headless_drawing() {
-    let h = harness("Login", "update", Kind::Legacy);
+    let h = harness("Login", "update", Kind::Legacy, &[]);
     assert!(
         h.contains("fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame)"),
         "{h}"
@@ -162,7 +163,7 @@ fn in_the_copy_a_legacy_update_is_the_apps_ui_and_a_dialog_stays() {
         (Kind::Context, "show".into())
     );
     assert_eq!(in_copy(Kind::Ui, "ui"), (Kind::Ui, "ui".into()));
-    let h = harness("Login", "ui", Kind::App);
+    let h = harness("Login", "ui", Kind::App, &[]);
     assert!(
         h.contains("eframe::App::ui(&mut self.owner, ui, frame);"),
         "{h}"
@@ -171,8 +172,8 @@ fn in_the_copy_a_legacy_update_is_the_apps_ui_and_a_dialog_stays() {
     assert!(h.contains("        Vec::new()"), "{h}");
 }
 
-/// The designer imports free functions only when asked to (`ImportOptions::free_functions`), so a
-/// form without an owner type is refused rather than given a program that doesn't compile.
+/// A form without an owner type that is neither a free dialog nor a free `fn(ui)` is refused rather
+/// than given a program that doesn't compile.
 #[test]
 fn a_free_function_is_refused() {
     let mut free = inputs(LOGIN);
@@ -208,7 +209,7 @@ fn a_free_dialog_runs_as_a_call_from_the_owner_module() {
 /// The harness of a free dialog: no owner, the function called with the `ctx` in the draw.
 #[test]
 fn a_free_dialog_harness_calls_the_function_with_the_context() {
-    let h = harness("", "show", Kind::FreeDialog);
+    let h = harness("", "show", Kind::FreeDialog, &[]);
     assert!(h.contains("pub struct Runner;"), "{h}");
     assert!(h.contains("let _ = super::show(ui.ctx());"), "{h}");
     assert!(!h.contains("CentralPanel"), "{h}");
@@ -216,9 +217,10 @@ fn a_free_dialog_harness_calls_the_function_with_the_context() {
     assert!(h.contains("pub fn headless()"), "{h}");
 }
 
-/// A free function that is not a dialog (a `ui` taking a `Ui`) is still refused.
+/// A free function with no owner that is not called as a free dialog or a free `fn(ui)` is refused;
+/// so is a free `ui` function that takes more than the `ui`, since the run has nothing to pass.
 #[test]
-fn a_free_ui_function_is_refused_as_before() {
+fn a_free_function_that_takes_more_than_the_ui_is_refused() {
     let mut free = inputs(LOGIN);
     free.owner_type = String::new();
     free.form_id = "::ui".into();
@@ -227,10 +229,187 @@ fn a_free_ui_function_is_refused_as_before() {
     assert!(
         problems[0]
             .message
-            .contains("`ui` is a free function that is not a dialog"),
+            .contains("`ui` is a free function that is neither"),
         "{}",
         problems[0].message
     );
+    let mut two = inputs("pub fn row(ui: &mut egui::Ui, name: &str) {\n    ui.label(name);\n}\n");
+    two.owner_type = String::new();
+    two.form_id = "::row".into();
+    two.method = "row".into();
+    two.kind = Kind::FreeUi;
+    let problems = package(&two, &egui_project()).unwrap_err();
+    assert!(
+        problems[0].message.contains(
+            "a free function whose only parameter is the ui (`fn row(ui: &mut egui::Ui)`)"
+        ),
+        "{}",
+        problems[0].message
+    );
+}
+
+/// A free `fn form(ui: &mut egui::Ui)` runs as `owner::form(ui)` inside a `CentralPanel`, with no
+/// owner value and nothing opened.
+#[test]
+fn a_free_ui_function_runs_as_a_call_inside_a_central_panel() {
+    let h = harness("", "form", Kind::FreeUi, &[]);
+    assert!(h.contains("pub struct Runner;"), "{h}");
+    assert!(h.contains("egui::CentralPanel::default().show(ui"), "{h}");
+    assert!(h.contains("let _ = super::form(ui);"), "{h}");
+    assert!(h.contains("pub fn headless()"), "{h}");
+    let text = "pub fn form(ui: &mut egui::Ui) {\n    ui.label(\"Free form\");\n}\n";
+    let mut free = inputs(text);
+    free.owner_type = String::new();
+    free.form_id = "::form".into();
+    free.method = "form".into();
+    free.kind = Kind::FreeUi;
+    let pkg = package(&free, &egui_project()).unwrap();
+    assert!(pkg.owner.starts_with(text));
+    assert!(pkg.owner.contains("let _ = super::form(ui);"));
+    assert!(pkg.opened.is_empty());
+    // As a form (with `free_functions`), a free `ui` function is this kind.
+    let source = formust_rust::import_with(
+        text,
+        formust_rust::ImportOptions {
+            free_functions: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(kind_of(&source.forms[0].form), Kind::FreeUi);
+    assert_eq!(in_copy(Kind::FreeUi, "form"), (Kind::FreeUi, "form".into()));
+}
+
+/// A dialog that its owner's `open` flag keeps closed starts open: the run sets the flag before the
+/// first frame, and Output says so.
+#[test]
+fn a_dialog_kept_closed_by_its_flag_starts_open() {
+    let h = harness(
+        "Login",
+        "show",
+        Kind::Context,
+        &["open".into(), "shown".into()],
+    );
+    assert!(
+        h.contains("let mut owner = super::Login::default();\n            owner.open = true;\n            owner.shown = true;\n            Runner { owner }"),
+        "{h}"
+    );
+    let mut dialog = inputs(DIALOG_SOURCE);
+    dialog.owner_type = "Dialog".into();
+    dialog.method = "show".into();
+    dialog.form_id = "Dialog::show".into();
+    dialog.kind = Kind::Context;
+    let pkg = package(&dialog, &egui_project()).unwrap();
+    assert_eq!(pkg.opened, ["open"]);
+    assert!(pkg.owner.contains("owner.open = true;"), "{}", pkg.owner);
+    assert_eq!(
+        open_note(&pkg.opened).as_deref(),
+        Some(
+            "the dialog starts open: Run Form sets `self.open` to true in the run (the project's code is not changed)."
+        )
+    );
+    assert!(open_note(&[]).is_none());
+    // A `ui` form opens nothing, even with the same fields.
+    let mut ui = dialog.clone();
+    ui.method = "ui".into();
+    ui.kind = Kind::Ui;
+    assert!(package(&ui, &egui_project()).unwrap().opened.is_empty());
+}
+
+/// A scratch `formust-run` folder with program folders `names`, each last run `days` ago.
+fn run_root(name: &str, folders: &[(&str, u64)]) -> PathBuf {
+    let root = crate::target_tmp()
+        .join(format!("formust-run-clean-{name}"))
+        .join(FOLDER);
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let now = std::time::SystemTime::now();
+    for (folder, days) in folders {
+        let dir = root.join(folder);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/owner.rs"), "").unwrap();
+        let file = std::fs::File::create(dir.join(STAMP)).unwrap();
+        file.set_modified(now - std::time::Duration::from_secs(days * 24 * 60 * 60))
+            .unwrap();
+    }
+    root
+}
+
+const DAY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Old program folders go: those not run for longer than the age, and those beyond the count, the
+/// oldest first. The folder of the run starting now always stays.
+#[test]
+fn old_program_folders_are_removed_by_age_and_count() {
+    let keys = [
+        "000000000000000a",
+        "000000000000000b",
+        "000000000000000c",
+        "000000000000000d",
+        "000000000000000e",
+    ];
+    let root = run_root(
+        "age",
+        &[
+            (keys[0], 0),
+            (keys[1], 1),
+            (keys[2], 30),
+            (keys[3], 2),
+            (keys[4], 40),
+        ],
+    );
+    let now = std::time::SystemTime::now();
+    // By age: the 30- and 40-day-old ones; the 40-day-old one is the run starting now and stays.
+    let removed = clean_old(&root, &root.join(keys[4]), now, 14 * DAY, 100);
+    assert_eq!(removed, [root.join(keys[2])]);
+    assert!(root.join(keys[4]).exists(), "the current run stays");
+    // By count: keep 2 (the current one and the most recent other), so `d` (2 days) and `b` go.
+    let removed = clean_old(&root, &root.join(keys[4]), now, 14 * DAY, 2);
+    let mut removed: Vec<_> = removed.into_iter().collect();
+    removed.sort();
+    assert_eq!(removed, [root.join(keys[1]), root.join(keys[3])]);
+    assert!(root.join(keys[0]).exists() && root.join(keys[4]).exists());
+}
+
+/// Cleaning touches nothing but key-named folders directly in a real `formust-run` folder: not a
+/// file, not a folder with another name, not a link (nor what it points to), and nothing at all when
+/// the folder given is not a `formust-run` folder.
+#[test]
+fn cleaning_never_removes_anything_but_old_program_folders() {
+    let root = run_root("safe", &[("00000000000000aa", 60)]);
+    let other = root.join("keep-me");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(root.join("0000000000000bbb"), "a file, not a folder").unwrap();
+    std::fs::create_dir_all(root.join("00000000000000FF")).unwrap();
+    // A link with a key's name to a folder outside: neither is removed.
+    let outside = root.parent().unwrap().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("precious"), "x").unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("00000000000000cc")).unwrap();
+    let now = std::time::SystemTime::now() + 365 * DAY;
+    // Not a `formust-run` folder: nothing happens.
+    assert!(clean_old(root.parent().unwrap(), Path::new("/none"), now, DAY, 0).is_empty());
+    assert!(root.join("00000000000000aa").exists());
+    let removed = clean_old(&root, Path::new("/none"), now, DAY, 0);
+    assert_eq!(removed, [root.join("00000000000000aa")]);
+    assert!(other.exists());
+    assert!(root.join("0000000000000bbb").exists());
+    assert!(
+        root.join("00000000000000FF").exists(),
+        "upper case is no key (a different name: macOS folders ignore case)"
+    );
+    assert!(root.join("00000000000000cc").symlink_metadata().is_ok());
+    assert!(outside.join("precious").exists());
+    // A `formust-run` that is itself a link is left alone.
+    let linked = root.parent().unwrap().join("linked");
+    std::fs::create_dir_all(&linked).unwrap();
+    let real = linked.join("real");
+    std::fs::create_dir_all(real.join("00000000000000dd")).unwrap();
+    let link = linked.join(FOLDER);
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert!(clean_old(&link, Path::new("/none"), now, DAY, 0).is_empty());
+    assert!(real.join("00000000000000dd").exists());
 }
 
 /// Output says when the copy uses `crate::` paths, and nothing when it doesn't.
@@ -476,6 +655,9 @@ fn form_project(name: &str) -> PathBuf {
     std::fs::write(dir.join("src/login.frm.rs"), copy).unwrap();
     dir
 }
+
+/// A dialog whose `open` flag is `false` by default: before the run set it, nothing showed.
+const DIALOG_SOURCE: &str = "#[derive(Default)]\npub struct Dialog {\n    open: bool,\n    name: String,\n}\n\nimpl Dialog {\n    pub fn show(&mut self, ctx: &egui::Context) {\n        let mut open = self.open;\n        egui::Window::new(\"About\").open(&mut open).show(ctx, |ui| {\n            ui.label(\"Hello dialog\");\n            ui.text_edit_singleline(&mut self.name);\n        });\n        self.open = open;\n    }\n}\n";
 
 /// A project with a free dialog in `dialog.rs`: `show(ctx)` opens a window with one label.
 fn dialog_project(name: &str) -> PathBuf {
@@ -805,4 +987,127 @@ fn a_free_dialog_runs_through_cargo_headless() {
         !dir.join("src/formust-run").exists(),
         "nothing is written in the project"
     );
+}
+
+/// A dialog that its `open` flag keeps closed by default starts open in the run: one headless frame
+/// draws its window's text.
+#[test]
+fn a_closed_dialog_starts_open_through_cargo_headless() {
+    let dir = project_dir("closed-dialog");
+    egui_manifest(&dir, "closed-dialog-app");
+    std::fs::write(dir.join("src/main.rs"), "mod dialog;\n\nfn main() {}\n").unwrap();
+    let file = dir.join("src/dialog.rs");
+    std::fs::write(&file, DIALOG_SOURCE).unwrap();
+    let app = designer_app(&file);
+    let inputs = app.run_form_inputs().unwrap();
+    assert_eq!(inputs.kind, Kind::Context);
+    assert_eq!(inputs.form_id, "Dialog::show");
+    let mut plan = prepare(inputs, Some(shared_target())).unwrap();
+    assert!(
+        plan.note
+            .as_deref()
+            .is_some_and(|n| n.contains("the dialog starts open")),
+        "{:?}",
+        plan.note
+    );
+    plan.request.cargo_args.push("--offline".into());
+    plan.request
+        .env
+        .push(("FORMUST_RUN_FORM_TEST".into(), "1".into()));
+    let (stdout, outcome) = run_to_end(plan.request);
+    assert!(
+        outcome.result.success,
+        "the program didn't build:\n{}",
+        outcome.result.raw_output
+    );
+    let drawn = stdout
+        .iter()
+        .find(|l| l.starts_with("drawn: "))
+        .unwrap_or_else(|| panic!("no drawn line: {stdout:?}"));
+    assert!(drawn.contains("Hello dialog"), "{drawn}");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        DIALOG_SOURCE,
+        "the source is not written"
+    );
+}
+
+/// A file with a free `fn form(ui: &mut egui::Ui)` and no form: in code view with the caret in that
+/// function, Run runs it (from the open, unsaved text), and one headless frame draws it.
+#[test]
+fn a_free_ui_function_under_the_caret_runs_through_cargo_headless() {
+    let dir = project_dir("free-ui");
+    egui_manifest(&dir, "free-ui-app");
+    std::fs::write(dir.join("src/main.rs"), "mod panel;\n\nfn main() {}\n").unwrap();
+    let file = dir.join("src/panel.rs");
+    let text = "pub fn helper(ui: &mut egui::Ui, n: u32) {\n    ui.label(n.to_string());\n}\n\npub fn form(ui: &mut egui::Ui) {\n    ui.label(\"Free ui saved\");\n    helper(ui, 7);\n}\n";
+    std::fs::write(&file, text).unwrap();
+    let mut app = crate::App::bare(Some(file.clone()));
+    app.show_code();
+    app.sync_designer(true);
+    // Off the function: no free `ui` function to run.
+    app.cursor_pos = (1, 1);
+    assert!(
+        app.free_ui_at_caret().is_none(),
+        "`helper` takes more than the ui"
+    );
+    app.cursor_pos = (6, 5);
+    assert_eq!(
+        app.free_ui_at_caret().map(|f| f.name).as_deref(),
+        Some("form")
+    );
+    // An unsaved edit of the open text is what runs.
+    let doc = app.docs.get_mut(app.active).unwrap();
+    doc.text = doc.text.replace("Free ui saved", "Free ui unsaved");
+    let inputs = app.run_form_inputs().unwrap();
+    assert_eq!(inputs.kind, Kind::FreeUi);
+    assert_eq!(inputs.form_id, "::form");
+    assert_eq!(inputs.owner, file);
+    let mut plan = prepare(inputs, Some(shared_target())).unwrap();
+    plan.request.cargo_args.push("--offline".into());
+    plan.request
+        .env
+        .push(("FORMUST_RUN_FORM_TEST".into(), "1".into()));
+    let (stdout, outcome) = run_to_end(plan.request);
+    assert!(
+        outcome.result.success,
+        "the program didn't build:\n{}",
+        outcome.result.raw_output
+    );
+    let drawn = stdout
+        .iter()
+        .find(|l| l.starts_with("drawn: "))
+        .unwrap_or_else(|| panic!("no drawn line: {stdout:?}"));
+    assert!(
+        drawn.contains("Free ui unsaved") && drawn.contains('7'),
+        "{drawn}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        text,
+        "the source is not written"
+    );
+
+    // Run itself starts Run Form for it, not the project's program.
+    let ctx = egui::Context::default();
+    app.run_active(&ctx);
+    assert!(app.form_prep.is_some(), "the run is being prepared");
+    assert!(
+        app.console.starts_with("Preparing Run Form for ::form"),
+        "{}",
+        app.console
+    );
+    let started = std::time::Instant::now();
+    while app.building.is_none() && started.elapsed() < std::time::Duration::from_secs(120) {
+        app.poll_form_prep(&ctx);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(app.building.is_some(), "the run started: {}", app.console);
+    app.stop_cargo();
+    let started = std::time::Instant::now();
+    while app.building.is_some() && started.elapsed() < std::time::Duration::from_secs(120) {
+        app.poll_build(&ctx);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(app.building.is_none(), "Stop ends the run");
 }

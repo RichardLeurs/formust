@@ -139,11 +139,16 @@ impl FrmFile {
 /// Reads a `.frm.rs` through the shared importer, as any `.rs`. A syntax error is an `Err`: the
 /// caller must open the code editor, block the designer and not overwrite the file.
 pub fn parse_frm(src: &str) -> Result<FrmFile, ImportError> {
+    parse_frm_with(src, ImportOptions::default())
+}
+
+/// [`parse_frm`] with importer options (such as [`ImportOptions::extended`]); `frm` is always set.
+pub fn parse_frm_with(src: &str, options: ImportOptions) -> Result<FrmFile, ImportError> {
     let file = import_with(
         src,
         ImportOptions {
             frm: true,
-            ..ImportOptions::default()
+            ..options
         },
     )?;
     Ok(assemble(src, file))
@@ -422,6 +427,37 @@ mod tests {
     use formust_model::{PropValue, WidgetId};
 
     const SRC: &str = "pub struct A;\nimpl A {\n    pub fn ui(&mut self, ui: &mut egui::Ui) {\n        ui.label(\"a\");\n    }\n}\npub struct B;\nimpl B {\n    pub fn ui(&mut self, ui: &mut egui::Ui) {\n        ui.label(\"b\");\n    }\n}\nfn helper() {}\n";
+
+    /// `parse_frm_with` passes the importer options on (control flow is a node with `extended`,
+    /// locked code without), and a parsed file emits its own text either way.
+    #[test]
+    fn parse_frm_with_passes_the_extended_option() {
+        let src = "pub struct A { on: bool }\nimpl A {\n    pub fn ui(&mut self, ui: &mut egui::Ui) {\n        if self.on {\n            ui.label(\"a\");\n        }\n    }\n}\n";
+        let flow = |f: &FrmFile| {
+            let mut found = false;
+            f.forms[0].imported.form.root.walk(&mut |n| {
+                if let formust_model::NodeKind::Container { def, .. } = &n.kind
+                    && def.is_flow()
+                {
+                    found = true;
+                }
+            });
+            found
+        };
+        let plain = parse_frm(src).unwrap();
+        let extended = parse_frm_with(
+            src,
+            ImportOptions {
+                extended: true,
+                ..ImportOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(!flow(&plain));
+        assert!(flow(&extended));
+        assert_eq!(plain.emit(), src);
+        assert_eq!(extended.emit(), src);
+    }
 
     /// Exporting one form into a copy replaces its function there and keeps everything else.
     #[test]

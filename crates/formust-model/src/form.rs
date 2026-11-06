@@ -38,6 +38,13 @@ pub enum PropValue {
     Expr(String),
     /// The static items of a ComboBox.
     Items(Vec<ComboItem>),
+    /// A line of `width` points in a colour for light mode and optionally another for dark mode:
+    /// `egui::Stroke::new(width, colour)`, the colour written as for [`PropValue::Color`].
+    Stroke {
+        width: f64,
+        light: [u8; 4],
+        dark: Option<[u8; 4]>,
+    },
 }
 
 impl PropValue {
@@ -55,6 +62,11 @@ impl PropValue {
             light,
             dark: Some(dark),
         }
+    }
+
+    /// A stroke with one colour for both modes, or with a dark one too.
+    pub fn stroke(width: f64, light: [u8; 4], dark: Option<[u8; 4]>) -> PropValue {
+        PropValue::Stroke { width, light, dark }
     }
 }
 
@@ -188,8 +200,6 @@ pub enum EditError {
     NoSuchProp(String),
     /// Custom code has no properties or events.
     IsCustom(NodeId),
-    /// `add_sized`, `add_enabled` and `add_visible` are separate calls: a widget has one of them.
-    WrapperTaken(&'static str),
     /// A branch of an `if` or an arm of a `match` can't be moved, removed or added to.
     Locked(NodeId),
     /// A dialog's root has a `&Context`, not a `Ui`: widgets go inside a `Window`.
@@ -262,7 +272,7 @@ impl Node {
         }
     }
 
-    fn indent(&self) -> Option<&str> {
+    pub(crate) fn indent(&self) -> Option<&str> {
         self.leading.rfind('\n').map(|i| &self.leading[i + 1..])
     }
 }
@@ -383,29 +393,53 @@ impl Form {
     /// Sets a property. A value equal to an optional property's default is removed instead.
     pub fn set_prop(&mut self, id: NodeId, name: &str, value: PropValue) -> Result<(), EditError> {
         let node = self.find(id).ok_or(EditError::NoSuchNode(id))?;
+        // The column count is the columns themselves: they are added or removed with it.
+        if let (
+            NodeKind::Container {
+                def: ContainerId::Columns,
+                ..
+            },
+            "count",
+            PropValue::Int(n),
+        ) = (&node.kind, name, &value)
+        {
+            let n = usize::try_from(*n).unwrap_or(0);
+            return self.set_columns(id, n);
+        }
+        // A table's columns and header are its cells and its first row.
+        if let NodeKind::Container {
+            def: ContainerId::Table,
+            ..
+        } = &node.kind
+        {
+            match (name, &value) {
+                ("columns", PropValue::Items(items)) => {
+                    let items = items.clone();
+                    return self.set_table_columns_list(id, items);
+                }
+                ("header", PropValue::Float(h)) => {
+                    let h = *h;
+                    return self.set_table_header(id, Some(h));
+                }
+                _ => {}
+            }
+        }
+        // The tabs are the pages: their count changes through `add_tab` and `remove_tab`.
+        if let (NodeKind::Container { def, .. }, "tabs", PropValue::Items(items)) =
+            (&node.kind, name, &value)
+            && def.is_tabs()
+        {
+            let items = items.clone();
+            return self.set_tabs(id, items);
+        }
         let def = match &node.kind {
             NodeKind::Widget { def, .. } => widget_def(*def).prop(name),
             NodeKind::Container { def, .. } => container_def(*def).prop(name),
             NodeKind::Custom { .. } => return Err(EditError::IsCustom(id)),
         }
         .ok_or_else(|| EditError::NoSuchProp(name.to_string()))?;
-        if matches!(
-            def.role,
-            PropRole::AddSized | PropRole::AddEnabled | PropRole::AddVisible
-        ) && let NodeKind::Widget {
-            def: widget, props, ..
-        } = &node.kind
-            && let Some(other) = widget_def(*widget).props.iter().find(|p| {
-                p.name != def.name
-                    && matches!(
-                        p.role,
-                        PropRole::AddSized | PropRole::AddEnabled | PropRole::AddVisible
-                    )
-                    && props.contains_key(p.name)
-            })
-        {
-            return Err(EditError::WrapperTaken(other.name));
-        }
+        // `add_sized`, enabled and visible together nest as `ui.add_enabled_ui(..)` and
+        // `ui.scope(..)` around the widget, which the importer reads back: any mix is allowed.
         let drop_it = def.role != PropRole::Arg && def.default.to_value().as_ref() == Some(&value);
         self.edit(id, |node| {
             let props = match &mut node.kind {
@@ -422,6 +456,15 @@ impl Form {
 
     /// Removes a property, back to its default.
     pub fn clear_prop(&mut self, id: NodeId, name: &str) -> Result<(), EditError> {
+        // A table without a header loses its header row.
+        if name == "header"
+            && let Some(NodeKind::Container {
+                def: ContainerId::Table,
+                ..
+            }) = self.find(id).map(|n| &n.kind)
+        {
+            return self.set_table_header(id, None);
+        }
         self.edit(id, |node| {
             if let NodeKind::Widget { props, .. } | NodeKind::Container { props, .. } =
                 &mut node.kind
@@ -495,22 +538,44 @@ impl Form {
     pub fn new_bound_widget(&mut self, def: WidgetId, field: &str) -> Node {
         let mut node = self.new_widget(def);
         if let Some(state) = widget_def(def).state {
-            let name = self.unique_field(field);
-            self.state.push(StateField {
-                name: name.clone(),
-                ty: state.ty.to_string(),
+            // A second binding (a RangeSlider's `high`) is named after its registry default.
+            let also = state.also.map(|prop| {
+                let hint = match widget_def(def).prop(prop).map(|p| p.default) {
+                    Some(crate::registry::DefaultValue::Expr(e)) => {
+                        e.rsplit('.').next().unwrap_or(prop).to_string()
+                    }
+                    _ => prop.to_string(),
+                };
+                (prop, hint)
             });
-            if let NodeKind::Widget { props, .. } = &mut node.kind {
-                props.insert(
-                    state.prop,
-                    PropValue::Expr(format!("&mut self.{}.{name}", self.state_field)),
-                );
+            for (prop, hint) in std::iter::once((state.prop, field.to_string())).chain(also) {
+                let name = self.unique_field(&hint);
+                self.add_state_field(&name, state.ty);
+                if let NodeKind::Widget { props, .. } = &mut node.kind {
+                    props.insert(
+                        prop,
+                        PropValue::Expr(format!("&mut self.{}.{name}", self.state_field)),
+                    );
+                }
             }
         }
         node
     }
 
-    fn unique_field(&self, wanted: &str) -> String {
+    /// Adds a field to the generated state struct. A type starting `egui::` is written with the
+    /// form's own egui path (`eframe::egui::Color32`), so it resolves where the form's code does.
+    pub(crate) fn add_state_field(&mut self, name: &str, ty: &str) {
+        let ty = match ty.strip_prefix("egui::") {
+            Some(rest) => format!("{}{rest}", self.egui_path),
+            None => ty.to_string(),
+        };
+        self.state.push(StateField {
+            name: name.to_string(),
+            ty,
+        });
+    }
+
+    pub(crate) fn unique_field(&self, wanted: &str) -> String {
         let base = snake(wanted);
         let taken = |name: &str| self.state.iter().any(|f| f.name == name);
         if !taken(&base) {
@@ -522,8 +587,88 @@ impl Form {
             .expect("an unbounded range")
     }
 
-    /// A new, empty container with its default properties, not yet in the tree.
+    /// A new, empty container with its default properties, not yet in the tree. Columns get their
+    /// two columns and Sides their two closures.
     pub fn new_container(&mut self, def: ContainerId) -> Node {
+        let mut node = self.bare_container(def);
+        let parts: Vec<Node> = match def {
+            ContainerId::Columns => {
+                if let NodeKind::Container { ident, closure, .. } = &mut node.kind {
+                    *ident = "cols".to_string();
+                    *closure = "|cols| ".to_string();
+                }
+                (0..2).map(|i| self.new_column("cols", i)).collect()
+            }
+            ContainerId::Tabs | ContainerId::TabsVertical => {
+                let field = match container_def(def).prop("field").map(|p| p.default) {
+                    Some(crate::registry::DefaultValue::Expr(e)) => e.to_string(),
+                    _ => "self.form.tab".to_string(),
+                }
+                .replace("self.form.", &format!("self.{}.", self.state_field));
+                let tabs = vec![
+                    ComboItem {
+                        value: "0".to_string(),
+                        label: PropValue::Text("Tab 1".to_string()),
+                    },
+                    ComboItem {
+                        value: "1".to_string(),
+                        label: PropValue::Text("Tab 2".to_string()),
+                    },
+                ];
+                if let NodeKind::Container { props, .. } = &mut node.kind {
+                    props.insert("field", PropValue::Expr(field));
+                    props.insert("tabs", PropValue::Items(tabs));
+                }
+                (0..2).map(|_| self.new_page(def)).collect()
+            }
+            ContainerId::Table => {
+                let columns: Vec<ComboItem> =
+                    (0..2).map(|_| crate::tables::column_item()).collect();
+                if let NodeKind::Container { props, .. } = &mut node.kind {
+                    props.insert("columns", PropValue::Items(columns));
+                    props.insert("header", PropValue::Float(20.0));
+                }
+                (0..3).map(|_| self.new_table_row(2)).collect()
+            }
+            ContainerId::Sides => (0..2)
+                .map(|i| {
+                    let mut side = self.bare_container(ContainerId::Side);
+                    if let NodeKind::Container { recv, .. } = &mut side.kind {
+                        *recv = "ui".to_string();
+                    }
+                    if i == 1 {
+                        side.leading = ", ".to_string();
+                    }
+                    side
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        if let NodeKind::Container { children, .. } = &mut node.kind {
+            *children = parts;
+        }
+        node
+    }
+
+    /// Column `index` of a Columns whose closure names its slice `cols`: its children use
+    /// `cols[index]`.
+    pub(crate) fn new_column(&mut self, cols: &str, index: usize) -> Node {
+        let mut column = self.bare_container(ContainerId::Column);
+        if let NodeKind::Container {
+            ident,
+            recv,
+            closure,
+            ..
+        } = &mut column.kind
+        {
+            *ident = format!("{cols}[{index}]");
+            *recv = cols.to_string();
+            closure.clear();
+        }
+        column
+    }
+
+    pub(crate) fn bare_container(&mut self, def: ContainerId) -> Node {
         let mut props = Props::new();
         for prop in container_def(def).props {
             if prop.role == PropRole::Arg
@@ -575,9 +720,61 @@ impl Form {
         if !self.fits(parent, &node) {
             return Err(EditError::NeedsUi(parent));
         }
+        self.fresh_columns_name(parent, &mut node);
         let newline = self.newline.clone();
         let root_indent = self.root_child_indent();
         let returns = self.returns_value();
+        // A column or side has no line of its own: its statements are indented from its holder's.
+        let holder_indent = match self.find(parent).map(|n| &n.kind) {
+            Some(NodeKind::Container {
+                def: ContainerId::Column | ContainerId::Side,
+                ..
+            }) => self
+                .parent_of(parent)
+                .and_then(|(h, _)| self.find(h))
+                .map(|h| h.indent().unwrap_or("").to_string()),
+            // A page is an arm of the Tabs' `match`: one step in from the `match`, which a
+            // vertical bar puts two closures deeper.
+            Some(NodeKind::Container {
+                def: ContainerId::TabPage,
+                ..
+            }) => self
+                .parent_of(parent)
+                .and_then(|(h, _)| self.find(h))
+                .map(|h| {
+                    let deeper = match &h.kind {
+                        NodeKind::Container {
+                            def: ContainerId::TabsVertical,
+                            ..
+                        } => "            ",
+                        _ => "    ",
+                    };
+                    format!("{}{deeper}", h.indent().unwrap_or(""))
+                }),
+            // A cell's statements: one step in from its `col(|ui| {` line, which is one step in
+            // from a header's `.header(..)` line and two from a body row's table.
+            Some(NodeKind::Container {
+                def: ContainerId::TableCell,
+                ..
+            }) => self.table_cell_indent(parent),
+            _ => None,
+        };
+        if let Some(indent) = &holder_indent
+            && let Some((holder, _)) = self.parent_of(parent)
+        {
+            // An empty Columns closes on a line of its own once it has a statement.
+            let holder_path = self.path(holder)?;
+            let h = self.root.dirty_path(&holder_path);
+            if let NodeKind::Container {
+                def: ContainerId::Columns,
+                closing,
+                ..
+            } = &mut h.kind
+                && !closing.contains('\n')
+            {
+                *closing = format!("{newline}{indent}");
+            }
+        }
         let parent_node = self.root.dirty_path(&path);
         let parent_is_root = path.is_empty();
         let mut index = index.min(parent_node.children().len());
@@ -593,6 +790,7 @@ impl Form {
             parent_node,
             parent_is_root,
             &root_indent,
+            holder_indent.as_deref(),
             &newline,
             index,
             &mut node,
@@ -604,6 +802,51 @@ impl Form {
         Ok(())
     }
 
+    /// A new Columns (no source text) inside another Columns' column must not name its slice like
+    /// the outer one: the inner name would hide the outer, and the outer's statements would no longer
+    /// read as one column each. It becomes `cols2`, `cols3`, ...
+    fn fresh_columns_name(&self, parent: NodeId, node: &mut Node) {
+        let NodeKind::Container {
+            def: ContainerId::Columns,
+            ident,
+            closure,
+            children,
+            shell: None,
+            ..
+        } = &mut node.kind
+        else {
+            return;
+        };
+        let mut taken = Vec::new();
+        let mut at = Some(parent);
+        while let Some(id) = at {
+            if let Some(NodeKind::Container {
+                def: ContainerId::Columns,
+                ident,
+                ..
+            }) = self.find(id).map(|n| &n.kind)
+            {
+                taken.push(ident.clone());
+            }
+            at = self.parent_of(id).map(|(p, _)| p);
+        }
+        if !taken.contains(ident) {
+            return;
+        }
+        let name = (2..)
+            .map(|k| format!("cols{k}"))
+            .find(|n| !taken.contains(n))
+            .expect("an unbounded range");
+        *closure = format!("|{name}| ");
+        for (i, column) in children.iter_mut().enumerate() {
+            if let NodeKind::Container { ident, recv, .. } = &mut column.kind {
+                *ident = format!("{name}[{i}]");
+                *recv = name.clone();
+            }
+        }
+        *ident = name;
+    }
+
     /// Does the form's function return a value (`-> T` in its signature)? Then a body's final
     /// expression is that value.
     pub fn returns_value(&self) -> bool {
@@ -612,13 +855,12 @@ impl Form {
             .is_some_and(|close| sig[close..].contains("->"))
     }
 
+    /// A holder of parts that can't be moved or removed on their own: the branches of an `if` or
+    /// `match`, the columns of a Columns, the two closures of a Sides.
     fn is_group(&self, id: NodeId) -> bool {
         matches!(
             self.find(id).map(|n| &n.kind),
-            Some(NodeKind::Container {
-                def: ContainerId::FlowGroup,
-                ..
-            })
+            Some(NodeKind::Container { def, .. }) if def.is_group()
         )
     }
 
@@ -740,6 +982,7 @@ impl Form {
                 NodeKind::Custom { .. }
                     | NodeKind::Container {
                         def: ContainerId::Window
+                            | ContainerId::Modal
                             | ContainerId::DialogCall
                             | ContainerId::Flow
                             | ContainerId::FlowGroup,
@@ -754,7 +997,7 @@ impl Form {
         fn first_window(n: &Node) -> Option<NodeId> {
             n.children().iter().find_map(|c| match &c.kind {
                 NodeKind::Container {
-                    def: ContainerId::Window | ContainerId::DialogCall,
+                    def: ContainerId::Window | ContainerId::Modal | ContainerId::DialogCall,
                     ..
                 } => Some(c.id),
                 NodeKind::Container { def, .. } if def.is_flow() => first_window(c),
@@ -770,10 +1013,11 @@ impl Form {
 
     /// Can `id` take children here: a container that isn't the locked holder of `if`/`match` branches.
     pub fn accepts_children(&self, id: NodeId) -> bool {
-        matches!(self.find(id).map(|n| &n.kind), Some(NodeKind::Container { def, .. }) if *def != ContainerId::FlowGroup)
+        matches!(self.find(id).map(|n| &n.kind), Some(NodeKind::Container { def, .. }) if !def.is_group())
     }
 
-    /// Is `id` a branch of an `if` chain or `match`, which can't be moved or removed on its own?
+    /// Is `id` a branch of an `if` chain or `match`, a column or a side, which can't be moved or
+    /// removed on its own?
     pub fn is_locked_branch(&self, id: NodeId) -> bool {
         self.parent_of(id)
             .is_some_and(|(parent, _)| self.is_group(parent))
@@ -794,6 +1038,7 @@ fn fit_layout(
     parent: &mut Node,
     parent_is_root: bool,
     root_indent: &str,
+    parent_indent_override: Option<&str>,
     newline: &str,
     index: usize,
     node: &mut Node,
@@ -808,7 +1053,8 @@ fn fit_layout(
             let base = if parent_is_root {
                 root_indent.to_string()
             } else {
-                format!("{}    ", parent.indent().unwrap_or(""))
+                let own = parent.indent().unwrap_or("");
+                format!("{}    ", parent_indent_override.unwrap_or(own))
             };
             Some(base)
         }
@@ -839,7 +1085,8 @@ fn fit_layout(
     let parent_indent = if parent_is_root {
         root_indent.strip_suffix("    ").unwrap_or("").to_string()
     } else {
-        parent.indent().unwrap_or("").to_string()
+        let own = parent.indent().unwrap_or("");
+        parent_indent_override.unwrap_or(own).to_string()
     };
     let empty = siblings.is_empty();
     if let NodeKind::Container { closing, .. } = &mut parent.kind
@@ -872,6 +1119,37 @@ impl ContainerId {
     /// Control flow: its head is locked source text, with no generator behind it.
     pub fn is_flow(self) -> bool {
         matches!(self, ContainerId::Flow | ContainerId::FlowGroup)
+    }
+
+    /// Holds fixed parts (branches, columns, sides, tab pages) rather than free children.
+    pub fn is_group(self) -> bool {
+        matches!(
+            self,
+            ContainerId::FlowGroup
+                | ContainerId::Columns
+                | ContainerId::Sides
+                | ContainerId::Tabs
+                | ContainerId::TabsVertical
+                | ContainerId::Table
+                | ContainerId::TableRow
+        )
+    }
+
+    /// One of those parts, whose place is fixed.
+    pub fn is_part(self) -> bool {
+        matches!(
+            self,
+            ContainerId::Column
+                | ContainerId::Side
+                | ContainerId::TabPage
+                | ContainerId::TableRow
+                | ContainerId::TableCell
+        )
+    }
+
+    /// Tabs, with the bar above or to the left of the pages.
+    pub fn is_tabs(self) -> bool {
+        matches!(self, ContainerId::Tabs | ContainerId::TabsVertical)
     }
 }
 
@@ -1005,19 +1283,20 @@ mod tests {
         assert!(!has(&form));
     }
 
+    /// Size, enabled and visible go together (they nest in the export; see `emit::wrap_add`).
     #[test]
-    fn a_widget_takes_one_add_wrapper() {
+    fn a_widget_takes_several_add_wrappers() {
         let (mut form, _, _, b) = sample();
         form.set_prop(b, "enabled", PropValue::Bool(false)).unwrap();
-        assert_eq!(
-            form.set_prop(b, "add_sized", PropValue::Expr("[1.0, 1.0]".to_string())),
-            Err(EditError::WrapperTaken("enabled"))
-        );
-        form.set_prop(b, "enabled", PropValue::Expr("self.on".to_string()))
-            .unwrap();
-        form.clear_prop(b, "enabled").unwrap();
         form.set_prop(b, "add_sized", PropValue::Expr("[1.0, 1.0]".to_string()))
             .unwrap();
+        form.set_prop(b, "visible", PropValue::Expr("self.on".to_string()))
+            .unwrap();
+        let NodeKind::Widget { props, .. } = &form.find(b).unwrap().kind else {
+            panic!()
+        };
+        assert_eq!(props.len(), 4, "{props:?}");
+        form.clear_prop(b, "enabled").unwrap();
     }
 
     #[test]

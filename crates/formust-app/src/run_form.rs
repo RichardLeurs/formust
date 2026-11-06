@@ -9,8 +9,13 @@
 //! source's text (an open tab's, unsaved). That text gets a `formust_run` module appended. It sits inside the owner's module, so
 //! it can use the owner's private items, and it calls the form's function every frame: a `Ui` form
 //! inside a `CentralPanel`, a dialog (a `Context` form) with the `ctx`, a free dialog as
-//! `owner::fn(ctx)`. A headless run (`FORMUST_RUN_FORM_TEST=1`) draws one frame instead and prints the
-//! texts it drew; the tests use it.
+//! `owner::fn(ctx)`, a free `fn f(ui: &mut egui::Ui)` as `owner::f(ui)` inside a `CentralPanel`. A
+//! dialog starts open: the `bool` fields that keep it closed are set to `true` when the run starts
+//! (see [`formust_rust::run::open_flags`]). A headless run (`FORMUST_RUN_FORM_TEST=1`) draws one frame
+//! instead and prints the texts it drew; the tests use it.
+//!
+//! Each run also removes old program folders of other sources under `<target>/formust-run/` (see
+//! [`clean_old`]); nothing outside that folder is removed.
 //!
 //! The pure parts (manifest, copies, placement, the choice of form) are here and unit-tested. Reading
 //! the project and running cargo happen on a worker thread ([`prepare`]), so the window never waits
@@ -30,6 +35,13 @@ use formust_rust::{FileKind, Origin, file_kind};
 
 /// The folder under the target folder where the generated programs live.
 const FOLDER: &str = "formust-run";
+/// The file in a program folder whose time says when it last ran (see [`clean_old`]). Outside `src/`,
+/// so cargo's build of the program does not depend on it.
+const STAMP: &str = "formust-last-run";
+/// Program folders not run for this long are removed (see [`clean_old`]).
+const KEEP_FOR: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 60 * 60);
+/// At most this many program folders are kept, the most recently run first (see [`clean_old`]).
+const KEEP_COUNT: usize = 16;
 
 /// What the designer shows, as Run Form needs it. Built on the UI thread from the open tabs and the
 /// designer's state, so unsaved text is what the program gets.
@@ -42,7 +54,7 @@ pub struct Inputs {
     pub owner_text: String,
     /// The form's identity, `owner::method`.
     pub form_id: String,
-    /// The owner type; empty for a free function (a dialog only, see [`Kind::FreeDialog`]).
+    /// The owner type; empty for a free function ([`Kind::FreeDialog`] or [`Kind::FreeUi`]).
     pub owner_type: String,
     pub method: String,
     pub kind: Kind,
@@ -63,6 +75,10 @@ pub enum Kind {
     /// A free dialog, `fn m(ctx: &egui::Context)` with no owner type: called as `owner::m(ctx)` every
     /// frame. The copy keeps the function, so it must compile on its own (see [`crate_note`]).
     FreeDialog,
+    /// A free `fn m(ui: &mut egui::Ui)` with no owner type: called as `owner::m(ui)` inside a
+    /// `CentralPanel`. Only a function whose one parameter is the `ui` runs (see
+    /// [`formust_rust::run::takes_only_ui`]).
+    FreeUi,
 }
 
 /// The project as the generated manifest needs it.
@@ -85,6 +101,8 @@ pub struct Package {
     pub main: String,
     /// The file that runs, with the harness appended.
     pub owner: String,
+    /// The owner's `bool` fields set to `true` at the start, so a dialog starts open.
+    pub opened: Vec<String>,
 }
 
 /// Where the copies stand for the real files, so that a diagnostic in a copy is shown in the project.
@@ -158,6 +176,18 @@ pub fn own_build_note(source: &str) -> String {
 /// Output's line when Run is pressed on a Rust file with no form: the project's program runs instead.
 pub const NO_FORM: &str = "no form in this file, running the project";
 
+/// Output's line for a dialog that the run starts open: which of the owner's fields it set. `None`
+/// when it set none.
+pub fn open_note(opened: &[String]) -> Option<String> {
+    (!opened.is_empty()).then(|| {
+        let fields: Vec<String> = opened.iter().map(|f| format!("`self.{f}`")).collect();
+        format!(
+            "the dialog starts open: Run Form sets {} to true in the run (the project's code is not changed).",
+            fields.join(", ")
+        )
+    })
+}
+
 /// Output's line for a file whose text uses `crate::` paths: it is built alone, so those paths don't
 /// resolve in it. `None` when it has none.
 pub fn crate_note(owner_text: &str) -> Option<String> {
@@ -173,6 +203,8 @@ pub fn crate_note(owner_text: &str) -> Option<String> {
 pub fn kind_of(form: &Form) -> Kind {
     if form.context_root && form.owner.is_empty() {
         Kind::FreeDialog
+    } else if form.owner.is_empty() && form.legacy_ctx.is_none() {
+        Kind::FreeUi
     } else if form.context_root {
         Kind::Context
     } else if form.legacy_ctx.is_some() {
@@ -500,21 +532,43 @@ const HEADLESS_DRAW: &str = r#"        fn texts(shape: &egui::Shape, out: &mut V
 /// called with the `ctx` every frame; a free dialog is `super::method(ctx)` with no owner; a legacy
 /// `update` and an `eframe::App`'s `ui` are called with the frame from the window's
 /// `eframe::App::ui`, so they have no headless drawing.
-pub fn harness(owner_type: &str, method: &str, kind: Kind) -> String {
+///
+/// `opened` are `bool` fields of the owner set to `true` before the first frame, so a dialog that its
+/// own flag keeps closed starts open (see [`formust_rust::run::open_flags`]).
+pub fn harness(owner_type: &str, method: &str, kind: Kind, opened: &[String]) -> String {
     // `app.owner.m(args)`: the owner is the value `Runner::new` makes with `Default`.
     let call = |recv: &str, args: &str| format!("{recv}.owner.{method}({args})");
-    let (structure, new) = if kind == Kind::FreeDialog {
+    let (structure, new) = if matches!(kind, Kind::FreeDialog | Kind::FreeUi) {
         ("pub struct Runner;".to_string(), "Runner".to_string())
-    } else {
+    } else if opened.is_empty() {
         (
             format!("pub struct Runner {{\n        owner: super::{owner_type},\n    }}"),
             format!("Runner {{ owner: super::{owner_type}::default() }}"),
+        )
+    } else {
+        let sets: String = opened
+            .iter()
+            .map(|field| format!("            owner.{field} = true;\n"))
+            .collect();
+        (
+            format!("pub struct Runner {{\n        owner: super::{owner_type},\n    }}"),
+            format!(
+                "// The dialog starts open.\n            let mut owner = super::{owner_type}::default();\n{sets}            Runner {{ owner }}"
+            ),
         )
     };
     let (draw, app_body, frame, headless) = match kind {
         Kind::FreeDialog => (
             format!(
                 "    fn draw(_app: &mut Runner, ui: &mut egui::Ui) {{\n        let _ = super::{method}(ui.ctx());\n    }}\n"
+            ),
+            "draw(self, ui);".to_string(),
+            "_frame",
+            HEADLESS_DRAW.to_string(),
+        ),
+        Kind::FreeUi => (
+            format!(
+                "    fn draw(_app: &mut Runner, ui: &mut egui::Ui) {{\n        egui::CentralPanel::default().show(ui, |ui| {{\n            let _ = super::{method}(ui);\n        }});\n    }}\n"
             ),
             "draw(self, ui);".to_string(),
             "_frame",
@@ -587,15 +641,20 @@ fn main() {{
 }
 
 /// The generated package for `input`, or the problems that stop it: a free function that is no
-/// dialog, a type with no `Default`, a manifest that can't be made.
+/// dialog and takes more than the `ui`, a type with no `Default`, a manifest that can't be made.
 pub fn package(input: &Inputs, project: &ProjectInfo) -> Result<Package, Vec<Diagnostic>> {
     let source = input.owner.as_path();
-    if input.owner_type.is_empty() && input.kind != Kind::FreeDialog {
+    let free_runs = match input.kind {
+        Kind::FreeDialog => true,
+        Kind::FreeUi => formust_rust::run::takes_only_ui(&input.owner_text, &input.method),
+        _ => false,
+    };
+    if input.owner_type.is_empty() && !free_runs {
         return Err(vec![problem(
             source,
             0,
             format!(
-                "Run Form runs a method of a type or a free dialog (`fn {m}(ctx: &egui::Context)`), and `{m}` is a free function that is not a dialog. Call it from a method of a type with `impl Default` (such as `ui`) and run that form instead.",
+                "Run Form runs a method of a type, a free dialog (`fn {m}(ctx: &egui::Context)`) or a free function whose only parameter is the ui (`fn {m}(ui: &mut egui::Ui)`), and `{m}` is a free function that is neither. Call it from a method of a type with `impl Default` (such as `ui`) and run that form instead.",
                 m = input.method
             ),
         )]);
@@ -628,12 +687,23 @@ pub fn package(input: &Inputs, project: &ProjectInfo) -> Result<Package, Vec<Dia
         owner.push('\n');
     }
     owner.push('\n');
-    owner.push_str(&harness(&input.owner_type, &input.method, input.kind));
+    let opened = if input.kind == Kind::Context {
+        formust_rust::run::open_flags(&input.owner_text, &input.owner_type, &input.method)
+    } else {
+        Vec::new()
+    };
+    owner.push_str(&harness(
+        &input.owner_type,
+        &input.method,
+        input.kind,
+        &opened,
+    ));
     Ok(Package {
         manifest,
         lock: project.lock.clone(),
         main: main_rs(&input.form_id),
         owner,
+        opened,
     })
 }
 
@@ -658,6 +728,66 @@ pub fn write(dir: &Path, package: &Package) -> std::io::Result<()> {
     write_if_changed(&src.join("main.rs"), &package.main)?;
     write_if_changed(&src.join("owner.rs"), &package.owner)?;
     Ok(())
+}
+
+/// Is `name` a program folder's name: a key as [`key_of`] writes it, 16 lowercase hex digits?
+fn is_key(name: &str) -> bool {
+    name.len() == 16 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Marks `dir` as just run, for [`clean_old`].
+fn stamp(dir: &Path) -> std::io::Result<()> {
+    std::fs::write(dir.join(STAMP), b"")
+}
+
+/// When the program in `dir` last ran: its stamp's time, else the folder's.
+fn last_run(dir: &Path) -> Option<std::time::SystemTime> {
+    std::fs::symlink_metadata(dir.join(STAMP))
+        .or_else(|_| std::fs::symlink_metadata(dir))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+/// Removes old program folders from `root` (a `<target>/formust-run` folder) and returns them: those
+/// not run for `max_age` (before `now`), and beyond the `max_count` most recently run. `keep` (the
+/// folder of the run starting now) always stays. Only real folders directly in `root` whose name is
+/// a key (see [`key_of`]) are touched: a file, a link or any other name stays, and so does all of
+/// `root` when it is no `formust-run` folder or is a link. Errors leave a folder in place.
+pub fn clean_old(
+    root: &Path,
+    keep: &Path,
+    now: std::time::SystemTime,
+    max_age: std::time::Duration,
+    max_count: usize,
+) -> Vec<PathBuf> {
+    if root.file_name() != Some(std::ffi::OsStr::new(FOLDER)) {
+        return Vec::new();
+    }
+    if !std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut folders: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_str().is_some_and(is_key))
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir() && !t.is_symlink()))
+        .map(|e| e.path())
+        .filter(|path| path.as_path() != keep)
+        .map(|path| (last_run(&path).unwrap_or(std::time::UNIX_EPOCH), path))
+        .collect();
+    // The most recent first; `keep` counts as one of the kept.
+    folders.sort_by_key(|(time, _)| std::cmp::Reverse(*time));
+    let room = max_count.saturating_sub(1);
+    let mut removed = Vec::new();
+    for (index, (time, path)) in folders.into_iter().enumerate() {
+        let old = now.duration_since(time).is_ok_and(|age| age > max_age);
+        if (old || index >= room) && std::fs::remove_dir_all(&path).is_ok() {
+            removed.push(path);
+        }
+    }
+    removed
 }
 
 /// Reads the project of `input`, asks cargo where its target folder is, and writes the program there.
@@ -689,11 +819,24 @@ pub fn prepare(input: Inputs, target: Option<PathBuf>) -> Result<Plan, Vec<Diagn
         manifest_text,
     };
     let package = package(&input, &project)?;
-    let note = crate_note(&input.owner_text);
+    let notes: Vec<String> = [crate_note(&input.owner_text), open_note(&package.opened)]
+        .into_iter()
+        .flatten()
+        .collect();
+    let note = (!notes.is_empty()).then(|| notes.join("\n"));
     let target_dir = target.unwrap_or(meta.target_directory);
     let dir = dir_for(&target_dir, &owner);
     write(&dir, &package)
         .map_err(|e| io(format!("Run Form could not write {}: {e}", dir.display())))?;
+    // The stamp only dates the folder for cleaning; a failure to write it is no reason not to run.
+    let _ = stamp(&dir);
+    clean_old(
+        &target_dir.join(FOLDER),
+        &dir,
+        std::time::SystemTime::now(),
+        KEEP_FOR,
+        KEEP_COUNT,
+    );
     let places = Places {
         canonical: dir.canonicalize().unwrap_or_else(|_| dir.clone()),
         dir: dir.clone(),
@@ -714,8 +857,9 @@ pub fn prepare(input: Inputs, target: Option<PathBuf>) -> Result<Plan, Vec<Diagn
 
 impl crate::App {
     /// Run (Cmd+R, the menu, the toolbar): Run Form for the form of the active Rust file, whether the
-    /// designer or the code view shows it. A Rust file with no form, and any other file, runs the
-    /// project's own program (`cargo run`); a Rust file with no form says why in Output.
+    /// designer or the code view shows it, or for the free `fn f(ui: &mut egui::Ui)` under the caret
+    /// in code view. A Rust file with neither, and any other file, runs the project's own program
+    /// (`cargo run`); a Rust file with no form says why in Output.
     pub(crate) fn run_active(&mut self, ctx: &egui::Context) {
         if self.working() {
             return;
@@ -730,7 +874,7 @@ impl crate::App {
         }
         // The designer reads the file now, so a file in code view has its forms too.
         self.sync_designer(true);
-        if self.run_is_form() {
+        if self.run_is_form() || self.free_ui_at_caret().is_some() {
             self.start_run_form(ctx);
             return;
         }
@@ -782,6 +926,41 @@ impl crate::App {
         });
     }
 
+    /// The caret's line in code view (1-based); `None` while the designer shows the form.
+    fn caret_line(&self) -> Option<u32> {
+        (!self.form_showing()).then_some(self.cursor_pos.0 as u32)
+    }
+
+    /// In code view, the free `fn f(ui: &mut egui::Ui)` of the active Rust file that holds the caret,
+    /// unless a designer form does (a form under the caret wins). The designer does not read free
+    /// `ui` functions as forms, so Run Form finds them here.
+    pub(crate) fn free_ui_at_caret(&self) -> Option<formust_rust::run::FreeUi> {
+        let line = self.caret_line()?;
+        let doc = self.docs.get(self.active)?;
+        if !designer::is_rust(&doc.path) {
+            return None;
+        }
+        let free = formust_rust::run::free_ui_at(&doc.text, line)?;
+        let here = if file_kind(&doc.path) == FileKind::Form {
+            Origin::Frm
+        } else {
+            Origin::Rs
+        };
+        let form_here = self
+            .designer
+            .loaded
+            .as_ref()
+            .filter(|l| l.path == doc.path)
+            .is_some_and(|l| {
+                l.forms.iter().any(|f| {
+                    (f.origin.is_none() || f.origin == Some(here))
+                        && f.imported.fn_range.start < free.range.end
+                        && free.range.start < f.imported.fn_range.end
+                })
+            });
+        (!form_here).then_some(free)
+    }
+
     /// What the designer shows, for Run Form. A problem names the file it is about.
     fn run_form_inputs(&self) -> Result<Inputs, Diagnostic> {
         let doc = self.docs.get(self.active).ok_or_else(|| {
@@ -792,6 +971,17 @@ impl crate::App {
             )
         })?;
         let fail = |message: &str| problem(&doc.path, 0, message.to_string());
+        // A free `ui` function under the caret runs from the open text, unsaved edits and all.
+        if let Some(free) = self.free_ui_at_caret() {
+            return Ok(Inputs {
+                owner: doc.path.clone(),
+                owner_text: doc.text.clone(),
+                form_id: format!("::{}", free.name),
+                owner_type: String::new(),
+                method: free.name,
+                kind: Kind::FreeUi,
+            });
+        }
         let loaded = self
             .designer
             .loaded
@@ -813,7 +1003,7 @@ impl crate::App {
                 (f.origin.is_none() || f.origin == Some(here)).then(|| f.imported.fn_range.clone())
             })
             .collect();
-        let caret = (!self.form_showing()).then_some(self.cursor_pos.0 as u32);
+        let caret = self.caret_line();
         let shown = pick_form(
             &ids,
             &spans,

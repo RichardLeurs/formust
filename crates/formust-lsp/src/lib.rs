@@ -181,6 +181,8 @@ pub struct Client {
     encoding: Encoding,
     /// Latest `publishDiagnostics` per file.
     diagnostics: std::collections::HashMap<PathBuf, Vec<Diagnostic>>,
+    /// Files whose diagnostics were published since `take_published` last looked.
+    published: Vec<PathBuf>,
     /// The server's last `serverStatus` said it was idle (loaded, indexed, nothing queued).
     quiescent: bool,
 }
@@ -313,6 +315,7 @@ impl Client {
             texts: Default::default(),
             encoding: Encoding::Utf16,
             diagnostics: Default::default(),
+            published: Vec::new(),
             quiescent: false,
         };
         client.request("initialize", initialize_params(root))?;
@@ -393,9 +396,46 @@ impl Client {
                 .flatten()
                 .map(|d| parse_diagnostic(d, &text, encoding))
                 .collect();
+            if !self.published.contains(&path) {
+                self.published.push(path.clone());
+            }
             self.diagnostics.insert(path, list);
         }
         Ok(())
+    }
+
+    /// The files whose diagnostics the server published since the last call, with the new list of
+    /// each (empty when the file is clean). Reads what has arrived without waiting. Only files
+    /// that were opened with `sync` are reported: the server also publishes cargo's results for
+    /// files nobody opened, and those come to the app from its own `cargo check`.
+    pub fn take_published(&mut self) -> Vec<(PathBuf, Vec<Diagnostic>)> {
+        while let Ok(msg) = self.messages.try_recv() {
+            if msg.get("method").is_some() {
+                let _ = self.handle_server_message(&msg);
+            }
+        }
+        std::mem::take(&mut self.published)
+            .into_iter()
+            .filter(|p| self.versions.contains_key(p))
+            .map(|p| {
+                let list = self.diagnostics.get(&p).cloned().unwrap_or_default();
+                (p, list)
+            })
+            .collect()
+    }
+
+    /// Tells the server `path` is closed and forgets what it published for it.
+    pub fn close(&mut self, path: &Path) -> Result<(), String> {
+        self.texts.remove(path);
+        self.diagnostics.remove(path);
+        self.published.retain(|p| p != path);
+        if self.versions.remove(path).is_none() {
+            return Ok(());
+        }
+        self.notify(
+            "textDocument/didClose",
+            json!({"textDocument": {"uri": uri(path)}}),
+        )
     }
 
     /// Diagnostics the server has published for `path`, waiting up to `wait` for news.
@@ -1130,17 +1170,15 @@ mod tests {
         assert!(tool_candidates("no-such-tool-xyz").is_empty());
     }
 
-    #[test]
-    fn server_status_marks_the_client_quiescent() {
-        // A client over a process that exits at once: only the message handling is exercised.
+    /// A client over a process that does nothing: only the message handling is exercised.
+    fn test_client(messages: Receiver<Value>) -> Client {
         let mut child = Command::new("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
         let stdin = child.stdin.take().unwrap();
-        let (_tx, messages) = channel();
-        let mut c = Client {
+        Client {
             child,
             stdin,
             messages,
@@ -1149,8 +1187,15 @@ mod tests {
             texts: Default::default(),
             encoding: Encoding::Utf16,
             diagnostics: Default::default(),
+            published: Vec::new(),
             quiescent: false,
-        };
+        }
+    }
+
+    #[test]
+    fn server_status_marks_the_client_quiescent() {
+        let (_tx, messages) = channel();
+        let mut c = test_client(messages);
         c.handle_server_message(&json!({"method": "experimental/serverStatus", "params": {"quiescent": true, "health": "ok"}})).unwrap();
         assert!(c.quiescent);
         c.texts.insert(PathBuf::from("/w/a.rs"), "x\n".into());
@@ -1159,5 +1204,26 @@ mod tests {
         let got = c.diagnostics(Path::new("/w/a.rs"), Duration::from_millis(1));
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].message, "boom");
+    }
+
+    #[test]
+    fn published_diagnostics_are_reported_once_for_open_files_only() {
+        let (_tx, messages) = channel();
+        let mut c = test_client(messages);
+        let publish = |c: &mut Client, uri: &str, n: usize| {
+            let d: Vec<Value> = (0..n).map(|_| json!({"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "severity": 2, "message": "w"})).collect();
+            c.handle_server_message(&json!({"method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": d}})).unwrap();
+        };
+        c.versions.insert(PathBuf::from("/w/a.rs"), 1);
+        publish(&mut c, "file:///w/a.rs", 1);
+        publish(&mut c, "file:///w/other.rs", 1);
+        let got = c.take_published();
+        assert_eq!(got.len(), 1, "unopened files are left out");
+        assert_eq!(got[0].0, PathBuf::from("/w/a.rs"));
+        assert_eq!(got[0].1.len(), 1);
+        assert!(c.take_published().is_empty(), "reported once");
+        publish(&mut c, "file:///w/a.rs", 0);
+        let got = c.take_published();
+        assert_eq!(got, vec![(PathBuf::from("/w/a.rs"), vec![])]);
     }
 }

@@ -1,11 +1,15 @@
 //! Runs the language server (rust-analyzer) on its own thread and talks to the UI over channels.
 
 use eframe::egui;
+use formust_build::{Diagnostic, Severity};
 use formust_lsp::{Client, CompletionItem, Config, FileEdit, Location, Symbol};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 
 pub enum Req {
+    /// The tab for `path` was closed: tell the server and drop its diagnostics.
+    Close { path: PathBuf },
     /// Format the file on disk (rustfmt through the server; see `Client::format_file`).
     Format { path: PathBuf },
     Complete {
@@ -59,6 +63,13 @@ pub enum Req {
 
 pub enum Resp {
     Ready,
+    /// The server has closed a file.
+    Closed,
+    /// The server published diagnostics for an open file; empty when the file is clean.
+    Diagnostics {
+        path: PathBuf,
+        list: Vec<formust_lsp::Diagnostic>,
+    },
     Completion(Vec<CompletionItem>),
     Definition(Option<Location>),
     /// The position the answer is for (0-based line, column), so late answers can be ignored.
@@ -107,8 +118,20 @@ pub fn spawn(root: &Path, ctx: egui::Context) -> Option<Handle> {
             Err(e) => return reply(Resp::Error(e)),
         };
         reply(Resp::Ready);
-        while let Ok(req) = req_rx.recv() {
+        loop {
+            // Wake now and then to pass on what the server published without being asked.
+            let req = match req_rx.recv_timeout(std::time::Duration::from_millis(300)) {
+                Ok(req) => req,
+                Err(RecvTimeoutError::Timeout) => {
+                    for (path, list) in client.take_published() {
+                        reply(Resp::Diagnostics { path, list });
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
             let result = match req {
+                Req::Close { path } => client.close(&path).map(|_| Resp::Closed),
                 Req::Complete {
                     path,
                     text,
@@ -174,6 +197,9 @@ pub fn spawn(root: &Path, ctx: egui::Context) -> Option<Handle> {
                     .and_then(|_| client.rename(&path, line, col, &new_name))
                     .map(Resp::Rename),
             };
+            for (path, list) in client.take_published() {
+                reply(Resp::Diagnostics { path, list });
+            }
             reply(result.unwrap_or_else(Resp::Error));
         }
         client.stop();
@@ -182,4 +208,117 @@ pub fn spawn(root: &Path, ctx: egui::Context) -> Option<Handle> {
         requests,
         responses,
     })
+}
+
+/// The server's diagnostic as a Problems entry (the list counts lines and columns from 1).
+pub fn problem_for(path: &Path, d: &formust_lsp::Diagnostic) -> Diagnostic {
+    Diagnostic {
+        file: path.to_path_buf(),
+        line: d.line + 1,
+        col: d.col + 1,
+        severity: match d.severity {
+            1 => Severity::Error,
+            2 => Severity::Warning,
+            3 => Severity::Note,
+            _ => Severity::Hint,
+        },
+        message: d.message.clone(),
+    }
+}
+
+/// What rust-analyzer added to the Problems list, per file, so a republished or closed file takes
+/// back exactly its own entries. An entry that the list already had (cargo reported the same) is not
+/// added, and so is not taken back.
+#[derive(Default)]
+pub struct Published {
+    added: HashMap<PathBuf, Vec<Diagnostic>>,
+}
+
+impl Published {
+    /// Replaces the entries of `path` in `list` with `diags`, skipping identical ones.
+    pub fn set(
+        &mut self,
+        list: &mut Vec<Diagnostic>,
+        path: &Path,
+        diags: &[formust_lsp::Diagnostic],
+    ) {
+        self.clear(list, path);
+        let mut added = Vec::new();
+        for d in diags {
+            let problem = problem_for(path, d);
+            if !list.contains(&problem) {
+                list.push(problem.clone());
+                added.push(problem);
+            }
+        }
+        if !added.is_empty() {
+            self.added.insert(path.to_path_buf(), added);
+        }
+    }
+
+    /// Takes back the entries added for `path`.
+    pub fn clear(&mut self, list: &mut Vec<Diagnostic>, path: &Path) {
+        if let Some(old) = self.added.remove(path) {
+            list.retain(|d| !old.contains(d));
+        }
+    }
+
+    /// Takes back every entry (the server restarted or stopped).
+    pub fn clear_all(&mut self, list: &mut Vec<Diagnostic>) {
+        for (_, old) in self.added.drain() {
+            list.retain(|d| !old.contains(d));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lsp_diag(line: u32, severity: u8, message: &str) -> formust_lsp::Diagnostic {
+        formust_lsp::Diagnostic {
+            line,
+            col: 4,
+            end_line: line,
+            end_col: 6,
+            severity,
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn a_server_diagnostic_becomes_a_one_based_problem() {
+        let p = problem_for(Path::new("/p/a.rs"), &lsp_diag(2, 2, "unused"));
+        assert_eq!((p.line, p.col, p.severity), (3, 5, Severity::Warning));
+        assert_eq!(p.file, PathBuf::from("/p/a.rs"));
+    }
+
+    #[test]
+    fn published_problems_merge_dedupe_and_clear() {
+        let a = Path::new("/p/a.rs");
+        let b = Path::new("/p/b.rs");
+        let cargo = problem_for(a, &lsp_diag(0, 1, "boom"));
+        let mut list = vec![cargo.clone()];
+        let mut published = Published::default();
+        published.set(
+            &mut list,
+            a,
+            &[lsp_diag(0, 1, "boom"), lsp_diag(1, 2, "warn")],
+        );
+        published.set(&mut list, b, &[lsp_diag(0, 1, "other")]);
+        assert_eq!(list.len(), 3, "the identical one is listed once");
+        // Republished with fewer entries: the old ones go.
+        published.set(&mut list, a, &[lsp_diag(1, 2, "warn")]);
+        assert_eq!(list.len(), 3);
+        // Republished empty: its own entries go, cargo's stays.
+        published.set(&mut list, a, &[]);
+        assert_eq!(list.len(), 2);
+        assert!(list.contains(&cargo));
+        // Closing b clears b.
+        published.clear(&mut list, b);
+        assert_eq!(list, vec![cargo.clone()]);
+        published.set(&mut list, a, &[lsp_diag(1, 2, "warn")]);
+        published.clear_all(&mut list);
+        assert_eq!(list, vec![cargo]);
+    }
 }

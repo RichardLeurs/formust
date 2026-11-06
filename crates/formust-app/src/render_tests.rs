@@ -2097,7 +2097,11 @@ fn the_designer_renders_every_first_palette_widget() {
                 }
             }
         });
-        for w in formust_model::ALL_WIDGETS {
+        // Batch D's widgets are in their own form (`batch_d_widgets_preview_and_edit`).
+        for w in formust_model::ALL_WIDGETS
+            .iter()
+            .filter(|w| !BATCH_D_WIDGETS.contains(w))
+        {
             assert!(seen.contains(w), "the sample has no {w:?}");
         }
         assert!(missing.is_empty(), "drawn without a rect: {missing:?}");
@@ -2439,7 +2443,12 @@ fn accesskit_actions_never_reach_the_preview() {
     h.get_by_label("Sign in").focus();
     designer_step(&mut h);
     designer_step(&mut h);
+    // The preview's fields only: the IDE's own (the palette filter) take text as usual.
+    let client = h.state().designer.client.expect("drawn");
     for input in h.get_all_by_role(egui::accesskit::Role::TextInput) {
+        if !client.contains(input.rect().center()) {
+            continue;
+        }
         input.focus();
         input.set_text_value_accesskit("typed by VoiceOver");
     }
@@ -2662,6 +2671,9 @@ fn a_palette_click_adds_into_the_selected_container_or_after_the_widget() {
     h.get_by_role_and_label(egui::accesskit::Role::TreeItem, "Horizontal")
         .click();
     h.run_steps(2);
+    // The filter brings an item into view in the scrolling palette.
+    h.state_mut().designer.palette_filter = "separ".to_string();
+    h.run_steps(2);
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Separator")
         .click();
     h.run_steps(3);
@@ -2682,6 +2694,8 @@ fn a_palette_click_adds_into_the_selected_container_or_after_the_widget() {
     // With a widget selected, the next one goes after it.
     let name = exact_node(h.state(), "Label \"Name label\"");
     h.state_mut().designer.select(Some(name), false);
+    h.state_mut().designer.palette_filter = "Checkbox".to_string();
+    h.run_steps(2);
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Checkbox")
         .click();
     h.run_steps(3);
@@ -2988,6 +3002,8 @@ fn saving_exports_the_form_file_and_reopening_gives_the_same_form() {
     let rs = designer_copy("export");
     let original = std::fs::read_to_string(&rs).unwrap();
     let mut h = designer_harness_for(rs.clone(), false);
+    h.state_mut().designer.palette_filter = "Text edit".to_string();
+    h.run_steps(2);
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Text edit")
         .click();
     h.run_steps(2);
@@ -3075,6 +3091,9 @@ fn a_changed_source_or_form_file_brings_up_the_conflict_prompt() {
     let mut h = designer_harness_for(rs.clone(), false);
     let add = |h: &mut Harness<'static, App>| {
         h.state_mut().designer.select(None, false);
+        // The filter brings the item into view in the scrolling palette.
+        h.state_mut().designer.palette_filter = "Spinner".to_string();
+        h.run_steps(2);
         h.get_by_role_and_label(egui::accesskit::Role::Button, "Spinner")
             .click();
         h.run_steps(2);
@@ -3291,5 +3310,1845 @@ fn a_source_with_a_form_opens_in_the_designer_window() {
     assert!(
         harness.query_by_label("Code editor").is_none(),
         "the designer replaces the code"
+    );
+}
+
+// ---- The form designer, layout: resize handles, Fill, anchors, wrap -----------------------------
+
+fn widget_prop(
+    h: &Harness<'static, App>,
+    id: formust_model::NodeId,
+    name: &str,
+) -> Option<formust_model::PropValue> {
+    match &shown_form(h).find(id).unwrap().kind {
+        formust_model::NodeKind::Widget { props, .. } => props.get(name).cloned(),
+        _ => None,
+    }
+}
+
+fn undo_steps(h: &Harness<'static, App>) -> usize {
+    h.state().designer.loaded.as_ref().unwrap().history.steps()
+}
+
+fn select_node(h: &mut Harness<'static, App>, id: formust_model::NodeId) {
+    h.state_mut().designer.select(Some(id), false);
+    designer_step(h);
+    designer_step(h);
+}
+
+/// Dragging the right handle of a selected text edit sets `desired_width` live through real
+/// pointer events, as one undo step; Escape in the middle of a drag puts it back.
+#[test]
+fn dragging_the_right_handle_sets_the_desired_width() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut h = designer_harness_for(designer_copy("resize-width"), false);
+    let field = exact_node(h.state(), "Text edit &mut self.name");
+    select_node(&mut h, field);
+    let rect = designer_rect(&h, field);
+    let from = rect.right_center();
+    let to = from + egui::vec2(60.0, 7.0);
+    designer_drag(&mut h, from, to);
+    assert!(
+        h.state().designer.resize.is_some(),
+        "the handle takes the drag, not the shield"
+    );
+    assert_eq!(h.state().designer.drag, None, "no move starts");
+    let want = (rect.width() + 60.0).round() as f64;
+    assert_eq!(
+        widget_prop(&h, field, "desired_width"),
+        Some(formust_model::PropValue::Float(want)),
+        "live while dragging"
+    );
+    let image = h.render().expect("offscreen render");
+    image
+        .save(out_dir().join("ui-designer-resize.png"))
+        .unwrap();
+    designer_release(&mut h, to);
+    assert!(h.state().designer.resize.is_none());
+    assert_eq!(undo_steps(&h), 1, "one drag, one step");
+    let now = designer_rect(&h, field);
+    assert!(
+        (now.width() - want as f32).abs() < 1.5,
+        "the preview follows: {now:?}"
+    );
+    let text = formust_rust::emit_form_item(&shown_form(&h));
+    assert!(
+        text.contains(&format!(
+            "ui.add(egui::TextEdit::singleline(&mut self.name).desired_width({}));",
+            formust_model::num(want)
+        )),
+        "{text}"
+    );
+
+    // Escape during a drag: back to where it was, no step.
+    designer_drag(
+        &mut h,
+        now.right_center(),
+        now.right_center() + egui::vec2(40.0, 0.0),
+    );
+    assert!(h.state().designer.resize.is_some());
+    h.key_press(egui::Key::Escape);
+    designer_step(&mut h);
+    designer_release(&mut h, now.right_center() + egui::vec2(40.0, 0.0));
+    assert_eq!(
+        widget_prop(&h, field, "desired_width"),
+        Some(formust_model::PropValue::Float(want))
+    );
+    assert_eq!(undo_steps(&h), 1);
+    assert_eq!(
+        h.state().designer.selected,
+        Some(field),
+        "Escape kept the selection"
+    );
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(2);
+    assert_eq!(widget_prop(&h, field, "desired_width"), None);
+}
+
+/// A label has no size property of its own: the bottom handle gives it `ui.add_sized([w, h], ..)`,
+/// and so does the right handle of an anchored checkbox, inside its wrapper.
+#[test]
+fn a_widget_without_size_properties_is_resized_with_add_sized() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut h = designer_harness_for(designer_copy("resize-sized"), false);
+    let label = exact_node(h.state(), "Label \"Name label\"");
+    select_node(&mut h, label);
+    let rect = designer_rect(&h, label);
+    let from = rect.center_bottom();
+    let to = from + egui::vec2(0.0, 20.0);
+    designer_drag(&mut h, from, to);
+    designer_release(&mut h, to);
+    let size = format!(
+        "[{}, {}]",
+        formust_model::num(rect.width().round() as f64),
+        formust_model::num((rect.height() + 20.0).round() as f64)
+    );
+    assert_eq!(
+        widget_prop(&h, label, "add_sized"),
+        Some(formust_model::PropValue::Expr(size.clone()))
+    );
+    let text = formust_rust::emit_form_item(&shown_form(&h));
+    assert!(
+        text.contains(&format!(
+            "ui.add_sized({size}, egui::Label::new(\"Name label\"));"
+        )),
+        "{text}"
+    );
+
+    // Anchored right, then resized inside its wrapper.
+    let checkbox = exact_node(h.state(), "Checkbox \"Remember me\"");
+    select_node(&mut h, checkbox);
+    assert!(
+        h.state_mut()
+            .designer
+            .set_anchor(Some(formust_model::Anchor::Right))
+    );
+    designer_step(&mut h);
+    designer_step(&mut h);
+    let rect = designer_rect(&h, checkbox);
+    let client = h.state().designer.client.unwrap();
+    assert!(
+        rect.right() > client.right() - 20.0,
+        "anchored right: {rect:?} in {client:?}"
+    );
+    let from = rect.right_center();
+    // Right to left: the handle drags its right edge, and the box grows leftwards.
+    let to = from + egui::vec2(-30.0, 0.0);
+    designer_drag(&mut h, from, to);
+    designer_release(&mut h, to);
+    let text = formust_rust::emit_form_item(&shown_form(&h));
+    assert!(
+        text.contains(&format!(
+            "ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {{\n            ui.add_sized([{}, {}], egui::Checkbox::new(&mut self.remember, \"Remember me\"));",
+            formust_model::num((rect.width() - 30.0).round() as f64),
+            formust_model::num(rect.height().round() as f64),
+        )),
+        "{text}"
+    );
+    assert_eq!(h.state().designer.selected, Some(checkbox));
+}
+
+/// Cmd+E fills: the text edit in the Name row stretches to the end of the row, and the export says
+/// `.desired_width(f32::INFINITY)`. A click on the anchored node's empty row selects the node.
+#[test]
+fn fill_stretches_a_text_edit_in_its_row() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut h = designer_harness_for(designer_copy("fill"), false);
+    let field = exact_node(h.state(), "Text edit &mut self.name");
+    select_node(&mut h, field);
+    let before = designer_rect(&h, field);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::E);
+    designer_step(&mut h);
+    designer_step(&mut h);
+    assert_eq!(h.state().designer.selected_fill(), Some(true));
+    let after = designer_rect(&h, field);
+    let client = h.state().designer.client.unwrap();
+    assert_eq!(after.left(), before.left(), "still after its label");
+    assert!(
+        (after.right() - (client.right() - designer::preview::MARGIN)).abs() < 1.5,
+        "to the end of the row: {after:?} in {client:?}"
+    );
+    let text = formust_rust::emit_form_item(&shown_form(&h));
+    assert!(
+        text.contains(
+            "ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(f32::INFINITY));"
+        ),
+        "{text}"
+    );
+    let image = h.render().expect("offscreen render");
+    image.save(out_dir().join("ui-designer-fill.png")).unwrap();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::E);
+    designer_step(&mut h);
+    assert_eq!(h.state().designer.selected_fill(), Some(false));
+
+    // An anchored link: at the right, and a click on it selects the link, never its wrapper.
+    let link = exact_node(h.state(), "Link \"A link\"");
+    select_node(&mut h, link);
+    assert!(
+        h.state_mut()
+            .designer
+            .set_anchor(Some(formust_model::Anchor::Right))
+    );
+    designer_step(&mut h);
+    let wrapper = h.state().designer.host(link);
+    assert_ne!(wrapper, link);
+    let at = designer_rect(&h, link);
+    assert!(at.right() > client.right() - 20.0, "{at:?}");
+    h.state_mut().designer.select(None, true);
+    designer_click(&mut h, at.center());
+    assert_eq!(h.state().designer.selected, Some(link));
+    assert!(
+        h.state().designer.rows.iter().all(|r| r.id != wrapper),
+        "the outline has no row for the wrapper"
+    );
+    assert!(h.query_by_label("Link \"A link\" · anchor right").is_some());
+}
+
+/// A right-click on the canvas opens the node's menu; "Wrap in row" puts it in a new Horizontal
+/// as one step, and Cmd+Shift+J unwraps it again.
+#[test]
+fn the_canvas_menu_wraps_in_a_row_and_the_shortcut_unwraps() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut h = designer_harness_for(designer_copy("wrap"), false);
+    let root = shown_form(&h).root.id;
+    let checkbox = exact_node(h.state(), "Checkbox \"Remember me\"");
+    let at = designer_rect(&h, checkbox).center();
+    let secondary = |pressed| egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Secondary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    h.event(egui::Event::PointerMoved(at));
+    designer_step(&mut h);
+    h.event(secondary(true));
+    designer_step(&mut h);
+    h.event(secondary(false));
+    designer_step(&mut h);
+    designer_step(&mut h);
+    assert_eq!(h.state().designer.selected, Some(checkbox));
+    let item = h
+        .query_all_by_label("Wrap in row")
+        .filter(|n| n.accesskit_node().role() == egui::accesskit::Role::Button)
+        .min_by(|a, b| {
+            let d = |n: &egui_kittest::Node<'_>| (n.rect().center() - at).length();
+            d(a).total_cmp(&d(b))
+        })
+        .expect("the menu's item");
+    item.click();
+    h.run_steps(3);
+    let (row, _) = shown_form(&h).parent_of(checkbox).unwrap();
+    assert_ne!(row, root);
+    assert_eq!(
+        designer::node_title(shown_form(&h).find(row).unwrap()),
+        "Horizontal"
+    );
+    assert_eq!(undo_steps(&h), 1);
+    let text = formust_rust::emit_form_item(&shown_form(&h));
+    assert!(
+        text.contains("        ui.horizontal(|ui| {\n            ui.checkbox(&mut self.remember, \"Remember me\");\n        });"),
+        "{text}"
+    );
+    select_node(&mut h, row);
+    h.key_press_modifiers(
+        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        egui::Key::J,
+    );
+    h.run_steps(2);
+    assert_eq!(shown_form(&h).parent_of(checkbox).unwrap().0, root);
+    assert!(shown_form(&h).find(row).is_none());
+    assert_eq!(undo_steps(&h), 2);
+    // Cmd+J wraps the selected node again.
+    select_node(&mut h, checkbox);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::J);
+    h.run_steps(2);
+    assert_ne!(shown_form(&h).parent_of(checkbox).unwrap().0, root);
+}
+
+// ---- The form designer, batch B: Frame, spacing and size, tooltip/enabled/visible, text style, events
+
+const LOOK: &str = r#"#[derive(Default)]
+pub struct Look {
+    name: String,
+    ready: bool,
+}
+
+impl Look {
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
+        ui.label("First label");
+        ui.vertical(|ui| {
+            ui.label("Top line");
+            ui.label("Bottom line");
+        });
+        ui.horizontal(|ui| {
+            ui.label("In a row");
+        });
+        if ui.button("Store values").clicked() {
+            self.ready = true;
+        }
+        ui.label("Plain text");
+        ui.heading("Big title");
+        ui.text_edit_singleline(&mut self.name);
+    }
+}
+"#;
+
+/// The designer on `LOOK`, tall enough that a widget's whole inspector fits without scrolling.
+fn look_harness(name: &str) -> Harness<'static, App> {
+    let mut h = designer_harness_for(look_copy(name), false);
+    h.set_size(egui::vec2(1500.0, 1900.0));
+    h.run_steps(3);
+    h
+}
+
+/// `LOOK` in a folder of its own under the target dir, never in the fixtures.
+fn look_copy(name: &str) -> PathBuf {
+    let dir = crate::target_tmp().join("designer-look").join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let rs = dir.join("look.rs");
+    std::fs::write(&rs, LOOK).unwrap();
+    rs
+}
+
+fn node_props(h: &Harness<'static, App>, id: formust_model::NodeId) -> formust_model::Props {
+    match &shown_form(h).find(id).unwrap().kind {
+        formust_model::NodeKind::Widget { props, .. }
+        | formust_model::NodeKind::Container { props, .. } => props.clone(),
+        formust_model::NodeKind::Custom { .. } => formust_model::Props::new(),
+    }
+}
+
+fn set_prop(
+    h: &mut Harness<'static, App>,
+    id: formust_model::NodeId,
+    name: &'static str,
+    value: formust_model::PropValue,
+) {
+    assert!(
+        h.state_mut()
+            .designer
+            .try_edit(None, |f| f.set_prop(id, name, value)),
+        "{:?}",
+        h.state().designer.status
+    );
+    designer_step(h);
+    designer_step(h);
+}
+
+/// The one combo box showing `value`.
+fn combo<'h>(h: &'h Harness<'static, App>, value: &'h str) -> egui_kittest::Node<'h> {
+    let mut found: Vec<_> = h
+        .query_all_by_value(value)
+        .filter(|n| n.accesskit_node().role() == egui::accesskit::Role::ComboBox)
+        .collect();
+    assert_eq!(found.len(), 1, "one combo box showing {value:?}");
+    found.remove(0)
+}
+
+/// The colour of one pixel of the last render, in points (pixels_per_point is 1).
+fn pixel(image: &image::RgbaImage, at: egui::Pos2) -> [u8; 4] {
+    image.get_pixel(at.x as u32, at.y as u32).0
+}
+
+/// A Frame from the palette: a margin, rounded corners and a line that suits both modes. Its fill
+/// set as a light and dark pair shows the light colour in light mode and the dark one in dark mode,
+/// and the export is the `egui::Frame::new()..show(ui, |ui| ..)` chain.
+#[test]
+fn a_frame_from_the_palette_is_light_and_dark_aware() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut h = designer_harness_for(look_copy("frame"), false);
+    let first = exact_node(h.state(), "Label \"First label\"");
+    select_node(&mut h, first);
+    // The palette offers it (its button may be scrolled out of the panel here).
+    assert!(
+        designer::edit::palette().contains(&designer::edit::Item::Container(
+            formust_model::ContainerId::Frame
+        ))
+    );
+    h.state_mut().designer.add(
+        designer::edit::Item::Container(formust_model::ContainerId::Frame),
+        None,
+    );
+    h.run_steps(3);
+    let frame = h
+        .state()
+        .designer
+        .selected
+        .expect("the new frame is selected");
+    assert_eq!(
+        designer::node_title(shown_form(&h).find(frame).unwrap()),
+        "Frame"
+    );
+    let plain = exact_node(h.state(), "Label \"Plain text\"");
+    assert!(h.state_mut().designer.move_to(plain, frame, 0));
+    designer_step(&mut h);
+    set_prop(
+        &mut h,
+        frame,
+        "fill",
+        formust_model::PropValue::color_pair([250, 240, 200, 255], [20, 40, 60, 255]),
+    );
+    select_node(&mut h, frame);
+    // The inspector has the Frame's own editors, the stroke with its width and colours.
+    for label in [
+        "Fill",
+        "Stroke",
+        "Corner radius",
+        "Inner margin",
+        "Item spacing",
+        "Min width",
+    ] {
+        assert!(h.query_by_label(label).is_some(), "{label}");
+    }
+    let rect = designer_rect(&h, frame);
+    let inner = designer_rect(&h, plain);
+    assert!(
+        inner.left() - rect.left() >= 8.0 && inner.top() - rect.top() >= 8.0,
+        "the inner margin: {inner:?} in {rect:?}"
+    );
+    let inside = egui::pos2(rect.left() + 4.0, rect.center().y);
+    let light = h.render().expect("offscreen render");
+    assert_eq!(pixel(&light, inside), [250, 240, 200, 255]);
+    light
+        .save(out_dir().join("ui-designer-frame-light.png"))
+        .unwrap();
+    h.state_mut().designer.dark = Some(true);
+    designer_step(&mut h);
+    designer_step(&mut h);
+    let dark = h.render().expect("offscreen render");
+    assert_eq!(pixel(&dark, inside), [20, 40, 60, 255]);
+    dark.save(out_dir().join("ui-designer-frame-dark.png"))
+        .unwrap();
+
+    let text = formust_rust::emit_form_item(&shown_form(&h));
+    assert!(
+        text.contains("        egui::Frame::new().fill(if ui.visuals().dark_mode { egui::Color32::from_rgb(20, 40, 60) } else { egui::Color32::from_rgb(250, 240, 200) }).stroke(egui::Stroke::new(1.0, if ui.visuals().dark_mode { egui::Color32::from_rgb(90, 90, 90) } else { egui::Color32::from_rgb(180, 180, 180) })).corner_radius(4.0).inner_margin(8.0).show(ui, |ui| {\n            ui.label(\"Plain text\");\n        });"),
+        "{text}"
+    );
+    let again = formust_rust::import(&text).unwrap();
+    assert!(
+        again.forms[0].custom.is_empty(),
+        "{:?}",
+        again.forms[0].custom
+    );
+}
+
+/// Item spacing on a Vertical spreads its children in the preview as at runtime, and dragging a
+/// row's right handle writes `ui.set_min_width(..)` at the start of its body, as one undo step.
+#[test]
+fn spacing_and_a_min_width_change_the_preview() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut h = designer_harness_for(look_copy("spacing"), false);
+    let top = exact_node(h.state(), "Label \"Top line\"");
+    let bottom = exact_node(h.state(), "Label \"Bottom line\"");
+    let column = shown_form(&h).parent_of(top).unwrap().0;
+    let gap =
+        |h: &Harness<'static, App>| designer_rect(h, bottom).top() - designer_rect(h, top).bottom();
+    let before = gap(&h);
+    set_prop(
+        &mut h,
+        column,
+        "item_spacing",
+        formust_model::PropValue::Expr("egui::vec2(8.0, 24.0)".into()),
+    );
+    assert!((gap(&h) - 24.0).abs() < 1.0, "{before} to {}", gap(&h));
+    select_node(&mut h, column);
+    assert!(h.query_by_label("SPACING AND PADDING").is_some());
+
+    let label = exact_node(h.state(), "Label \"In a row\"");
+    let row = shown_form(&h).parent_of(label).unwrap().0;
+    select_node(&mut h, row);
+    let rect = designer_rect(&h, row);
+    let from = rect.right_center();
+    let to = from + egui::vec2(120.0, 0.0);
+    designer_drag(&mut h, from, to);
+    designer_release(&mut h, to);
+    let want = (rect.width() + 120.0).round() as f64;
+    assert_eq!(
+        node_props(&h, row).get("set_min_width"),
+        Some(&formust_model::PropValue::Float(want))
+    );
+    assert_eq!(undo_steps(&h), 2, "the spacing, then one drag");
+    assert!((designer_rect(&h, row).width() - want as f32).abs() < 1.5);
+    let text = formust_rust::emit_form_item(&shown_form(&h));
+    assert!(
+        text.contains(&format!(
+            "        ui.horizontal(|ui| {{\n            ui.set_min_width({});\n            ui.label(\"In a row\");\n        }});",
+            formust_model::num(want)
+        )),
+        "{text}"
+    );
+    assert!(text.contains("            ui.spacing_mut().item_spacing = egui::vec2(8.0, 24.0);\n            ui.label(\"Top line\");"), "{text}");
+}
+
+/// A tooltip typed in the inspector goes onto the response; a button set disabled shows disabled
+/// (AccessKit says so too); a heading set invisible stays on the canvas, dimmed and selectable; and
+/// "Expression…" lets enabled take `self.ready`.
+#[test]
+fn tooltip_enabled_and_visible_show_in_the_designer() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut h = look_harness("behaviour");
+    let button = exact_node(h.state(), "Button \"Store values\" · clicked");
+    select_node(&mut h, button);
+    assert!(h.query_by_label("BEHAVIOUR").is_some());
+    h.query_all_by_label("Tooltip")
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::TextInput)
+        .expect("the tooltip field")
+        .focus();
+    h.run_steps(2);
+    h.event(egui::Event::Text("Keeps it".into()));
+    h.run_steps(2);
+    assert_eq!(
+        node_props(&h, button).get("tooltip"),
+        Some(&formust_model::PropValue::Text("Keeps it".into()))
+    );
+    if let Some(id) = h.ctx.memory(|m| m.focused()) {
+        h.ctx.memory_mut(|m| m.surrender_focus(id));
+    }
+    h.run_steps(1);
+    assert!(
+        !h.get_by_label("Store values")
+            .accesskit_node()
+            .is_disabled()
+    );
+    set_prop(
+        &mut h,
+        button,
+        "enabled",
+        formust_model::PropValue::Bool(false),
+    );
+    assert!(
+        h.get_by_label("Store values")
+            .accesskit_node()
+            .is_disabled(),
+        "the preview shows it disabled"
+    );
+    let text = formust_rust::emit_form_item(&shown_form(&h));
+    assert!(
+        text.contains("if ui.add_enabled(false, egui::Button::new(\"Store values\")).on_hover_text(\"Keeps it\").clicked() {"),
+        "{text}"
+    );
+
+    // Invisible: dimmed, still drawn where it would be and selectable.
+    let heading = exact_node(h.state(), "Heading \"Big title\"");
+    let shown = designer_rect(&h, heading);
+    set_prop(
+        &mut h,
+        heading,
+        "visible",
+        formust_model::PropValue::Bool(false),
+    );
+    assert_eq!(designer_rect(&h, heading), shown, "it keeps its place");
+    h.state_mut().designer.select(None, true);
+    designer_click(&mut h, shown.center());
+    assert_eq!(h.state().designer.selected, Some(heading));
+    let image = h.render().expect("offscreen render");
+    image
+        .save(out_dir().join("ui-designer-behaviour.png"))
+        .unwrap();
+
+    // Enabled as an expression, picked from the bool editor and typed.
+    select_node(&mut h, heading);
+    combo(&h, "(not set)").click();
+    h.run_steps(2);
+    h.get_by_label("Expression…").click();
+    h.run_steps(3);
+    assert_eq!(
+        node_props(&h, heading).get("enabled"),
+        Some(&formust_model::PropValue::Expr("true".into()))
+    );
+    set_prop(
+        &mut h,
+        heading,
+        "visible",
+        formust_model::PropValue::Expr("self.ready".into()),
+    );
+    let text = formust_rust::emit_form_item(&shown_form(&h));
+    assert!(
+        text.contains("ui.add_enabled_ui(true, |ui| ui.scope(|ui| { if !(self.ready) { ui.set_invisible(); } ui.heading(\"Big title\") }).inner).inner;"),
+        "{text}"
+    );
+    let again = formust_rust::import(&text).unwrap();
+    assert!(
+        again.forms[0].custom.is_empty(),
+        "{:?}",
+        again.forms[0].custom
+    );
+}
+
+/// Font size, bold and italic on a label: the preview grows the text, the inspector groups them
+/// under TEXT STYLE, and the export is an `egui::RichText` chain that reads back.
+#[test]
+fn text_styling_changes_the_label() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut h = designer_harness_for(look_copy("text-style"), false);
+    let label = exact_node(h.state(), "Label \"Plain text\"");
+    let before = designer_rect(&h, label);
+    select_node(&mut h, label);
+    assert!(h.query_by_label("TEXT STYLE").is_some());
+    let bold = h
+        .query_all_by_label("Bold")
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::CheckBox)
+        .expect("the bold checkbox");
+    bold.click();
+    h.run_steps(2);
+    set_prop(
+        &mut h,
+        label,
+        "font_size",
+        formust_model::PropValue::Float(28.0),
+    );
+    set_prop(
+        &mut h,
+        label,
+        "italic",
+        formust_model::PropValue::Bool(true),
+    );
+    let after = designer_rect(&h, label);
+    assert!(
+        after.height() > before.height() + 10.0 && after.width() > before.width(),
+        "{before:?} to {after:?}"
+    );
+    let text = formust_rust::emit_form_item(&shown_form(&h));
+    assert!(
+        text.contains(
+            "ui.label(egui::RichText::new(\"Plain text\").size(28.0).strong().italics());"
+        ),
+        "{text}"
+    );
+    let again = formust_rust::import(&text).unwrap();
+    let props = widget_props_of(&again.forms[0].form, "Plain text");
+    assert_eq!(
+        props.get("bold"),
+        Some(&formust_model::PropValue::Bool(true))
+    );
+    assert_eq!(
+        props.get("font_size"),
+        Some(&formust_model::PropValue::Float(28.0))
+    );
+}
+
+/// The props of the widget whose text is `text`.
+fn widget_props_of(form: &formust_model::Form, text: &str) -> formust_model::Props {
+    let mut found = None;
+    form.root.walk(&mut |n| {
+        if let formust_model::NodeKind::Widget { props, .. } = &n.kind
+            && props.get("text") == Some(&formust_model::PropValue::Text(text.into()))
+        {
+            found = Some(props.clone());
+        }
+    });
+    found.expect("the widget")
+}
+
+/// "Add handler…" lists the widget's other events; picking double_clicked adds its handler stub
+/// next to clicked, written with one `response`, and "Use in code" lists the new stub.
+#[test]
+fn a_double_click_handler_is_added_from_the_inspector() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut h = look_harness("events");
+    let button = exact_node(h.state(), "Button \"Store values\" · clicked");
+    select_node(&mut h, button);
+    combo(&h, "Add handler…").click();
+    h.run_steps(2);
+    for event in ["double_clicked", "secondary_clicked", "hovered"] {
+        assert!(h.query_by_label(event).is_some(), "{event} is offered");
+    }
+    h.get_by_label("double_clicked").click();
+    h.run_steps(3);
+    let events: Vec<formust_model::EventId> = match &shown_form(&h).find(button).unwrap().kind {
+        formust_model::NodeKind::Widget { events, .. } => events.iter().map(|(e, _)| *e).collect(),
+        _ => Vec::new(),
+    };
+    assert_eq!(
+        events,
+        [
+            formust_model::EventId::Clicked,
+            formust_model::EventId::DoubleClicked
+        ]
+    );
+    let text = formust_rust::emit_form_item(&shown_form(&h));
+    assert!(
+        text.contains("{ let response = ui.button(\"Store values\"); if response.clicked() {\n            self.ready = true;\n        } if response.double_clicked() { self.on_store_values_double_clicked(); } }"),
+        "{text}"
+    );
+    let usage = formust_rust::use_in_code(&shown_form(&h), "look.frm.rs", "look.rs", None);
+    assert!(
+        usage
+            .stubs
+            .as_deref()
+            .is_some_and(|s| s.contains("fn on_store_values_double_clicked(&mut self)")),
+        "{:?}",
+        usage.stubs
+    );
+}
+
+// ---- The form designer, batch C: palette, multi-select, align, Columns and Sides, overlays, tab order
+
+/// A click on the canvas with modifiers held over several frames, as a real keyboard does.
+fn designer_click_with(h: &mut Harness<'static, App>, pos: egui::Pos2, mods: egui::Modifiers) {
+    h.event(egui::Event::ModifiersChanged(mods));
+    h.event(egui::Event::PointerMoved(pos));
+    designer_step(h);
+    h.event(egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: mods,
+    });
+    designer_step(h);
+    h.event(egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: mods,
+    });
+    designer_step(h);
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    designer_step(h);
+}
+
+/// The palette scrolls, filters and folds its groups: every item can be brought into view, a
+/// closed group hides its items, and the outline keeps its rows.
+#[test]
+fn the_palette_scrolls_filters_and_folds_its_groups() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut h = designer_harness_for(look_copy("palette"), false);
+    // A short window: the palette is taller than its room and scrolls.
+    h.set_size(egui::vec2(1500.0, 700.0));
+    h.run_steps(3);
+    let outline_top = h.get_by_label("OUTLINE").rect().top();
+    for item in designer::edit::palette() {
+        h.state_mut().designer.palette_filter = item.label().to_string();
+        h.run_steps(2);
+        let button = h
+            .query_all_by_label(item.label())
+            .filter(|n| n.accesskit_node().role() == egui::accesskit::Role::Button)
+            .min_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+            .unwrap_or_else(|| panic!("{} is in the palette", item.label()));
+        assert!(
+            button.rect().bottom() < outline_top + 1.0,
+            "{} is in view above the outline",
+            item.label()
+        );
+    }
+    h.state_mut().designer.palette_filter.clear();
+    h.run_steps(2);
+    let image = h.render().unwrap();
+    image
+        .save(out_dir().join("ui-designer-palette.png"))
+        .unwrap();
+    assert!(
+        h.query_by_role_and_label(egui::accesskit::Role::Button, "Heading")
+            .is_some()
+    );
+    h.get_by_label("▾ Text").click();
+    h.run_steps(2);
+    assert!(h.state().designer.palette_closed.contains("Text"));
+    assert!(
+        h.query_by_role_and_label(egui::accesskit::Role::Button, "Heading")
+            .is_none(),
+        "a closed group hides its items"
+    );
+    h.get_by_label("▸ Text").click();
+    h.run_steps(2);
+    assert!(
+        h.query_by_role_and_label(egui::accesskit::Role::Button, "Heading")
+            .is_some()
+    );
+}
+
+/// Cmd-click on the canvas and in the outline builds a selection; the inspector shows what they
+/// have in common and a change there sets it on all of them as one undo step; copy, duplicate,
+/// arrows and delete act on the set; a rubber band selects what it encloses.
+#[test]
+fn several_nodes_are_selected_and_edited_together() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut h = look_harness("multi");
+    let first = exact_node(h.state(), "Label \"First label\"");
+    let plain = exact_node(h.state(), "Label \"Plain text\"");
+    let title = exact_node(h.state(), "Heading \"Big title\"");
+    let at = designer_rect(&h, first).center();
+    designer_click(&mut h, at);
+    let at = designer_rect(&h, plain).center();
+    designer_click_with(&mut h, at, egui::Modifiers::COMMAND);
+    assert_eq!(h.state().designer.selection_len(), 2);
+    h.get_by_role_and_label(egui::accesskit::Role::TreeItem, "Heading \"Big title\"")
+        .click_modifiers(egui::Modifiers::COMMAND);
+    h.run_steps(2);
+    // The outline click arrives with Cmd in the same frame: hold it over frames instead.
+    if h.state().designer.selection_len() != 3 {
+        let row = outline_row(&h, title).center();
+        designer_click_with(&mut h, row, egui::Modifiers::COMMAND);
+    }
+    assert_eq!(h.state().designer.selection_len(), 3);
+    assert!(h.query_by_label("3 selected").is_some());
+    assert!(h.query_by_label("COMMON PROPERTIES").is_some());
+    let steps = undo_steps(&h);
+    let bold = h
+        .query_all_by_label("Bold")
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::CheckBox)
+        .expect("the common bold checkbox");
+    bold.click();
+    h.run_steps(2);
+    for id in [first, plain, title] {
+        assert_eq!(
+            node_props(&h, id).get("bold"),
+            Some(&formust_model::PropValue::Bool(true)),
+            "bold on every one"
+        );
+    }
+    assert_eq!(undo_steps(&h), steps + 1, "one undo step");
+    // Cmd-click again takes one out.
+    let at = designer_rect(&h, plain).center();
+    designer_click_with(&mut h, at, egui::Modifiers::COMMAND);
+    assert_eq!(h.state().designer.selection_len(), 2);
+    // Copy holds both; duplicate copies both after themselves; delete removes the copies.
+    let text = h.state_mut().designer.copy_selected().unwrap();
+    assert!(
+        text.contains("First label") && text.contains("Big title"),
+        "{text}"
+    );
+    let count = shown_form(&h).node_ids().len();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
+    h.run_steps(2);
+    assert_eq!(shown_form(&h).node_ids().len(), count + 2);
+    assert_eq!(
+        h.state().designer.selection_len(),
+        2,
+        "the copies are selected"
+    );
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    assert_eq!(shown_form(&h).node_ids().len(), count);
+    // A rubber band from empty space selects the nodes it encloses.
+    let a = designer_rect(&h, plain);
+    let b = designer_rect(&h, title);
+    let client = h.state().designer.client.unwrap();
+    let from = egui::pos2(client.right() - 6.0, a.top() - 2.0);
+    let to = egui::pos2(a.left() - 3.0, b.bottom() + 2.0);
+    designer_drag(&mut h, from, to);
+    let image = h.render().unwrap();
+    image
+        .save(out_dir().join("ui-designer-rubber-band.png"))
+        .unwrap();
+    designer_release(&mut h, to);
+    let mut picked = h.state().designer.selection_hosts();
+    picked.sort();
+    let mut want = vec![plain, title];
+    want.sort();
+    assert_eq!(picked, want);
+    // The arrow keys move them together.
+    let at = shown_form(&h).parent_of(plain).unwrap().1;
+    h.key_press(egui::Key::ArrowUp);
+    h.run_steps(2);
+    assert_eq!(shown_form(&h).parent_of(plain).unwrap().1, at - 1);
+    assert_eq!(shown_form(&h).parent_of(title).unwrap().1, at);
+}
+
+/// The Align menu: same width writes each node's size property (a heading has none and is
+/// skipped), align right wraps each in a right-to-left layout, distribute evenly writes
+/// `ui.add_space`, and make a column wraps them in `ui.vertical`. Each is one undo step.
+#[test]
+fn align_and_distribute_write_what_egui_has() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut h = look_harness("align");
+    let first = exact_node(h.state(), "Label \"First label\"");
+    let plain = exact_node(h.state(), "Label \"Plain text\"");
+    let title = exact_node(h.state(), "Heading \"Big title\"");
+    let edit = exact_node(h.state(), "Text edit &mut self.name");
+    let select = |h: &mut Harness<'static, App>, ids: &[formust_model::NodeId]| {
+        h.state_mut().designer.select_all_of(ids);
+        designer_step(h);
+        designer_step(h);
+    };
+    select(&mut h, &[first, plain, title]);
+    // The widest selected node, the heading included (it is measured, though it is skipped).
+    let wide = [first, plain, title]
+        .iter()
+        .map(|id| designer_rect(&h, *id).width())
+        .fold(0.0, f32::max);
+    // From the context menu's Align submenu.
+    let at = designer_rect(&h, first).center();
+    h.event(egui::Event::PointerMoved(at));
+    designer_step(&mut h);
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        designer_step(&mut h);
+    }
+    designer_step(&mut h);
+    assert_eq!(
+        h.state().designer.selection_len(),
+        3,
+        "the right-click keeps the set"
+    );
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Align")
+        .click();
+    h.run_steps(2);
+    // The menu's item, not the inspector's button of the same name.
+    h.query_all_by_label("Same width")
+        .filter(|n| n.accesskit_node().role() == egui::accesskit::Role::Button)
+        .min_by(|a, b| {
+            let d = |n: &egui_kittest::Node<'_>| (n.rect().center() - at).length();
+            d(a).total_cmp(&d(b))
+        })
+        .expect("the menu's item")
+        .click();
+    h.run_steps(3);
+    let size = |h: &Harness<'static, App>, id| node_props(h, id).get("add_sized").cloned();
+    let want = format!("[{:.1}, ", wide.round());
+    for id in [first, plain] {
+        match size(&h, id) {
+            Some(formust_model::PropValue::Expr(t)) => assert!(t.starts_with(&want), "{t}"),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(size(&h, title), None, "a heading has no size property");
+    assert!(
+        h.state()
+            .designer
+            .status
+            .as_deref()
+            .is_some_and(|s| s.contains("1 skipped")),
+        "{:?}",
+        h.state().designer.status
+    );
+    let steps = undo_steps(&h);
+    assert!(
+        h.state_mut()
+            .designer
+            .align(designer::align::AlignAction::Right)
+    );
+    designer_step(&mut h);
+    for id in [first, plain, title] {
+        assert_eq!(
+            shown_form(&h).anchor_of(id),
+            Some(formust_model::Anchor::Right)
+        );
+    }
+    assert_eq!(undo_steps(&h), steps + 1);
+    let text = formust_rust::emit_form_item(&shown_form(&h));
+    assert!(
+        text.contains("ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {"),
+        "{text}"
+    );
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(2);
+    assert_eq!(shown_form(&h).anchor_of(plain), None);
+    // Distribute: the gap after the first of three neighbours is made like the widest one.
+    h.state_mut()
+        .designer
+        .try_edit(None, |f| f.set_space_after(plain, 20.0));
+    designer_step(&mut h);
+    designer_step(&mut h);
+    select(&mut h, &[plain, title, edit]);
+    assert!(
+        h.state_mut()
+            .designer
+            .align(designer::align::AlignAction::Distribute)
+    );
+    designer_step(&mut h);
+    designer_step(&mut h);
+    let space = shown_form(&h)
+        .space_after(title)
+        .expect("a space after the heading");
+    assert!((space - 20.0).abs() <= 1.0, "{space}");
+    let gap =
+        |h: &Harness<'static, App>, a, b| designer_rect(h, b).top() - designer_rect(h, a).bottom();
+    assert!(
+        (gap(&h, plain, title) - gap(&h, title, edit)).abs() <= 1.0,
+        "even gaps"
+    );
+    // Make a column: one Vertical around them.
+    assert!(
+        h.state_mut()
+            .designer
+            .align(designer::align::AlignAction::MakeColumn)
+    );
+    designer_step(&mut h);
+    let (column, _) = shown_form(&h).parent_of(plain).unwrap();
+    assert_eq!(
+        designer::node_title(shown_form(&h).find(column).unwrap()),
+        "Vertical"
+    );
+    assert_eq!(shown_form(&h).parent_of(edit).unwrap().0, column);
+    // What each action writes is in its hover text.
+    let writes = designer::align::AlignAction::Distribute.writes("egui::");
+    assert!(writes.contains("ui.add_space"), "{writes}");
+}
+
+const SPLIT: &str = r#"#[derive(Default)]
+pub struct Split {
+    name: String,
+}
+
+impl Split {
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
+        ui.columns(3, |cols| {
+            cols[0].label("Left column");
+            cols[2].label("Right column");
+        });
+        egui::Sides::new().show(ui, |ui| {
+            ui.label("Side left");
+        }, |ui| {
+            ui.label("Side right");
+        });
+        ui.text_edit_singleline(&mut self.name);
+    }
+}
+"#;
+
+fn split_harness(name: &str) -> Harness<'static, App> {
+    let dir = crate::target_tmp().join("designer-split").join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let rs = dir.join("split.rs");
+    std::fs::write(&rs, SPLIT).unwrap();
+    designer_harness_for(rs, false)
+}
+
+/// Columns and Sides preview as at runtime: the columns side by side at equal widths, the sides at
+/// the left and right edges. A palette drag drops into an empty column, and the code says `cols[1]`.
+#[test]
+fn columns_and_sides_preview_and_take_drops() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut h = split_harness("preview");
+    let left = designer_rect(&h, exact_node(h.state(), "Label \"Left column\""));
+    let right = designer_rect(&h, exact_node(h.state(), "Label \"Right column\""));
+    let form = shown_form(&h);
+    let columns = form.root.children()[0].id;
+    let middle = form.find(columns).unwrap().children()[1].id;
+    let gap = designer_rect(&h, middle);
+    assert!(left.right() <= gap.left() + 1.0 && gap.right() <= right.left() + 1.0);
+    assert!((gap.width() - (right.left() - gap.left() - 8.0)).abs() <= 2.0 || gap.width() > 50.0);
+    let side_left = designer_rect(&h, exact_node(h.state(), "Label \"Side left\""));
+    let side_right = designer_rect(&h, exact_node(h.state(), "Label \"Side right\""));
+    let client = h.state().designer.client.unwrap();
+    assert!(side_left.left() < client.left() + 20.0);
+    assert!(
+        side_right.right() > client.right() - 20.0,
+        "{side_right:?} {client:?}"
+    );
+    let image = h.render().unwrap();
+    image
+        .save(out_dir().join("ui-designer-columns.png"))
+        .unwrap();
+    // A label dragged from the palette into the empty middle column.
+    h.state_mut().designer.palette_filter = "Label".into();
+    h.run_steps(2);
+    let from = palette_button(&h, "Label").center();
+    let to = gap.center();
+    designer_drag(&mut h, from, to);
+    assert_eq!(h.state().designer.drop.map(|d| d.parent), Some(middle));
+    designer_release(&mut h, to);
+    assert_eq!(shown_form(&h).find(middle).unwrap().children().len(), 1);
+    let text = formust_rust::emit_form_item(&shown_form(&h));
+    assert!(
+        text.contains("            cols[1].label(\"Label\");\n"),
+        "{text}"
+    );
+    // A column can't be deleted on its own.
+    select_node(&mut h, middle);
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    assert!(shown_form(&h).find(middle).is_some());
+    // The count in the inspector: two columns, the third's label moves to the second.
+    select_node(&mut h, columns);
+    set_prop(&mut h, columns, "count", formust_model::PropValue::Int(2));
+    assert_eq!(shown_form(&h).find(columns).unwrap().children().len(), 2);
+    let text = formust_rust::emit_form_item(&shown_form(&h));
+    assert!(
+        text.contains("ui.columns(2, |cols| {")
+            && text.contains("cols[1].label(\"Right column\");"),
+        "{text}"
+    );
+}
+
+/// The overlays: rulers, grid lines and distance guides show on the canvas and are never part of
+/// the form. Preset widths set the preview's width, and the light/dark switch sits in the canvas bar.
+#[test]
+fn rulers_grid_guides_and_preset_widths() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut h = look_harness("overlays");
+    let before = formust_rust::emit_form_item(&shown_form(&h));
+    let plain = exact_node(h.state(), "Label \"Plain text\"");
+    select_node(&mut h, plain);
+    h.get_by_label("Rulers").click();
+    h.run_steps(2);
+    h.get_by_label("Grid lines").click();
+    h.run_steps(2);
+    h.get_by_label("16").click();
+    h.run_steps(2);
+    assert!(h.state().designer.rulers);
+    assert_eq!(h.state().designer.grid, Some(16.0));
+    // The guides of the selected label: to its neighbours above and below and the form's edges.
+    let d = &h.state().designer;
+    let guides = designer::ui::distance_guides(&shown_form(&h), &d.rects, plain, d.rects[&plain]);
+    // Up to the label above, down to the heading, right to the form's edge; the label is flush
+    // with the form's left edge, so there is no left guide.
+    assert_eq!(guides.len(), 3, "{guides:?}");
+    let image = h.render().unwrap();
+    image
+        .save(out_dir().join("ui-designer-overlays.png"))
+        .unwrap();
+    // A ruler is drawn in the chrome colour along the canvas's top-left corner.
+    let client = h.state().designer.client.unwrap();
+    assert_eq!(
+        designer::ui::grid_lines(client.left(), client.left(), client.left() + 40.0, 16.0).len(),
+        3
+    );
+    assert!(!h.state().is_dirty(0), "overlays are no edit");
+    assert_eq!(formust_rust::emit_form_item(&shown_form(&h)), before);
+    // Preset widths.
+    h.get_by_label("Width").click();
+    h.run_steps(2);
+    h.get_by_label("480 pt").click();
+    h.run_steps(3);
+    assert_eq!(h.state().designer.preview_width, Some(480.0));
+    let client = h.state().designer.client.unwrap();
+    assert!((client.width() - 480.0).abs() < 1.0, "{client:?}");
+    // The light/dark switch is in the canvas bar.
+    h.get_by_label("Dark").click();
+    h.run_steps(2);
+    assert_eq!(h.state().designer.dark, Some(true));
+    assert!(!h.state().is_dirty(0));
+}
+
+/// Tab order mode numbers the focusable widgets and lists them; dragging a row moves the widget in
+/// the code (egui's focus follows creation order), and the star writes the initial focus.
+#[test]
+fn the_tab_order_is_shown_reordered_and_given_an_initial_focus() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut h = look_harness("tab-order");
+    // The canvas bar's switch (the right panel's pill has one too).
+    h.query_all_by_label("Tab order")
+        .max_by(|a, b| a.rect().left().total_cmp(&b.rect().left()).reverse())
+        .expect("the switch")
+        .click();
+    h.run_steps(3);
+    assert!(h.state().designer.tab_order);
+    let order = shown_form(&h).tab_order();
+    assert_eq!(order.len(), 2, "the button and the text edit");
+    let (button, text_edit) = (order[0], order[1]);
+    let image = h.render().unwrap();
+    image
+        .save(out_dir().join("ui-designer-tab-order.png"))
+        .unwrap();
+    let row = |h: &Harness<'static, App>, n: usize| {
+        h.query_all_by_role(egui::accesskit::Role::ListItem)
+            .find(|r| {
+                r.accesskit_node()
+                    .label()
+                    .is_some_and(|l| l.starts_with(&format!("{n}  ")))
+            })
+            .expect("a tab order row")
+            .rect()
+    };
+    // The text edit's row onto the top of the button's: the text edit comes first now.
+    let from = row(&h, 2).center();
+    let to = egui::pos2(row(&h, 1).center().x, row(&h, 1).top() + 3.0);
+    designer_drag(&mut h, from, to);
+    designer_release(&mut h, to);
+    assert_eq!(shown_form(&h).tab_order(), [text_edit, button]);
+    let text = formust_rust::emit_form_item(&shown_form(&h));
+    let (a, b) = (
+        text.find("ui.text_edit_singleline").unwrap(),
+        text.find("ui.button(\"Store values\")").unwrap(),
+    );
+    assert!(a < b, "the text edit is created first now:\n{text}");
+    // The star: initial focus on the text edit.
+    h.query_all_by_label("☆").next().expect("a star").click();
+    h.run_steps(3);
+    let text = formust_rust::emit_form_item(&shown_form(&h));
+    assert!(
+        text.contains("{ let response = ui.text_edit_singleline(&mut self.name); if ui.memory(|m| m.focused().is_none()) { response.request_focus(); } }"),
+        "{text}"
+    );
+    let back = formust_rust::import(&text).unwrap();
+    assert!(back.forms[0].custom.is_empty());
+}
+
+// ---- Designer batch D ----------------------------------------------------------------------
+
+/// The widgets batch D added: `the_designer_renders_every_first_palette_widget` leaves them to
+/// `batch_d_widgets_preview_and_edit`, whose form has them all.
+const BATCH_D_WIDGETS: &[formust_model::WidgetId] = &[
+    formust_model::WidgetId::Image,
+    formust_model::WidgetId::ColorEdit,
+    formust_model::WidgetId::ColorEditRgb,
+    formust_model::WidgetId::RangeSlider,
+];
+
+const BATCH_D: &str = r#"#[derive(Default)]
+pub struct Batch {
+    tab: usize,
+    color: egui::Color32,
+    rgb: [f32; 3],
+    low: f32,
+    high: f32,
+    open: bool,
+}
+
+impl Batch {
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("File", |ui| {
+                if ui.button("Open").clicked() {
+                    ui.close();
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.tab, 0, "Main");
+            ui.selectable_value(&mut self.tab, 1, "Other");
+        });
+        match self.tab {
+            0 => {
+                ui.label("On main");
+            }
+            1 => {
+                ui.label("On other");
+            }
+            _ => {}
+        }
+        ui.image("file://logo.png");
+        ui.image("https://example.com/remote.png");
+        ui.color_edit_button_srgba(&mut self.color);
+        ui.color_edit_button_rgb(&mut self.rgb);
+        ui.add(egui::RangeSlider::new(&mut self.low, &mut self.high, 0.0..=100.0).text("Range"));
+    }
+
+    pub fn settings(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Settings").pivot(egui::Align2::CENTER_CENTER).show(ctx, |ui| {
+            ui.label("Inside");
+        });
+    }
+
+    pub fn dialog(&mut self, ctx: &egui::Context) {
+        egui::Modal::new(egui::Id::unique("sure")).show(ctx, |ui| {
+            ui.label("In the modal");
+            if ui.button("Close").clicked() {
+                self.open = false;
+            }
+        });
+    }
+}
+"#;
+
+/// The batch D form in a scratch folder, with a 20 x 10 PNG beside it as `logo.png`.
+fn batch_d_harness(name: &str) -> Harness<'static, App> {
+    let dir = crate::target_tmp().join("designer-batch-d").join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = image::RgbaImage::from_pixel(20, 10, image::Rgba([200, 40, 40, 255]));
+    png.save(dir.join("logo.png")).unwrap();
+    let rs = dir.join("batch.rs");
+    std::fs::write(&rs, BATCH_D).unwrap();
+    designer_harness_for(rs, false)
+}
+
+/// Tabs show one page and a click on a tab button shows another (a drop goes into it); Add tab
+/// adds a page; a selected menu is drawn open; a local PNG is drawn and a URL is a placeholder; the
+/// colour pickers and the range slider are real widgets; a modal is drawn over a dimmed form. The
+/// shield holds throughout (`designer_step` checks that nothing reacted).
+#[test]
+fn batch_d_widgets_preview_and_edit() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut h = batch_d_harness("preview");
+    let form = shown_form(&h);
+    let mut seen = std::collections::BTreeSet::new();
+    form.root.walk(&mut |n| {
+        if let formust_model::NodeKind::Widget { def, .. } = &n.kind {
+            seen.insert(*def);
+        }
+    });
+    for w in BATCH_D_WIDGETS {
+        assert!(seen.contains(w), "the batch D form has no {w:?}");
+    }
+    for title in [
+        "Colour picker &mut self.color",
+        "Colour picker (RGB) &mut self.rgb",
+        "Range slider \"Range\"",
+    ] {
+        designer_rect(&h, exact_node(h.state(), title));
+    }
+    // The local PNG at its own size; the URL as a placeholder box.
+    let images: Vec<_> = {
+        let mut out = Vec::new();
+        form.root.walk(&mut |n| {
+            if matches!(
+                n.kind,
+                formust_model::NodeKind::Widget {
+                    def: formust_model::WidgetId::Image,
+                    ..
+                }
+            ) {
+                out.push(n.id);
+            }
+        });
+        out
+    };
+    let local = designer_rect(&h, images[0]);
+    assert_eq!(
+        (local.width().round(), local.height().round()),
+        (20.0, 10.0)
+    );
+    let remote = designer_rect(&h, images[1]);
+    assert_eq!(
+        (remote.width().round(), remote.height().round()),
+        (96.0, 64.0)
+    );
+    // The first page shows; the other has no place on the canvas.
+    let tabs = form
+        .root
+        .children()
+        .iter()
+        .find(|c| {
+            matches!(
+                c.kind,
+                formust_model::NodeKind::Container {
+                    def: formust_model::ContainerId::Tabs,
+                    ..
+                }
+            )
+        })
+        .expect("the bar and its match read as tabs")
+        .id;
+    let pages: Vec<_> = form
+        .find(tabs)
+        .unwrap()
+        .children()
+        .iter()
+        .map(|p| p.id)
+        .collect();
+    let main = exact_node(h.state(), "Label \"On main\"");
+    let other = exact_node(h.state(), "Label \"On other\"");
+    assert!(h.state().designer.rects.contains_key(&main));
+    assert!(!h.state().designer.rects.contains_key(&other));
+    let image = h.render().unwrap();
+    image
+        .save(out_dir().join("ui-designer-batch-d.png"))
+        .unwrap();
+    // A click on the "Other" tab button shows its page and selects it.
+    let button = h
+        .state()
+        .designer
+        .tab_buttons
+        .iter()
+        .find(|(_, page)| *page == pages[1])
+        .expect("a tab button for the second page")
+        .0;
+    designer_click(&mut h, button.center());
+    designer_step(&mut h);
+    assert_eq!(h.state().designer.selected, Some(pages[1]));
+    assert!(h.state().designer.rects.contains_key(&other));
+    assert!(!h.state().designer.rects.contains_key(&main));
+    // A label dropped from the palette onto that page goes into it.
+    h.state_mut().designer.palette_filter = "Label".into();
+    h.run_steps(2);
+    let from = palette_button(&h, "Label").center();
+    let to = designer_rect(&h, pages[1]).center();
+    designer_drag(&mut h, from, to);
+    assert_eq!(h.state().designer.drop.map(|d| d.parent), Some(pages[1]));
+    designer_release(&mut h, to);
+    assert_eq!(shown_form(&h).find(pages[1]).unwrap().children().len(), 2);
+    let text = formust_rust::emit_form_item(&shown_form(&h));
+    assert!(
+        text.contains("            1 => {\n                ui.label(\"On other\");\n                ui.label(\"Label\");\n            }"),
+        "{text}"
+    );
+    // Add tab in the inspector: a third tab whose empty page shows.
+    select_node(&mut h, tabs);
+    h.get_by_label("Add tab").click();
+    h.run_steps(3);
+    let now = shown_form(&h);
+    assert_eq!(now.find(tabs).unwrap().children().len(), 3);
+    let third = now.find(tabs).unwrap().children()[2].id;
+    assert_eq!(h.state().designer.tab_pages.get(&tabs), Some(&third));
+    assert!(h.state().designer.rects.contains_key(&third));
+    assert!(
+        formust_rust::emit_form_item(&now)
+            .contains("ui.selectable_value(&mut self.tab, 2, \"Tab 3\");"),
+    );
+    // A menu opens when it is selected, and closes when the selection leaves it.
+    let open = exact_node(h.state(), "Button \"Open\" · clicked");
+    assert!(!h.state().designer.rects.contains_key(&open));
+    let file = exact_node(h.state(), "Menu \"File\"");
+    select_node(&mut h, file);
+    assert!(h.state().designer.rects.contains_key(&open));
+    let menu = designer_rect(&h, file);
+    assert!(menu.contains(designer_rect(&h, open).center()));
+    let image = h.render().unwrap();
+    image
+        .save(out_dir().join("ui-designer-menu-open.png"))
+        .unwrap();
+    // A click on the open menu's item selects it, and the menu stays open around it.
+    let at = designer_rect(&h, open).center();
+    designer_click(&mut h, at);
+    assert_eq!(h.state().designer.selected, Some(open));
+    select_node(&mut h, main);
+    assert!(!h.state().designer.rects.contains_key(&open));
+    // The palette has the new items, in their groups.
+    for label in [
+        "Tabs (horizontal)",
+        "Tabs (vertical)",
+        "Menu bar",
+        "Menu",
+        "Modal",
+        "Image",
+        "Colour picker",
+        "Range slider",
+    ] {
+        h.state_mut().designer.palette_filter = label.into();
+        h.run_steps(2);
+        palette_button(&h, label);
+    }
+    // A Window's options in the inspector: the pivot read back, the order written.
+    h.state_mut().designer.choose_form("Batch::settings".into());
+    h.run_steps(3);
+    let window = shown_form(&h).root.children()[0].id;
+    select_node(&mut h, window);
+    h.get_by_label("Pivot");
+    h.get_by_label("Order");
+    set_prop(
+        &mut h,
+        window,
+        "order",
+        formust_model::PropValue::Enum("Foreground"),
+    );
+    let text = formust_rust::emit_form_item(&shown_form(&h));
+    assert!(
+        text.contains("egui::Window::new(\"Settings\").pivot(egui::Align2::CENTER_CENTER).order(egui::Order::Foreground).show(ctx, |ui| {"),
+        "{text}"
+    );
+    // The modal of the dialog form: framed over the form, its content selectable.
+    h.state_mut().designer.choose_form("Batch::dialog".into());
+    h.run_steps(3);
+    let modal_label = exact_node(h.state(), "Label \"In the modal\"");
+    let inside = designer_rect(&h, modal_label);
+    let modal = shown_form(&h).root.children()[0].id;
+    assert!(designer_rect(&h, modal).contains(inside.center()));
+    designer_click(&mut h, inside.center());
+    assert_eq!(h.state().designer.selected, Some(modal_label));
+    let image = h.render().unwrap();
+    image.save(out_dir().join("ui-designer-modal.png")).unwrap();
+}
+
+/// New tabs from the palette: both directions bind a new `usize` field, and the vertical bar sits
+/// to the left of its page.
+#[test]
+fn new_tabs_from_the_palette_bind_a_field() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut h = split_harness("tabs");
+    for label in ["Tabs (horizontal)", "Tabs (vertical)"] {
+        h.state_mut().designer.select(None, false);
+        h.state_mut().designer.palette_filter = label.into();
+        h.run_steps(2);
+        let at = palette_button(&h, label).center();
+        h.event(egui::Event::PointerMoved(at));
+        designer_step(&mut h);
+        h.event(pointer_button(at, true));
+        designer_step(&mut h);
+        h.event(pointer_button(at, false));
+        designer_step(&mut h);
+        designer_step(&mut h);
+    }
+    let form = shown_form(&h);
+    assert_eq!(
+        form.state
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>(),
+        ["tab", "tab_2"]
+    );
+    let vertical = form.root.children().last().unwrap();
+    let page = vertical.children()[0].id;
+    let bar = h
+        .state()
+        .designer
+        .tab_buttons
+        .iter()
+        .find(|(_, p)| *p == page)
+        .expect("the vertical bar's first button")
+        .0;
+    let page_rect = designer_rect(&h, page);
+    assert!(bar.right() < page_rect.left(), "{bar:?} {page_rect:?}");
+    let text = formust_rust::emit_form_item(&form);
+    assert!(
+        text.contains("match self.form.tab_2 {") && text.contains("ui.separator();"),
+        "{text}"
+    );
+    let back = formust_rust::import(&text).unwrap();
+    assert!(
+        back.forms[0].custom.is_empty(),
+        "{:?}",
+        back.forms[0].custom
+    );
+}
+
+const TABLE_FORM: &str = r#"#[derive(Default)]
+pub struct People {}
+
+impl People {
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
+        egui_extras::TableBuilder::new(ui)
+            .striped(true)
+            .column(egui_extras::Column::auto())
+            .column(egui_extras::Column::remainder())
+            .header(20.0, |mut header| {
+                header.col(|ui| {
+                    ui.heading("Name");
+                });
+                header.col(|ui| {
+                    ui.heading("Role");
+                });
+            })
+            .body(|mut body| {
+                body.row(18.0, |mut row| {
+                    row.col(|ui| {
+                        ui.label("Ada");
+                    });
+                    row.col(|ui| {});
+                });
+            });
+    }
+}
+"#;
+
+/// A table previews as a grid of its cells (the header row above the body), takes a palette drop
+/// into an empty cell, says in the inspector that it needs egui_extras, and grows a column.
+#[test]
+fn a_table_previews_its_cells_and_takes_drops() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = crate::target_tmp().join("designer-table");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let rs = dir.join("people.rs");
+    std::fs::write(&rs, TABLE_FORM).unwrap();
+    let mut h = designer_harness_for(rs, false);
+    let form = shown_form(&h);
+    let table = form.root.children()[0].id;
+    assert_eq!(form.table_size(table), Some((2, 1, true)));
+    let name = designer_rect(&h, exact_node(h.state(), "Heading \"Name\""));
+    let role = designer_rect(&h, exact_node(h.state(), "Heading \"Role\""));
+    let ada = designer_rect(&h, exact_node(h.state(), "Label \"Ada\""));
+    assert!(name.right() <= role.left() + 1.0, "{name:?} {role:?}");
+    assert!(ada.top() >= name.bottom() - 1.0, "{ada:?} {name:?}");
+    let empty = form.find(table).unwrap().children()[1].children()[1].id;
+    let empty_rect = designer_rect(&h, empty);
+    assert!(empty_rect.left() >= role.left() - 1.0);
+    let image = h.render().unwrap();
+    image.save(out_dir().join("ui-designer-table.png")).unwrap();
+    // A label from the palette into the empty cell.
+    h.state_mut().designer.palette_filter = "Label".into();
+    h.run_steps(2);
+    let from = palette_button(&h, "Label").center();
+    let to = designer_rect(&h, empty).center();
+    designer_drag(&mut h, from, to);
+    assert_eq!(h.state().designer.drop.map(|d| d.parent), Some(empty));
+    designer_release(&mut h, to);
+    let text = formust_rust::emit_form_item(&shown_form(&h));
+    assert!(
+        text.contains(
+            "row.col(|ui| {\n                    ui.label(\"Label\");\n                });"
+        ),
+        "{text}"
+    );
+    assert!(
+        formust_rust::import(&text).unwrap().forms[0]
+            .custom
+            .is_empty()
+    );
+    // The inspector says what a table needs; a third column appears on the canvas.
+    select_node(&mut h, table);
+    h.get_by_label_contains("Requires egui_extras");
+    assert!(
+        h.state_mut()
+            .designer
+            .try_edit(None, |f| f.set_table_columns(table, 3))
+    );
+    designer_step(&mut h);
+    designer_step(&mut h);
+    let third = shown_form(&h).find(table).unwrap().children()[1].children()[2].id;
+    assert!(designer_rect(&h, third).left() > role.left());
+}
+
+// ---- Dialog row, Form toggle and extended import (2026-11-06) ----------------------------------
+
+/// A fresh folder in the target dir with `name` holding `text`; returns the file's path.
+fn designer_file(folder: &str, name: &str, text: &str) -> PathBuf {
+    let dir = crate::target_tmp().join(folder);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, text).unwrap();
+    path.canonicalize().unwrap()
+}
+
+/// The FORM panel of a dialog has a "Dialog" row saying what it shows; a form drawn into a `Ui`
+/// has none.
+#[test]
+fn the_form_panel_has_a_dialog_row_for_a_dialog() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let rs = designer_file(
+        "designer-dialog-row",
+        "about.rs",
+        "pub struct About { name: String, open: bool }\nimpl About {\n    pub fn show(&mut self, ctx: &egui::Context) {\n        let mut open = self.open;\n        egui::Window::new(\"About\").open(&mut open).show(ctx, |ui| {\n            ui.label(\"Hello dialog\");\n        });\n        self.open = open;\n    }\n}\n",
+    );
+    let mut h = designer_harness_for(rs, false);
+    designer_step(&mut h);
+    assert_eq!(
+        h.state().designer.selected,
+        None,
+        "the root's FORM panel shows"
+    );
+    let note = designer::ui::dialog_note(&shown_form(&h)).expect("a dialog");
+    assert!(note.starts_with("shows Window \"About\""), "{note}");
+    h.get_by_label("Owner");
+    h.get_by_label("Dialog");
+    h.get_by_label(&note);
+
+    // Control: an ordinary `Ui` form has no Dialog row.
+    let rs = designer_file(
+        "designer-dialog-row-ui",
+        "login.rs",
+        "pub struct Login { name: String }\nimpl Login {\n    pub fn ui(&mut self, ui: &mut egui::Ui) {\n        ui.label(\"Name\");\n    }\n}\n",
+    );
+    let mut h = designer_harness_for(rs, false);
+    designer_step(&mut h);
+    h.get_by_label("Owner");
+    assert!(h.query_by_label("Dialog").is_none());
+    assert_eq!(designer::ui::dialog_note(&shown_form(&h)), None);
+}
+
+/// A free dialog through a helper call: the row says it is a free function and names the call.
+#[test]
+fn the_dialog_row_names_a_free_dialog_helper() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let rs = designer_file(
+        "designer-dialog-row-free",
+        "about.rs",
+        "pub fn show(ctx: &egui::Context) {\n    crate::style::dialog(ctx, \"About\", None, 540.0, |ui| {\n        ui.label(\"Hello\");\n    });\n}\n",
+    );
+    let mut h = designer_harness_for(rs, false);
+    designer_step(&mut h);
+    let note = designer::ui::dialog_note(&shown_form(&h)).expect("a dialog");
+    assert!(note.starts_with("free fn, shows Dialog "), "{note}");
+    h.get_by_label("Dialog");
+    h.get_by_label(&note);
+}
+
+/// Switching to Code makes a file open in code; clicking Form again clears that, so the file opens
+/// in the form once more.
+#[test]
+fn clicking_form_again_forgets_the_code_preference() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let rs = designer_file(
+        "designer-prefer-code",
+        "login.rs",
+        "pub struct Login { name: String }\nimpl Login {\n    pub fn ui(&mut self, ui: &mut egui::Ui) {\n        ui.label(\"Name\");\n    }\n}\n",
+    );
+    let plain = rs.with_file_name("plain.rs");
+    std::fs::write(&plain, "fn helper() {}\n").unwrap();
+    let mut h = designer_harness_for(rs.clone(), false);
+    // The Form segment is the "Form" next to Code (the toolbar's New Rust Form is "Form" too).
+    let code = h.get_by_label("Code").rect();
+    let form_segment = h
+        .query_all_by_label("Form")
+        .map(|n| n.rect())
+        .min_by(|a, b| {
+            a.center()
+                .distance(code.center())
+                .total_cmp(&b.center().distance(code.center()))
+        })
+        .unwrap();
+    h.get_by_label("Code").click();
+    h.run_steps(3);
+    assert!(!h.state().form_showing());
+    assert!(h.state().code_preferred.contains(&rs));
+    // Reopened, it stays in code (the preference holds).
+    h.state_mut().select_in_tree(plain.clone());
+    h.state_mut().select_in_tree(rs.clone());
+    h.run_steps(3);
+    assert!(
+        !h.state().form_showing(),
+        "switched to Code, it opens in code"
+    );
+
+    designer_click(&mut h, form_segment.center());
+    assert!(h.state().form_showing());
+    assert!(
+        !h.state().code_preferred.contains(&rs),
+        "the toggle back to Form clears the preference"
+    );
+    h.state_mut().select_in_tree(plain);
+    h.run_steps(2);
+    assert!(!h.state().form_showing());
+    h.state_mut().select_in_tree(rs);
+    h.run_steps(3);
+    assert!(h.state().form_showing(), "it opens in the form again");
+}
+
+/// The form shown has a control-flow container (`ImportOptions::extended`).
+fn has_flow(form: &formust_model::Form) -> bool {
+    let mut found = false;
+    form.root.walk(&mut |n| {
+        if let formust_model::NodeKind::Container { def, .. } = &n.kind
+            && def.is_flow()
+        {
+            found = true;
+        }
+    });
+    found
+}
+
+fn has_custom(form: &formust_model::Form) -> bool {
+    let mut found = false;
+    form.root.walk(&mut |n| {
+        if matches!(n.kind, formust_model::NodeKind::Custom { .. }) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// The "Extended import" switch is off by default; turning it on reads the file again with
+/// control flow as nodes (drawn by the preview), and off again brings back the locked code. With
+/// unsaved edits the switch is disabled.
+#[test]
+fn the_extended_import_switch_reloads_the_form() {
+    let _ui = crate::prefs::tests::APPLY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let rs = designer_file(
+        "designer-extended",
+        "login.rs",
+        "pub struct Login { on: bool }\nimpl Login {\n    pub fn ui(&mut self, ui: &mut egui::Ui) {\n        ui.label(\"Before\");\n        if self.on {\n            ui.label(\"Inside\");\n        }\n    }\n}\n",
+    );
+    let mut h = designer_harness_for(rs, false);
+    designer_step(&mut h);
+    assert!(!h.state().designer.extended, "off by default");
+    let form = shown_form(&h);
+    assert!(
+        !has_flow(&form) && has_custom(&form),
+        "the if is locked code"
+    );
+
+    h.get_by_label("Extended import").click();
+    h.run_steps(4);
+    assert!(h.state().designer.extended);
+    let form = shown_form(&h);
+    assert!(
+        has_flow(&form) && !has_custom(&form),
+        "the if is a node now"
+    );
+    let inside = designer_node(h.state(), "Label \"Inside\"");
+    designer_step(&mut h);
+    assert!(
+        h.state().designer.rects.contains_key(&inside),
+        "the preview draws the label inside the flow node"
+    );
+    assert!(!h.state().designer.is_dirty(), "a fresh read, no edits");
+
+    // With unsaved edits the switch is disabled, and the action is refused anyway.
+    h.state_mut()
+        .designer
+        .add(
+            designer::edit::Item::Widget(formust_model::WidgetId::Button),
+            None,
+        )
+        .unwrap();
+    h.run_steps(3);
+    assert!(h.state().designer.is_dirty());
+    assert!(
+        h.get_by_label("Extended import")
+            .accesskit_node()
+            .is_disabled()
+    );
+    h.state_mut()
+        .designer
+        .actions
+        .push(designer::ui::Action::Extended(false));
+    h.state_mut().run_designer_actions();
+    assert!(h.state().designer.extended, "refused with unsaved edits");
+    h.state_mut().designer.undo();
+    h.run_steps(3);
+    assert!(!h.state().designer.is_dirty());
+
+    h.get_by_label("Extended import").click();
+    h.run_steps(4);
+    assert!(!h.state().designer.extended);
+    let form = shown_form(&h);
+    assert!(
+        !has_flow(&form) && has_custom(&form),
+        "off again: locked code"
     );
 }

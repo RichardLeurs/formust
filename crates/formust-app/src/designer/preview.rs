@@ -31,20 +31,30 @@ use eframe::egui::{
 };
 use formust_model::{
     ContainerId, DefaultValue, Form, Node, NodeId, NodeKind, PropValue, Props, WidgetId,
-    container_def, widget_def,
+    container_def, is_fill_size, is_fill_text, number, parse_window_anchor, split_pair, widget_def,
 };
 
 /// How to draw one pass.
 #[derive(Clone, Copy, Debug)]
-pub struct Options {
+pub struct Options<'a> {
     /// Draw the form in dark mode (its colours pick their dark value).
     pub dark: bool,
     pub selected: Option<NodeId>,
     pub hovered: Option<NodeId>,
+    /// More selected nodes: the rest of a shift-click range.
+    pub also: &'a [NodeId],
+    /// The selected node's resize handles: (right edge, bottom edge); the corner when both.
+    pub handles: (bool, bool),
     /// The IDE's accent colour, for the selection marks.
     pub accent: Color32,
     /// Hold AccessKit actions back from the preview. Always on; off only in a test's control run.
     pub stash_accesskit: bool,
+    /// The page each Tabs shows, by Tabs id (the first page when absent).
+    pub pages: &'a HashMap<NodeId, NodeId>,
+    /// The menus drawn open: the selected menu and the menus around the selection.
+    pub open_menus: &'a [NodeId],
+    /// The folder of the form's file, where image paths are looked up.
+    pub base_dir: Option<&'a std::path::Path>,
 }
 
 /// What one pass produced.
@@ -60,6 +70,9 @@ pub struct Pass {
     pub content: Vec2,
     /// False for a pass egui will discard (Grid's sizing pass).
     pub kept: bool,
+    /// The tab buttons of every Tabs bar drawn, with the page each one shows: a click there shows
+    /// that page. They are no nodes of their own.
+    pub tab_buttons: Vec<(Rect, NodeId)>,
 }
 
 /// The shield's interaction this pass, on the parent layer.
@@ -72,7 +85,7 @@ pub struct Drawn {
 
 /// Draws `form` with its root laid out in `client` and only `area` visible, then shields `area`.
 /// `ui` is the IDE's canvas `Ui`; nothing is allocated in it.
-pub fn show(ui: &mut Ui, area: Rect, client: Rect, form: &Form, o: &Options) -> Drawn {
+pub fn show(ui: &mut Ui, area: Rect, client: Rect, form: &Form, o: &Options<'_>) -> Drawn {
     let base = ui.scope_id().with("formust_preview");
     let layer = LayerId::new(ui.layer_id().order, base);
     let mut pass = Pass {
@@ -103,8 +116,14 @@ pub fn show(ui: &mut Ui, area: Rect, client: Rect, form: &Form, o: &Options) -> 
     let mut cx = Cx {
         pass: &mut pass,
         dark: o.dark,
+        pages: o.pages.clone(),
+        open_menus: o.open_menus.to_vec(),
+        base_dir: o.base_dir.map(std::path::Path::to_path_buf),
+        popups: Vec::new(),
+        in_popup: false,
     };
     node(&mut child, &form.root, &mut cx);
+    draw_popups(&mut child, form, client, &mut cx);
     pass.content = child.min_rect().size() + Vec2::splat(2.0 * margin);
     paint_marks(&child, &pass, o);
     // Registered after the preview, on the parent's layer: the preview layer sorts below every
@@ -230,8 +249,21 @@ fn begin_focus_guard(
 
 // ---- Marks ---------------------------------------------------------------------------------
 
+/// Where the resize handles of a selected node's rect are: right edge, bottom edge, corner.
+pub fn handle_rects(r: Rect, (right, bottom): (bool, bool)) -> [Option<Rect>; 3] {
+    let size = vec2(HANDLE, HANDLE);
+    [
+        right.then(|| Rect::from_center_size(r.right_center(), size)),
+        bottom.then(|| Rect::from_center_size(r.center_bottom(), size)),
+        (right && bottom).then(|| Rect::from_center_size(r.right_bottom(), size)),
+    ]
+}
+
+/// The side of a resize handle's square.
+pub const HANDLE: f32 = 7.0;
+
 /// Hover and selection outlines, on the preview layer (it draws above the parent layer).
-fn paint_marks(ui: &Ui, pass: &Pass, o: &Options) {
+fn paint_marks(ui: &Ui, pass: &Pass, o: &Options<'_>) {
     let painter = ui.painter();
     if let Some(r) = o
         .hovered
@@ -245,17 +277,28 @@ fn paint_marks(ui: &Ui, pass: &Pass, o: &Options) {
             StrokeKind::Outside,
         );
     }
+    for r in o.also.iter().filter_map(|s| pass.rects.get(s)) {
+        painter.rect_stroke(*r, 2.0, Stroke::new(1.5, o.accent), StrokeKind::Outside);
+    }
     if let Some(r) = o.selected.and_then(|s| pass.rects.get(&s)) {
         painter.rect_stroke(*r, 2.0, Stroke::new(2.0, o.accent), StrokeKind::Outside);
-        let h = 6.0;
-        for p in [
-            r.left_top(),
-            r.right_top(),
-            r.left_bottom(),
-            r.right_bottom(),
-        ] {
+        let resizable = o.handles.0 || o.handles.1;
+        let squares: Vec<Rect> = if resizable {
+            handle_rects(*r, o.handles).into_iter().flatten().collect()
+        } else {
+            [
+                r.left_top(),
+                r.right_top(),
+                r.left_bottom(),
+                r.right_bottom(),
+            ]
+            .into_iter()
+            .map(|p| Rect::from_center_size(p, vec2(6.0, 6.0)))
+            .collect()
+        };
+        for square in squares {
             painter.rect(
-                Rect::from_center_size(p, vec2(h, h)),
+                square,
                 1.0,
                 Color32::WHITE,
                 Stroke::new(1.0, o.accent),
@@ -270,6 +313,101 @@ fn paint_marks(ui: &Ui, pass: &Pass, o: &Options) {
 struct Cx<'a> {
     pass: &'a mut Pass,
     dark: bool,
+    pages: HashMap<NodeId, NodeId>,
+    open_menus: Vec<NodeId>,
+    base_dir: Option<std::path::PathBuf>,
+    /// Open menus and modals, drawn after the form so they lie on top of it.
+    popups: Vec<Popup>,
+    /// Drawing inside an open menu: a menu here is a submenu.
+    in_popup: bool,
+}
+
+/// Something drawn over the form after it.
+#[derive(Clone, Copy, Debug)]
+enum Popup {
+    /// An open menu's items, below (or beside, for a submenu) its button.
+    Menu { id: NodeId, at: Pos2 },
+    /// A modal: a dimmed backdrop over the form and the dialog's frame on it.
+    Modal(NodeId),
+}
+
+/// Draws the open menus and the modals over the form, in the order they were met (a submenu is met
+/// while its menu is drawn, so it lies on top of it). A menu's rect grows by its items' frame, so a
+/// drop or click there finds the menu.
+fn draw_popups(ui: &mut Ui, form: &Form, client: Rect, cx: &mut Cx) {
+    let mut k = 0;
+    while k < cx.popups.len() && k < 64 {
+        let popup = cx.popups[k];
+        k += 1;
+        match popup {
+            Popup::Menu { id, at } => {
+                let Some(n) = form.find(id) else { continue };
+                let mut child = ui.new_child(
+                    UiBuilder::new()
+                        .max_rect(Rect::from_min_size(at, vec2(280.0, 2000.0)))
+                        .layout(Layout::top_down(Align::Min)),
+                );
+                egui::containers::menu::menu_style(child.style_mut());
+                let style = child.style().clone();
+                let was = std::mem::replace(&mut cx.in_popup, true);
+                let r = Frame::menu(&style)
+                    .show(&mut child, |ui| {
+                        ui.set_min_width(120.0);
+                        ui.set_max_width(260.0);
+                        kids(ui, n, cx);
+                    })
+                    .response;
+                cx.in_popup = was;
+                let visible = r.rect.intersect(ui.clip_rect());
+                if visible.is_positive() {
+                    let rect = match cx.pass.rects.get(&id) {
+                        Some(button) => button.union(visible),
+                        None => visible,
+                    };
+                    cx.pass.rects.insert(id, rect);
+                }
+            }
+            Popup::Modal(id) => {
+                let Some(n) = form.find(id) else { continue };
+                let backdrop = match n.kind {
+                    NodeKind::Container { ref props, .. } => {
+                        as_color(props.get("backdrop_color").cloned(), cx.dark)
+                    }
+                    _ => None,
+                }
+                .unwrap_or(Color32::from_black_alpha(if cx.dark {
+                    160
+                } else {
+                    100
+                }));
+                ui.painter()
+                    .rect_filled(client.intersect(ui.clip_rect()), 0.0, backdrop);
+                // Centred by the width it had in the last pass, as egui centres a modal's area.
+                let key = Id::unique(("formust_modal_width", id.0));
+                let width = ui.ctx().data(|d| d.get_temp::<f32>(key)).unwrap_or(240.0);
+                let room = client.shrink(24.0);
+                let left = (client.center().x - width / 2.0).max(room.left());
+                let mut child = ui.new_child(
+                    UiBuilder::new()
+                        .max_rect(Rect::from_min_max(
+                            egui::pos2(left, room.top() + 40.0),
+                            room.max,
+                        ))
+                        .layout(Layout::top_down(Align::Min)),
+                );
+                let style = child.style().clone();
+                let r = Frame::popup(&style)
+                    .inner_margin(12.0)
+                    .show(&mut child, |ui| kids(ui, n, cx))
+                    .response;
+                if (r.rect.width() - width).abs() > 0.5 {
+                    ui.ctx().data_mut(|d| d.insert_temp(key, r.rect.width()));
+                    ui.ctx().request_repaint();
+                }
+                cx.rec_rect(ui, id, r.rect);
+            }
+        }
+    }
 }
 
 impl Cx<'_> {
@@ -291,6 +429,9 @@ impl Cx<'_> {
 }
 
 fn kids(ui: &mut Ui, n: &Node, cx: &mut Cx) {
+    if let NodeKind::Container { props, .. } = &n.kind {
+        apply_body(ui, props);
+    }
     let children = n.children();
     if children.is_empty() {
         empty_placeholder(ui);
@@ -329,10 +470,30 @@ fn node(ui: &mut Ui, n: &Node, cx: &mut Cx) {
             extra_chain,
             ..
         } => {
-            if let Some(r) = widget(ui, n.id, *def, props, cx.dark) {
+            // Disabled as at runtime; hidden is dimmed rather than removed, so it can be selected.
+            let disabled = literal_off(props, "enabled");
+            let hidden = literal_off(props, "visible");
+            let r = if disabled || hidden {
+                ui.scope(|ui| {
+                    if disabled {
+                        ui.disable();
+                    }
+                    if hidden {
+                        ui.multiply_opacity(HIDDEN_OPACITY);
+                    }
+                    widget(ui, n.id, *def, props, cx.dark, cx.base_dir.as_deref())
+                })
+                .inner
+            } else {
+                widget(ui, n.id, *def, props, cx.dark, cx.base_dir.as_deref())
+            };
+            if let Some(r) = r {
                 cx.rec(ui, n.id, &r, r.rect);
                 if !extra_chain.is_empty() {
                     badge(ui, r.rect);
+                }
+                if hidden {
+                    hidden_mark(ui, r.rect);
                 }
             }
         }
@@ -347,6 +508,27 @@ fn node(ui: &mut Ui, n: &Node, cx: &mut Cx) {
             cx.rec(ui, n.id, &r, r.rect);
         }
     }
+}
+
+/// How a widget set invisible shows at design time.
+pub const HIDDEN_OPACITY: f32 = 0.3;
+
+/// A dashed outline around a widget that is invisible at runtime (`visible` is `false`).
+fn hidden_mark(ui: &Ui, rect: Rect) {
+    let r = rect.expand(1.0);
+    let corners = [
+        r.left_top(),
+        r.right_top(),
+        r.right_bottom(),
+        r.left_bottom(),
+        r.left_top(),
+    ];
+    ui.painter().extend(Shape::dashed_line(
+        &corners,
+        Stroke::new(1.0, ui.visuals().weak_text_color()),
+        3.0,
+        3.0,
+    ));
 }
 
 /// A small mark on a widget whose chain has builder methods the designer doesn't know: the preview
@@ -473,7 +655,7 @@ fn as_text(v: Option<PropValue>) -> Option<String> {
         PropValue::Bool(b) => Some(b.to_string()),
         PropValue::Int(i) => Some(i.to_string()),
         PropValue::Float(f) => Some(f.to_string()),
-        PropValue::Color { .. } | PropValue::Items(_) => None,
+        PropValue::Color { .. } | PropValue::Items(_) | PropValue::Stroke { .. } => None,
     }
 }
 
@@ -500,6 +682,57 @@ fn as_f64(v: Option<PropValue>) -> Option<f64> {
     }
 }
 
+/// One length of a size expression: a literal, the available width (Fill), or the usual widget
+/// height `ui.spacing().interact_size.y`.
+fn length(ui: &Ui, text: &str) -> Option<f32> {
+    if is_fill_text(text) {
+        return Some(ui.available_width());
+    }
+    let t: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if t.ends_with("spacing().interact_size.y") {
+        return Some(ui.spacing().interact_size.y);
+    }
+    if t.ends_with("spacing().interact_size.x") {
+        return Some(ui.spacing().interact_size.x);
+    }
+    number(&t).map(|v| v as f32)
+}
+
+/// A size: `[w, h]`, `vec2(w, h)`, or the designer's Fill marker for `add_sized`.
+fn size_value(ui: &Ui, v: Option<PropValue>) -> Option<Vec2> {
+    let v = v?;
+    if is_fill_size(&v) && matches!(v, PropValue::Float(_)) {
+        return Some(vec2(ui.available_width(), ui.spacing().interact_size.y));
+    }
+    match v {
+        PropValue::Expr(t) => {
+            let (w, h) = split_pair(&t)?;
+            Some(vec2(length(ui, &w)?, length(ui, &h)?))
+        }
+        _ => None,
+    }
+}
+
+/// A width: a number, or Fill (`f32::INFINITY`, `f32::MAX`, `ui.available_width()`) as the width
+/// available here, which is what each of those comes to at runtime.
+fn width_value(ui: &Ui, v: Option<PropValue>) -> Option<f32> {
+    match v? {
+        PropValue::Float(x) if x.is_infinite() && x > 0.0 => Some(ui.available_width()),
+        PropValue::Float(x) => Some(x as f32),
+        PropValue::Int(i) => Some(i as f32),
+        PropValue::Expr(e) => length(ui, &e),
+        _ => None,
+    }
+}
+
+/// `ui.add(w)`, or `ui.add_sized(size, w)` when the widget has a size.
+fn put(ui: &mut Ui, sized: Option<Vec2>, w: impl egui::Widget) -> Response {
+    match sized {
+        Some(size) => ui.add_sized(size, w),
+        None => ui.add(w),
+    }
+}
+
 fn as_enum(v: Option<PropValue>) -> Option<&'static str> {
     match v? {
         PropValue::Enum(s) => Some(s),
@@ -514,6 +747,93 @@ fn as_color(v: Option<PropValue>, dark: bool) -> Option<Color32> {
             Some(Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]))
         }
         _ => None,
+    }
+}
+
+/// A literal stroke in the preview's mode.
+fn as_stroke(v: Option<PropValue>, dark: bool) -> Option<Stroke> {
+    match v? {
+        PropValue::Stroke {
+            width,
+            light,
+            dark: d,
+        } => {
+            let color = as_color(Some(PropValue::Color { light, dark: d }), dark)?;
+            Some(Stroke::new(width as f32, color))
+        }
+        _ => None,
+    }
+}
+
+/// A literal pair, `egui::vec2(8.0, 3.0)` or `[8.0, 3.0]`.
+fn as_vec2(v: Option<PropValue>) -> Option<Vec2> {
+    match v? {
+        PropValue::Expr(t) => {
+            let (x, y) = formust_model::parse_vec2(&t)?;
+            Some(vec2(x as f32, y as f32))
+        }
+        _ => None,
+    }
+}
+
+/// The widget's text with its styling (font size, colour, bold and so on), as
+/// `egui::RichText::new(text).size(..).strong()..` in the exported code.
+fn rich(props: &Props, w: WidgetId, text: String, dark: bool) -> RichText {
+    let mut t = RichText::new(text);
+    if let Some(size) = as_f64(props.get("font_size").cloned()) {
+        t = t.size(size as f32);
+    }
+    if let Some(c) = as_color(props.get("text_color").cloned(), dark) {
+        t = t.color(c);
+    }
+    let on = |name: &str| as_bool(widget_prop(props, w, name)) == Some(true);
+    if on("bold") {
+        t = t.strong();
+    }
+    if on("italic") {
+        t = t.italics();
+    }
+    if on("underline") {
+        t = t.underline();
+    }
+    if on("strikethrough") {
+        t = t.strikethrough();
+    }
+    if on("monospace") {
+        t = t.monospace();
+    }
+    t
+}
+
+/// A literal `false`, the only enabled or visible value the preview can know is off: an
+/// expression such as `self.ready` previews as on.
+fn literal_off(props: &Props, name: &str) -> bool {
+    props.get(name) == Some(&PropValue::Bool(false))
+}
+
+/// The spacing and size statements of a container's body, applied to its `Ui` as at runtime.
+fn apply_body(ui: &mut Ui, props: &Props) {
+    let f = |name: &str| as_f64(props.get(name).cloned()).map(|v| v as f32);
+    if let Some(v) = f("set_min_width") {
+        ui.set_min_width(v);
+    }
+    if let Some(v) = f("set_min_height") {
+        ui.set_min_height(v);
+    }
+    if let Some(v) = f("set_max_width") {
+        ui.set_max_width(v);
+    }
+    if let Some(v) = f("set_max_height") {
+        ui.set_max_height(v);
+    }
+    if let Some(v) = as_vec2(props.get("item_spacing").cloned()) {
+        ui.spacing_mut().item_spacing = v;
+    }
+    if let Some(v) = as_vec2(props.get("button_padding").cloned()) {
+        ui.spacing_mut().button_padding = v;
+    }
+    if let Some(v) = f("indent") {
+        ui.spacing_mut().indent = v;
     }
 }
 
@@ -563,24 +883,34 @@ fn wrap_mode(props: &Props, w: WidgetId) -> Option<TextWrapMode> {
 
 /// One widget, on throwaway values: a binding such as `&mut self.name` previews as its type's
 /// empty value, and nothing can write back. `None` for widgets with no rect (space, end of row).
-fn widget(ui: &mut Ui, id: NodeId, w: WidgetId, props: &Props, dark: bool) -> Option<Response> {
+fn widget(
+    ui: &mut Ui,
+    id: NodeId,
+    w: WidgetId,
+    props: &Props,
+    dark: bool,
+    base_dir: Option<&std::path::Path>,
+) -> Option<Response> {
     let text = |name: &str| as_text(widget_prop(props, w, name)).unwrap_or_default();
+    let styled = || rich(props, w, text("text"), dark);
     let salt = ("formust_node", id.0);
+    let sized = size_value(ui, props.get("add_sized").cloned());
+    let min_size = size_value(ui, props.get("min_size").cloned());
     let r = match w {
         WidgetId::Label => {
-            let mut l = Label::new(text("text"));
+            let mut l = Label::new(styled());
             if let Some(m) = wrap_mode(props, w) {
                 l = l.wrap_mode(m);
             }
-            ui.add(l)
+            put(ui, sized, l)
         }
-        WidgetId::Heading => ui.heading(text("text")),
-        WidgetId::Small => ui.small(text("text")),
-        WidgetId::Strong => ui.strong(text("text")),
-        WidgetId::Weak => ui.weak(text("text")),
-        WidgetId::Monospace => ui.monospace(text("text")),
+        WidgetId::Heading => ui.heading(styled()),
+        WidgetId::Small => ui.small(styled()),
+        WidgetId::Strong => ui.strong(styled()),
+        WidgetId::Weak => ui.weak(styled()),
+        WidgetId::Monospace => ui.monospace(styled()),
         WidgetId::Button => {
-            let mut b = Button::new(text("text"));
+            let mut b = Button::new(styled());
             if as_bool(widget_prop(props, w, "small")) == Some(true) {
                 b = b.small();
             }
@@ -590,27 +920,33 @@ fn widget(ui: &mut Ui, id: NodeId, w: WidgetId, props: &Props, dark: bool) -> Op
             if let Some(c) = as_color(widget_prop(props, w, "fill"), dark) {
                 b = b.fill(c);
             }
+            if let Some(s) = as_stroke(widget_prop(props, w, "stroke"), dark) {
+                b = b.stroke(s);
+            }
             if let Some(f) = as_bool(widget_prop(props, w, "frame")) {
                 b = b.frame(f);
             }
             if as_bool(widget_prop(props, w, "selected")) == Some(true) {
                 b = b.selected(true);
             }
-            ui.add(b)
+            if let Some(m) = min_size {
+                b = b.min_size(m);
+            }
+            put(ui, sized, b)
         }
-        WidgetId::Link => ui.link(text("text")),
+        WidgetId::Link => put(ui, sized, egui::Link::new(styled())),
         WidgetId::Hyperlink => {
             let url = text("url");
             match as_text(props.get("text").cloned()) {
-                Some(label) => ui.hyperlink_to(label, url),
-                None => ui.hyperlink(url),
+                Some(label) => put(ui, sized, egui::Hyperlink::from_label_and_url(label, url)),
+                None => put(ui, sized, egui::Hyperlink::new(url)),
             }
         }
         WidgetId::Checkbox => {
             let mut v = false;
             let c = egui::Checkbox::new(&mut v, text("text"))
                 .indeterminate(as_bool(widget_prop(props, w, "indeterminate")) == Some(true));
-            ui.add(c)
+            put(ui, sized, c)
         }
         WidgetId::ToggleValue => ui.toggle_value(&mut false, text("text")),
         WidgetId::RadioValue => ui.radio(false, text("text")),
@@ -626,8 +962,11 @@ fn widget(ui: &mut Ui, id: NodeId, w: WidgetId, props: &Props, dark: bool) -> Op
             if let Some(h) = as_text(props.get("hint_text").cloned()) {
                 t = t.hint_text(h);
             }
-            if let Some(x) = as_f64(widget_prop(props, w, "desired_width")) {
-                t = t.desired_width(x as f32);
+            if let Some(x) = width_value(ui, widget_prop(props, w, "desired_width")) {
+                t = t.desired_width(x);
+            }
+            if let Some(m) = min_size {
+                t = t.min_size(m);
             }
             if let Some(x) = as_f64(widget_prop(props, w, "desired_rows")) {
                 t = t.desired_rows(x.max(1.0) as usize);
@@ -641,7 +980,7 @@ fn widget(ui: &mut Ui, id: NodeId, w: WidgetId, props: &Props, dark: bool) -> Op
             if let Some(c) = as_color(widget_prop(props, w, "background_color"), dark) {
                 t = t.background_color(c);
             }
-            ui.add(t)
+            put(ui, sized, t)
         }
         WidgetId::Slider => {
             let range = parse_range(widget_prop(props, w, "range"));
@@ -670,7 +1009,7 @@ fn widget(ui: &mut Ui, id: NodeId, w: WidgetId, props: &Props, dark: bool) -> Op
             if let Some(p) = as_text(props.get("suffix").cloned()) {
                 s = s.suffix(p);
             }
-            ui.add(s)
+            put(ui, sized, s)
         }
         WidgetId::DragValue => {
             let mut v = 0.0_f64;
@@ -681,7 +1020,10 @@ fn widget(ui: &mut Ui, id: NodeId, w: WidgetId, props: &Props, dark: bool) -> Op
             if let Some(p) = as_text(props.get("suffix").cloned()) {
                 d = d.suffix(p);
             }
-            ui.add(d)
+            if let Some(m) = min_size {
+                d = d.min_size(m);
+            }
+            put(ui, sized, d)
         }
         WidgetId::ProgressBar => {
             let progress = as_f64(widget_prop(props, w, "progress")).unwrap_or(0.5) as f32;
@@ -693,19 +1035,29 @@ fn widget(ui: &mut Ui, id: NodeId, w: WidgetId, props: &Props, dark: bool) -> Op
             if as_bool(widget_prop(props, w, "show_percentage")) == Some(true) {
                 p = p.show_percentage();
             }
-            if let Some(x) = as_f64(widget_prop(props, w, "desired_width")) {
-                p = p.desired_width(x as f32);
+            if let Some(x) = width_value(ui, widget_prop(props, w, "desired_width")) {
+                p = p.desired_width(x);
+            }
+            if let Some(x) = as_f64(widget_prop(props, w, "desired_height")) {
+                p = p.desired_height(x as f32);
             }
             if let Some(c) = as_color(widget_prop(props, w, "fill"), dark) {
                 p = p.fill(c);
             }
-            ui.add(p)
+            put(ui, sized, p)
         }
         WidgetId::Spinner => {
             let size = as_f64(widget_prop(props, w, "size"))
                 .map_or(ui.style().spacing.interact_size.y, |s| s as f32);
             let color = as_color(widget_prop(props, w, "color"), dark);
-            static_spinner(ui, size, color)
+            match sized {
+                Some(s) => {
+                    let layout = Layout::centered_and_justified(ui.layout().main_dir());
+                    ui.allocate_ui_with_layout(s, layout, |ui| static_spinner(ui, size, color))
+                        .inner
+                }
+                None => static_spinner(ui, size, color),
+            }
         }
         WidgetId::Separator => {
             let mut s = Separator::default();
@@ -718,7 +1070,7 @@ fn widget(ui: &mut Ui, id: NodeId, w: WidgetId, props: &Props, dark: bool) -> Op
             if as_bool(widget_prop(props, w, "vertical")) == Some(true) {
                 s = s.vertical();
             }
-            ui.add(s)
+            put(ui, sized, s)
         }
         WidgetId::AddSpace => {
             ui.add_space(as_f64(widget_prop(props, w, "amount")).unwrap_or(8.0) as f32);
@@ -741,8 +1093,8 @@ fn widget(ui: &mut Ui, id: NodeId, w: WidgetId, props: &Props, dark: bool) -> Op
                 None => ComboBox::from_id_salt(salt),
             };
             c = c.selected_text(selected);
-            if let Some(x) = as_f64(widget_prop(props, w, "width")) {
-                c = c.width(x as f32);
+            if let Some(x) = width_value(ui, widget_prop(props, w, "width")) {
+                c = c.width(x);
             }
             c.show_ui(ui, |ui| {
                 for item in &items {
@@ -755,8 +1107,194 @@ fn widget(ui: &mut Ui, id: NodeId, w: WidgetId, props: &Props, dark: bool) -> Op
             ui.end_row();
             return None;
         }
+        WidgetId::Image => image_preview(ui, props, dark, base_dir, sized),
+        WidgetId::ColorEdit => {
+            let mut c = PREVIEW_COLOR;
+            ui.color_edit_button_srgba(&mut c)
+        }
+        WidgetId::ColorEditRgb => {
+            let mut rgb = [
+                f32::from(PREVIEW_COLOR.r()) / 255.0,
+                f32::from(PREVIEW_COLOR.g()) / 255.0,
+                f32::from(PREVIEW_COLOR.b()) / 255.0,
+            ];
+            ui.color_edit_button_rgb(&mut rgb)
+        }
+        WidgetId::RangeSlider => {
+            let range = parse_range(widget_prop(props, w, "range"));
+            let span = range.end() - range.start();
+            let (mut lo, mut hi) = (range.start() + span * 0.25, range.start() + span * 0.75);
+            let mut s = egui::RangeSlider::new(&mut lo, &mut hi, range);
+            if let Some(t) = as_text(props.get("text").cloned()) {
+                s = s.text(t);
+            }
+            if let Some(c) = as_color(widget_prop(props, w, "text_color"), dark) {
+                s = s.text_color(c);
+            }
+            if as_bool(widget_prop(props, w, "integer")) == Some(true) {
+                s = s.integer();
+            }
+            if as_bool(widget_prop(props, w, "vertical")) == Some(true)
+                || as_enum(props.get("orientation").cloned()) == Some("Vertical")
+            {
+                s = s.vertical();
+            }
+            if let Some(b) = as_bool(widget_prop(props, w, "show_value")) {
+                s = s.show_value(b);
+            }
+            if let Some(p) = as_text(props.get("prefix").cloned()) {
+                s = s.prefix(p);
+            }
+            if let Some(p) = as_text(props.get("suffix").cloned()) {
+                s = s.suffix(p);
+            }
+            put(ui, sized, s)
+        }
     };
     Some(r)
+}
+
+/// The colour a colour picker shows at design time (its binding is not read).
+const PREVIEW_COLOR: Color32 = Color32::from_rgb(0x4A, 0x90, 0xD9);
+
+/// The local file an image's source names, if any: `file://path`, a plain path, or the path in
+/// `include_image!("path")` (relative to the form's file, as the macro reads it).
+pub fn image_path(props: &Props, base_dir: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    let text = match props.get("uri").or_else(|| props.get("source")) {
+        Some(PropValue::Text(t)) => t.clone(),
+        Some(PropValue::Expr(e)) if e.contains("include_image!") => first_string_literal(e)?,
+        Some(PropValue::Expr(_)) => return None,
+        _ => match widget_def(WidgetId::Image)
+            .prop("source")
+            .map(|p| p.default)
+        {
+            Some(DefaultValue::Text(t)) => t.to_string(),
+            _ => return None,
+        },
+    };
+    if text.contains("://") && !text.starts_with("file://") {
+        return None;
+    }
+    let path = std::path::PathBuf::from(text.trim_start_matches("file://"));
+    Some(match base_dir {
+        Some(dir) if path.is_relative() => dir.join(path),
+        _ => path,
+    })
+}
+
+/// The name an image placeholder shows: the file name, or the source as written.
+fn image_name(props: &Props) -> String {
+    let text = match props.get("uri").or_else(|| props.get("source")) {
+        Some(PropValue::Text(t) | PropValue::Expr(t)) => t.clone(),
+        _ => "image".to_string(),
+    };
+    let inner = first_string_literal(&text).unwrap_or(text);
+    inner
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&inner)
+        .to_string()
+}
+
+/// A local PNG as a texture, loaded once and kept in the context's memory (a failure too).
+fn image_texture(ctx: &egui::Context, path: &std::path::Path) -> Option<egui::TextureHandle> {
+    let key = Id::unique(("formust_image", path));
+    if let Some(cached) = ctx.data(|d| d.get_temp::<Option<egui::TextureHandle>>(key)) {
+        return cached;
+    }
+    let loaded = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| image::load_from_memory(&bytes).ok())
+        .map(|img| {
+            let rgba = img.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+            ctx.load_texture(
+                format!("formust-image-{}", path.display()),
+                color,
+                egui::TextureOptions::LINEAR,
+            )
+        });
+    ctx.data_mut(|d| d.insert_temp(key, loaded.clone()));
+    loaded
+}
+
+/// An image as at runtime when the preview can read the file (a local PNG), else a placeholder box
+/// with the file name. The designer installs no image loaders: a URL is always a placeholder.
+fn image_preview(
+    ui: &mut Ui,
+    props: &Props,
+    dark: bool,
+    base_dir: Option<&std::path::Path>,
+    sized: Option<Vec2>,
+) -> Response {
+    let texture = image_path(props, base_dir).and_then(|p| image_texture(ui.ctx(), &p));
+    let natural = texture.as_ref().map_or(vec2(96.0, 64.0), |t| t.size_vec2());
+    let float = |name: &str| as_f64(props.get(name).cloned()).map(|v| v as f32);
+    let mut size = match as_vec2(props.get("fit_to_exact_size").cloned()) {
+        Some(exact) => exact,
+        None => {
+            let mut s = natural * float("fit_to_original_size").unwrap_or(1.0);
+            let mut max = as_vec2(props.get("max_size").cloned()).unwrap_or(Vec2::INFINITY);
+            if let Some(w) = float("max_width") {
+                max.x = max.x.min(w);
+            }
+            if let Some(h) = float("max_height") {
+                max.y = max.y.min(h);
+            }
+            max.x = max.x.min(ui.available_width().max(16.0));
+            let scale = (max.x / s.x).min(max.y / s.y).min(1.0);
+            if scale.is_finite() && scale > 0.0 {
+                s *= scale;
+            }
+            s
+        }
+    };
+    size = size.max(vec2(8.0, 8.0));
+    let radius = float("corner_radius").unwrap_or(0.0);
+    match texture {
+        Some(t) => {
+            let mut img = egui::Image::new((t.id(), size)).corner_radius(radius);
+            if let Some(c) = as_color(props.get("tint").cloned(), dark) {
+                img = img.tint(c);
+            }
+            if let Some(c) = as_color(props.get("bg_fill").cloned(), dark) {
+                img = img.bg_fill(c);
+            }
+            put(ui, sized, img)
+        }
+        None => {
+            let (rect, response) = ui.allocate_exact_size(sized.unwrap_or(size), Sense::hover());
+            if ui.is_rect_visible(rect) {
+                let v = ui.visuals();
+                let fill =
+                    as_color(props.get("bg_fill").cloned(), dark).unwrap_or(v.faint_bg_color);
+                ui.painter().rect_filled(rect, radius, fill);
+                let r = rect.shrink(0.5);
+                let corners = [
+                    r.left_top(),
+                    r.right_top(),
+                    r.right_bottom(),
+                    r.left_bottom(),
+                    r.left_top(),
+                ];
+                ui.painter().extend(Shape::dashed_line(
+                    &corners,
+                    Stroke::new(1.0, v.weak_text_color()),
+                    4.0,
+                    3.0,
+                ));
+                ui.painter().with_clip_rect(rect).text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!("Image\n{}", image_name(props)),
+                    egui::FontId::proportional(11.0),
+                    v.weak_text_color(),
+                );
+            }
+            response
+        }
+    }
 }
 
 /// `format!("{:?}", self.x)` or `"text"`: what a `selected_text` expression most likely shows.
@@ -921,9 +1459,44 @@ fn container(
             ui.with_layout(layout, |ui| kids(ui, n, cx)).response
         }
         ContainerId::MenuButton => {
-            // Its children live in a popup that never opens here; select them in the outline.
+            // A real menu's popup never opens behind the shield. While the menu or something in
+            // it is selected, its items are drawn open over the form (see `draw_popups`).
             let title = as_text(container_prop(props, c, "text")).unwrap_or_default();
-            ui.menu_button(title, |ui| kids(ui, n, cx)).response
+            let r = if cx.in_popup {
+                ui.add(Button::new(title).right_text("⏵"))
+            } else {
+                ui.menu_button(title, |_| {}).response
+            };
+            if cx.open_menus.contains(&id) {
+                let at = if cx.in_popup {
+                    r.rect.right_top()
+                } else {
+                    r.rect.left_bottom()
+                };
+                cx.popups.push(Popup::Menu { id, at });
+            }
+            r
+        }
+        ContainerId::MenuBar => egui::MenuBar::new().ui(ui, |ui| kids(ui, n, cx)).response,
+        ContainerId::Modal => {
+            // Drawn over the form, centred on a dimmed backdrop, after everything else.
+            cx.popups.push(Popup::Modal(id));
+            return;
+        }
+        ContainerId::Tabs | ContainerId::TabsVertical => {
+            let r = tabs_preview(ui, n, c, props, cx);
+            cx.rec(ui, id, &r, r.rect);
+            return;
+        }
+        ContainerId::TabPage => ui.vertical(|ui| kids(ui, n, cx)).response,
+        ContainerId::Table => {
+            let r = table_preview(ui, n, props, cx);
+            cx.rec(ui, id, &r, r.rect);
+            return;
+        }
+        // Drawn by their Table.
+        ContainerId::TableRow | ContainerId::TableCell => {
+            ui.vertical(|ui| kids(ui, n, cx)).response
         }
         ContainerId::AddEnabledUi => {
             let enabled = as_bool(container_prop(props, c, "enabled")).unwrap_or(true);
@@ -945,6 +1518,25 @@ fn container(
             if let Some(col) = as_color(container_prop(props, c, "fill"), cx.dark) {
                 f = f.fill(col);
             }
+            if let Some(s) = as_stroke(container_prop(props, c, "stroke"), cx.dark) {
+                f = f.stroke(s);
+            }
+            let float = |name: &str| as_f64(container_prop(props, c, name)).map(|v| v as f32);
+            if let Some(m) = float("inner_margin") {
+                f = f.inner_margin(m);
+            }
+            if let Some(m) = float("outer_margin") {
+                f = f.outer_margin(m);
+            }
+            if let Some(r) = float("corner_radius") {
+                f = f.corner_radius(r);
+            }
+            if let Some(o) = float("multiply_with_opacity") {
+                f = f.multiply_with_opacity(o);
+            }
+            if as_bool(container_prop(props, c, "invisible")) == Some(true) {
+                f = f.invisible();
+            }
             f.show(ui, |ui| kids(ui, n, cx)).response
         }
         ContainerId::Window | ContainerId::DialogCall => {
@@ -959,13 +1551,20 @@ fn container(
                 _ => as_text(container_prop(props, c, "title")).unwrap_or_default(),
             };
             let style = ui.style().clone();
-            Frame::window(&style)
-                .show(ui, |ui| {
-                    ui.strong(title);
-                    ui.separator();
-                    kids(ui, n, cx);
-                })
-                .response
+            let draw = |ui: &mut Ui| {
+                Frame::window(&style)
+                    .show(ui, |ui| {
+                        ui.strong(title);
+                        ui.separator();
+                        kids(ui, n, cx);
+                    })
+                    .response
+            };
+            // `.anchor(Align2::X, ..)`: placed at that side of the form (the offset isn't shown).
+            match window_anchor_layout(props) {
+                Some(layout) => ui.with_layout(layout, draw).inner,
+                None => draw(ui),
+            }
         }
         ContainerId::Flow => {
             // `ImportOptions::extended` only: locked code around the children (`if c {`, `for ..`).
@@ -990,8 +1589,189 @@ fn container(
                 .response
         }
         ContainerId::FlowGroup => ui.vertical(|ui| kids(ui, n, cx)).response,
+        ContainerId::Columns => {
+            // `ui.columns(n, ..)` as at runtime; each column records its own rect, the full
+            // column width, so a drop into an empty one finds it.
+            let parts = n.children();
+            ui.scope(|ui| {
+                ui.columns(parts.len().max(1), |cols| {
+                    for (col, part) in cols.iter_mut().zip(parts) {
+                        let top = col.max_rect().min;
+                        kids(col, part, cx);
+                        let used = col.min_rect();
+                        let rect = Rect::from_min_max(
+                            top,
+                            egui::pos2(col.max_rect().right(), used.bottom()),
+                        );
+                        cx.rec_rect(col, part.id, rect);
+                    }
+                });
+            })
+            .response
+        }
+        ContainerId::Sides => {
+            let mut sides = egui::containers::Sides::new();
+            let float = |name: &str| as_f64(container_prop(props, c, name)).map(|v| v as f32);
+            if let Some(h) = float("height") {
+                sides = sides.height(h);
+            }
+            if let Some(s) = float("spacing") {
+                sides = sides.spacing(s);
+            }
+            let on = |name: &str| as_bool(container_prop(props, c, name)) == Some(true);
+            if on("shrink_left") {
+                sides = sides.shrink_left();
+            }
+            if on("shrink_right") {
+                sides = sides.shrink_right();
+            }
+            if on("extend") {
+                sides = sides.extend();
+            }
+            if let Some(mode) = match as_enum(container_prop(props, c, "wrap_mode")) {
+                Some("Wrap") => Some(TextWrapMode::Wrap),
+                Some("Truncate") => Some(TextWrapMode::Truncate),
+                Some("Extend") => Some(TextWrapMode::Extend),
+                _ => None,
+            } {
+                sides = sides.wrap_mode(mode);
+            }
+            if on("truncate") {
+                sides = sides.truncate();
+            }
+            if on("wrap") {
+                sides = sides.wrap();
+            }
+            // Both closures exist at once; egui calls them one after the other.
+            let cx = std::cell::RefCell::new(&mut *cx);
+            let side = |ui: &mut Ui, k: usize| {
+                if let Some(part) = n.children().get(k) {
+                    let mut cx = cx.borrow_mut();
+                    kids(ui, part, &mut cx);
+                    let rect = ui.min_rect();
+                    cx.rec_rect(ui, part.id, rect);
+                }
+            };
+            let r = ui
+                .scope(|ui| {
+                    sides.show(ui, |ui| side(ui, 0), |ui| side(ui, 1));
+                })
+                .response;
+            let cx = cx.into_inner();
+            cx.rec(ui, id, &r, r.rect);
+            return;
+        }
+        // Drawn by their Columns or Sides.
+        ContainerId::Column | ContainerId::Side => ui.vertical(|ui| kids(ui, n, cx)).response,
     };
     cx.rec(ui, id, &r, r.rect);
+}
+
+/// Tabs: the bar of buttons (the shown page's selected) and the shown page, laid out as the
+/// exported code lays them out. The shown page is the one around the selection, or the last one
+/// shown, or the first.
+fn tabs_preview(ui: &mut Ui, n: &Node, c: ContainerId, props: &Props, cx: &mut Cx) -> Response {
+    let pages = n.children();
+    let labels: Vec<String> = match props.get("tabs") {
+        Some(PropValue::Items(items)) => items
+            .iter()
+            .map(|t| as_text(Some(t.label.clone())).unwrap_or_default())
+            .collect(),
+        _ => Vec::new(),
+    };
+    let shown = cx
+        .pages
+        .get(&n.id)
+        .and_then(|p| pages.iter().position(|page| page.id == *p))
+        .unwrap_or(0);
+    let style = as_enum(container_prop(props, c, "style")).unwrap_or("selectable");
+    let bar = |ui: &mut Ui, cx: &mut Cx| {
+        for (k, page) in pages.iter().enumerate() {
+            let label = labels.get(k).cloned().unwrap_or_default();
+            let on = k == shown;
+            let r = match style {
+                "button" => ui.add(Button::new(label).selected(on)),
+                "frameless" => ui.add(Button::new(label).frame(false).selected(on)),
+                _ => ui.selectable_label(on, label),
+            };
+            if r.clicked() || r.hovered() || r.has_focus() {
+                cx.pass.reacted.push(n.id);
+            }
+            let visible = r.rect.intersect(ui.clip_rect());
+            if visible.is_positive() {
+                cx.pass.tab_buttons.push((visible, page.id));
+            }
+        }
+    };
+    let page = |ui: &mut Ui, cx: &mut Cx| {
+        if let Some(p) = pages.get(shown) {
+            let r = ui.scope(|ui| kids(ui, p, cx)).response;
+            cx.rec_rect(ui, p.id, r.rect);
+        }
+    };
+    if c == ContainerId::TabsVertical {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| bar(ui, cx));
+            ui.separator();
+            ui.vertical(|ui| page(ui, cx));
+        })
+        .response
+    } else {
+        // Two statements in the parent's own layout: the bar's row, then the page's content.
+        ui.scope(|ui| {
+            ui.horizontal(|ui| bar(ui, cx));
+            page(ui, cx);
+        })
+        .response
+    }
+}
+
+/// A table as a grid of its cells: no `egui_extras::TableBuilder` here (its scroll area and
+/// column resizing would take input), but the same rows and columns, striped like it, with the
+/// row heights as minimum heights. A row's rect is its cells' together.
+fn table_preview(ui: &mut Ui, n: &Node, props: &Props, cx: &mut Cx) -> Response {
+    let rows = n.children();
+    let columns = rows.first().map_or(1, |r| r.children().len().max(1));
+    let float =
+        |name: &str| as_f64(container_prop(props, ContainerId::Table, name)).map(|v| v as f32);
+    let row_height = float("row_height").unwrap_or(18.0);
+    let striped = as_bool(container_prop(props, ContainerId::Table, "striped")) == Some(true);
+    let header = formust_model::table_has_header(props);
+    let salt = ("formust_node", n.id.0);
+    egui::Frame::new()
+        .stroke(Stroke::new(
+            1.0,
+            ui.visuals().widgets.noninteractive.bg_stroke.color,
+        ))
+        .show(ui, |ui| {
+            Grid::new(salt)
+                .num_columns(columns)
+                .striped(striped)
+                .min_col_width(48.0)
+                .min_row_height(row_height)
+                .show(ui, |ui| {
+                    for (k, row) in rows.iter().enumerate() {
+                        let mut rect: Option<Rect> = None;
+                        for cell in row.children() {
+                            let r = ui
+                                .vertical(|ui| {
+                                    if header && k == 0 {
+                                        ui.set_min_height(float("header").unwrap_or(row_height));
+                                    }
+                                    kids(ui, cell, cx);
+                                })
+                                .response;
+                            cx.rec_rect(ui, cell.id, r.rect);
+                            rect = Some(rect.map_or(r.rect, |a| a.union(r.rect)));
+                        }
+                        if let Some(rect) = rect {
+                            cx.rec_rect(ui, row.id, rect);
+                        }
+                        ui.end_row();
+                    }
+                });
+        })
+        .response
 }
 
 impl Cx<'_> {
@@ -1002,6 +1782,25 @@ impl Cx<'_> {
             self.pass.rects.insert(id, visible);
         }
     }
+}
+
+/// The layout that puts a Window where its `.anchor(egui::Align2::X, ..)` says.
+fn window_anchor_layout(props: &Props) -> Option<Layout> {
+    let Some(PropValue::Expr(text)) = props.get("anchor") else {
+        return None;
+    };
+    let (align, _, _) = parse_window_anchor(text)?;
+    let (h, v) = align.split_once('_')?;
+    let h = match h {
+        "LEFT" => Align::Min,
+        "CENTER" => Align::Center,
+        _ => Align::Max,
+    };
+    Some(if v == "BOTTOM" {
+        Layout::bottom_up(h)
+    } else {
+        Layout::top_down(h)
+    })
 }
 
 /// The few `Layout` expressions a `with_layout` call usually has; anything else lays out top-down.
@@ -1019,6 +1818,8 @@ fn layout_of(expr: &str) -> Layout {
         Layout::left_to_right(align)
     } else if expr.contains("bottom_up") {
         Layout::bottom_up(align)
+    } else if expr.contains("top_down_justified") {
+        Layout::top_down_justified(align)
     } else if expr.contains("centered_and_justified") {
         Layout::centered_and_justified(egui::Direction::TopDown)
     } else {

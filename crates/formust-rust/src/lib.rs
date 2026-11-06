@@ -10,6 +10,7 @@ pub mod forms;
 pub mod frm;
 pub mod import;
 pub mod paths;
+pub mod run;
 pub mod stats;
 pub mod tokens;
 pub mod usage;
@@ -17,7 +18,7 @@ pub mod usage;
 pub use emit::{emit_body, emit_fn, emit_form_item, emit_node};
 pub use frm::{
     Conflict, FrmFile, FrmForm, Header, MergedForm, Origin, WriteError, check_conflict, merge,
-    parse_frm, standalone_base, update_frm, write_frm,
+    parse_frm, parse_frm_with, standalone_base, update_frm, write_frm,
 };
 pub use import::{
     CustomInfo, Diagnostic, ImportError, ImportOptions, ImportedForm, Severity, SourceFile, import,

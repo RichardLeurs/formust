@@ -9,6 +9,7 @@
 
 use std::path::Path;
 
+use super::align::{ALL_ALIGN, AlignAction};
 use super::edit::{self, Item, Payload, Row};
 use super::export::{self, Prompt};
 use super::preview::{self, Options};
@@ -17,8 +18,9 @@ use super::{DesignForm, Designer, node_title, show_value};
 use crate::style::{Palette, hline, pill, segment};
 use eframe::egui::{self, Color32, Frame, Margin, Rect, RichText, Sense, Stroke, StrokeKind, vec2};
 use formust_model::{
-    ContainerId, DefaultValue, EventId, Form, Node, NodeId, NodeKind, PropDef, PropKind, PropRole,
-    PropValue, WidgetId, container_def, widget_def,
+    ALIGN2, ALL_ANCHORS, Anchor, ContainerId, DefaultValue, EventId, Form, Node, NodeId, NodeKind,
+    PropDef, PropKind, PropRole, PropValue, WidgetId, container_def, parse_vec2,
+    parse_window_anchor, resize_axes, vec2_text, widget_def, window_anchor_text, wrapper_anchor,
 };
 use formust_rust::{Conflict, Origin};
 
@@ -42,6 +44,8 @@ pub enum Action {
     Reimport(String),
     /// Drop the edits and read the form file again.
     Reload,
+    /// Turn extended import (`ImportOptions::extended`) on or off and read the file again.
+    Extended(bool),
     ShowDiff(Prompt),
 }
 
@@ -98,21 +102,32 @@ pub fn show(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 pill(ui, pal, |ui| {
-                    if segment(ui, pal, "Inspector", !d.show_usage).clicked() {
+                    let (usage, tabs) = (d.show_usage, d.tab_order);
+                    if segment(ui, pal, "Inspector", !usage && !tabs).clicked() {
                         d.show_usage = false;
+                        d.tab_order = false;
                     }
-                    if segment(ui, pal, "Use in code", d.show_usage).clicked() {
+                    if segment(ui, pal, "Use in code", usage && !tabs).clicked() {
                         d.show_usage = true;
+                        d.tab_order = false;
+                    }
+                    if segment(ui, pal, "Tab order", tabs).clicked() {
+                        d.tab_order = true;
                     }
                 });
             });
             ui.add_space(4.0);
-            if d.show_usage {
+            if d.tab_order {
+                tab_order_panel(d, ui, pal);
+            } else if d.show_usage {
                 usage(d, ui, pal, read);
+            } else if d.selection_len() > 1 {
+                multi_inspector(d, ui, pal);
             } else {
                 inspector(d, ui, pal);
             }
         });
+    canvas_bar(d, ui, pal);
     canvas(d, ui, pal);
     finish_drag(d, ui.ctx());
     prompt_dialog(d, ui.ctx());
@@ -143,6 +158,16 @@ fn keyboard(d: &mut Designer, ctx: &egui::Context) {
     }
     if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::D)) {
         d.duplicate_selected();
+    }
+    // Wrap in row (Cmd+J), Unwrap (Cmd+Shift+J), Fill (Cmd+E). Shift is ignored by a plain Cmd
+    // match, so the longer one is asked first.
+    if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::J)) {
+        d.unwrap_selected();
+    } else if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::J)) {
+        d.wrap_selected();
+    }
+    if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::E)) {
+        d.toggle_fill();
     }
     if ctx.input_mut(|i| {
         i.consume_key(Modifiers::NONE, Key::Delete)
@@ -272,16 +297,20 @@ fn top_bar(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
                     ui.label(RichText::new(s).small().color(pal.text_secondary));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let dark = d.dark.unwrap_or(pal.dark);
-                    pill(ui, pal, |ui| {
-                        // Added right to left.
-                        if segment(ui, pal, "Dark", dark).clicked() {
-                            d.dark = Some(true);
-                        }
-                        if segment(ui, pal, "Light", !dark).clicked() {
-                            d.dark = Some(false);
-                        }
-                    });
+                    let mut extended = d.extended;
+                    let hover = if dirty {
+                        "Save or undo the designer edits first: switching reads the file again"
+                    } else {
+                        "Also read if/for/while/loop/match holding widgets, and let x = <widget>;, as nodes instead of locked custom code. Reads the file again."
+                    };
+                    if ui
+                        .add_enabled(!dirty, egui::Checkbox::new(&mut extended, "Extended import"))
+                        .on_hover_text(hover)
+                        .on_disabled_hover_text(hover)
+                        .changed()
+                    {
+                        d.actions.push(Action::Extended(extended));
+                    }
                     if let Some(l) = &d.loaded
                         && !l.notes.is_empty()
                     {
@@ -318,48 +347,126 @@ fn conflict_note(f: &DesignForm) -> Option<&'static str> {
 
 // ---- Palette -------------------------------------------------------------------------------
 
-/// The first palette: a click adds the item into the selected container or after the selected
-/// widget; a drag drops it where the indicator line shows.
+/// The palette: a filter box and the items by group (each group can be closed), in a scroll area
+/// of at most 240 pt, so every item can be reached and the outline keeps its room.
+/// A click adds the item into the selected container or after the selected widget; a drag drops it
+/// where the indicator line shows.
 fn palette(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
-    ui.label(
-        RichText::new("PALETTE")
-            .size(10.5)
-            .strong()
-            .color(pal.text_tertiary),
-    );
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("PALETTE")
+                .size(10.5)
+                .strong()
+                .color(pal.text_tertiary),
+        );
+        // Right to left, the clear button first: the field takes exactly the room left, so the
+        // row never overflows (a fixed allowance for the button made the resizable panel grow by
+        // a few points every frame while a filter was typed).
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if !d.palette_filter.is_empty()
+                && ui
+                    .small_button("×")
+                    .on_hover_text("Clear the filter")
+                    .clicked()
+            {
+                d.palette_filter.clear();
+            }
+            let filter = egui::TextEdit::singleline(&mut d.palette_filter)
+                .hint_text("Filter")
+                .desired_width(ui.available_width());
+            ui.add(filter)
+                .on_hover_text("Show only the items whose name contains this");
+        });
+    });
     ui.add_space(4.0);
+    let items: Vec<Item> = edit::palette()
+        .into_iter()
+        .filter(|i| edit::matches_filter(*i, &d.palette_filter))
+        .collect();
+    let filtering = !d.palette_filter.trim().is_empty();
+    // At most 240 pt (or 40% of a short panel): the outline below keeps its room, and the
+    // palette scrolls.
+    let max_height = (ui.available_height() * 0.4).clamp(120.0, 240.0);
     egui::ScrollArea::vertical()
         .id_salt("designer-palette")
-        .max_height(240.0)
+        .max_height(max_height)
         .auto_shrink([false, true])
         .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-                for item in edit::palette() {
-                    let is_container = matches!(item, Item::Container(_));
-                    let text = RichText::new(item.label()).size(11.5).color(pal.text);
-                    let fill = if is_container {
-                        pal.accent.gamma_multiply(0.18)
+            if items.is_empty() {
+                ui.label(
+                    RichText::new("Nothing matches")
+                        .small()
+                        .color(pal.text_tertiary),
+                );
+            }
+            for &group in edit::CATEGORIES {
+                let in_group: Vec<Item> = items
+                    .iter()
+                    .copied()
+                    .filter(|i| edit::category(*i) == group)
+                    .collect();
+                if in_group.is_empty() {
+                    continue;
+                }
+                let closed = !filtering && d.palette_closed.contains(group);
+                let arrow = if closed { "▸" } else { "▾" };
+                let head = ui
+                    .add(
+                        egui::Label::new(
+                            RichText::new(format!("{arrow} {group}"))
+                                .size(11.0)
+                                .color(pal.text_secondary),
+                        )
+                        .sense(Sense::click()),
+                    )
+                    .on_hover_text(if closed {
+                        "Show this group"
                     } else {
-                        pal.editor
-                    };
-                    let button = egui::Button::new(text)
-                        .fill(fill)
-                        .stroke(Stroke::new(1.0, pal.separator))
-                        .corner_radius(4.0)
-                        .sense(Sense::click_and_drag());
-                    let r = ui.add(button).on_hover_text(format!(
-                        "{}: click to add, or drag onto the form or the outline",
-                        item.label()
-                    ));
-                    if r.drag_started() {
-                        d.drag = Some(Payload::New(item));
-                    } else if r.clicked() {
-                        d.add(item, None);
+                        "Hide this group"
+                    });
+                if head.clicked() && !filtering {
+                    if closed {
+                        d.palette_closed.remove(group);
+                    } else {
+                        d.palette_closed.insert(group);
                     }
                 }
-            });
+                if closed {
+                    continue;
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                    for item in in_group {
+                        palette_button(d, ui, pal, item);
+                    }
+                });
+                ui.add_space(4.0);
+            }
         });
+}
+
+fn palette_button(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette, item: Item) {
+    let is_container = matches!(item, Item::Container(_));
+    let text = RichText::new(item.label()).size(11.5).color(pal.text);
+    let fill = if is_container {
+        pal.accent.gamma_multiply(0.18)
+    } else {
+        pal.editor
+    };
+    let button = egui::Button::new(text)
+        .fill(fill)
+        .stroke(Stroke::new(1.0, pal.separator))
+        .corner_radius(4.0)
+        .sense(Sense::click_and_drag());
+    let r = ui.add(button).on_hover_text(format!(
+        "{}: click to add, or drag onto the form or the outline",
+        item.label()
+    ));
+    if r.drag_started() {
+        d.drag = Some(Payload::New(item));
+    } else if r.clicked() {
+        d.add(item, None);
+    }
 }
 
 // ---- Outline -------------------------------------------------------------------------------
@@ -375,35 +482,48 @@ fn outline(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
     let Some(form) = d.current().map(|f| f.form().clone()) else {
         return;
     };
-    let mut clicked = None;
-    let mut dragged = None;
     let reveal = std::mem::take(&mut d.reveal_row);
-    let mut rows = Vec::new();
+    let also = d.also_selected();
+    let menu = MenuState::of(d);
+    let mut out_rows = RowOut::default();
+    let cx = RowCx {
+        pal,
+        selected: d.selected,
+        also: &also,
+        reveal,
+        menu: &menu,
+    };
     let out = egui::ScrollArea::vertical()
         .id_salt("designer-outline-rows")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            row(
-                ui,
-                pal,
-                &form.root,
-                0,
-                d.selected,
-                reveal,
-                &mut clicked,
-                &mut dragged,
-                &mut rows,
-            );
+            row(ui, &cx, &form.root, 0, None, &mut out_rows);
         });
+    let RowOut {
+        rows,
+        clicked,
+        dragged,
+        action,
+    } = out_rows;
     d.rows = rows;
-    if let Some(id) = clicked {
-        d.select(Some(id), false);
+    if let Some((id, shift, secondary, command)) = clicked {
+        let in_selection = d.selected == Some(id) || also.contains(&id);
+        if command {
+            d.toggle_select(id, false);
+        } else if shift {
+            d.select_range(id, false);
+        } else if !(secondary && in_selection) {
+            d.select(Some(id), false);
+        }
     }
     if let Some(id) = dragged
         && id != form.root.id
     {
-        d.drag = Some(Payload::Move(id));
+        d.drag = Some(Payload::Move(form.anchor_host(id)));
+    }
+    if let Some(action) = action {
+        run_menu_action(d, action);
     }
     // A drop over the outline: before, after or into the row under the pointer.
     if let Some(payload) = d.drag
@@ -422,36 +542,68 @@ fn outline(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// What the outline rows need to draw.
+struct RowCx<'a> {
+    pal: &'a Palette,
+    selected: Option<NodeId>,
+    /// The rest of a shift-click range.
+    also: &'a [NodeId],
+    reveal: bool,
+    menu: &'a MenuState,
+}
+
+/// What the outline rows report: their rects, and a click (with shift, or a right-click), a drag
+/// or a context menu choice.
+#[derive(Default)]
+struct RowOut {
+    rows: Vec<Row>,
+    /// The node, with shift, as a right-click, with Cmd.
+    clicked: Option<(NodeId, bool, bool, bool)>,
+    dragged: Option<NodeId>,
+    action: Option<MenuAction>,
+}
+
+/// One row and its children. An anchor wrapper has no row: its node's row says the anchor.
 fn row(
     ui: &mut egui::Ui,
-    pal: &Palette,
+    cx: &RowCx<'_>,
     n: &Node,
     depth: usize,
-    selected: Option<NodeId>,
-    reveal: bool,
-    clicked: &mut Option<NodeId>,
-    dragged: &mut Option<NodeId>,
-    rows: &mut Vec<Row>,
+    anchor: Option<Anchor>,
+    out: &mut RowOut,
 ) {
+    if let Some(a) = wrapper_anchor(n) {
+        row(ui, cx, &n.children()[0], depth, Some(a), out);
+        return;
+    }
+    let pal = cx.pal;
     let width = ui.available_width().max(120.0);
     let (rect, resp) = ui.allocate_exact_size(vec2(width, 20.0), Sense::click_and_drag());
-    rows.push(Row {
+    out.rows.push(Row {
         id: n.id,
         rect,
         depth,
     });
-    let is_sel = selected == Some(n.id);
-    if is_sel {
-        ui.painter().rect_filled(rect, 4.0, pal.row_selected);
-        if reveal {
+    let is_sel = cx.selected == Some(n.id);
+    let in_range = cx.also.contains(&n.id);
+    if is_sel || in_range {
+        let fill = if is_sel {
+            pal.row_selected
+        } else {
+            pal.row_selected.gamma_multiply(0.6)
+        };
+        ui.painter().rect_filled(rect, 4.0, fill);
+        if is_sel && cx.reveal {
             resp.scroll_to_me(Some(egui::Align::Center));
         }
     } else if resp.hovered() {
         ui.painter().rect_filled(rect, 4.0, pal.row_hover);
     }
     let custom = matches!(n.kind, NodeKind::Custom { .. });
-    let title = node_title(n);
+    let mut title = node_title(n);
+    if let Some(a) = anchor {
+        title.push_str(&format!(" · anchor {}", a.label().to_lowercase()));
+    }
     let x = rect.left() + 6.0 + depth as f32 * edit::ROW_INDENT;
     let color = if custom { pal.text_secondary } else { pal.text };
     let font = if custom {
@@ -474,27 +626,26 @@ fn row(
         font,
         color,
     );
-    let resp = resp.on_hover_text(if custom { format!("{title}\nLocked custom code: kept exactly as written. It can be moved, copied and deleted.") } else { title });
-    resp.widget_info(|| {
-        egui::WidgetInfo::selected(egui::Role::TreeItem, true, is_sel, node_title(n))
-    });
+    let hover = if custom {
+        format!(
+            "{title}\nLocked custom code: kept exactly as written. It can be moved, copied and deleted."
+        )
+    } else {
+        title.clone()
+    };
+    let resp = resp.on_hover_text(hover);
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::TreeItem, true, is_sel, &title));
+    let (shift, command) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
     if resp.drag_started() {
-        *dragged = Some(n.id);
+        out.dragged = Some(n.id);
     } else if resp.clicked() {
-        *clicked = Some(n.id);
+        out.clicked = Some((n.id, shift, false, command));
+    } else if resp.secondary_clicked() {
+        out.clicked = Some((n.id, false, true, false));
     }
+    resp.context_menu(|ui| node_menu(ui, cx.menu, &mut out.action));
     for c in n.children() {
-        row(
-            ui,
-            pal,
-            c,
-            depth + 1,
-            selected,
-            reveal,
-            clicked,
-            dragged,
-            rows,
-        );
+        row(ui, cx, c, depth + 1, None, out);
     }
 }
 
@@ -510,6 +661,166 @@ fn paint_lock(painter: &egui::Painter, r: Rect, color: Color32) {
         })
         .collect();
     painter.add(egui::Shape::line(pts, Stroke::new(1.3, color)));
+}
+
+// ---- Layout actions ------------------------------------------------------------------------
+
+/// A layout action from a context menu or the inspector, on the selection.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MenuAction {
+    WrapRow,
+    Unwrap,
+    Fill(bool),
+    Anchor(Option<Anchor>),
+    ResetSize,
+    Duplicate,
+    Delete,
+    Align(AlignAction),
+}
+
+/// What the layout actions can do for the selection, read before drawing.
+#[derive(Clone, Debug, Default)]
+struct MenuState {
+    any: bool,
+    fill: Option<bool>,
+    anchor: Option<Anchor>,
+    can_anchor: bool,
+    can_wrap: bool,
+    can_unwrap: bool,
+    resizable: bool,
+    range: usize,
+    /// The align actions that can run, with what each writes.
+    align: Vec<(AlignAction, bool, String)>,
+}
+
+impl MenuState {
+    fn of(d: &Designer) -> MenuState {
+        let Some(form) = d.current().map(|f| f.form()) else {
+            return MenuState::default();
+        };
+        let Some(node) = d.selected.and_then(|s| form.find(s)) else {
+            return MenuState::default();
+        };
+        let (anchor, can_anchor) = d.selected_anchor();
+        let (w, h) = resize_axes(node);
+        MenuState {
+            any: node.id != form.root.id,
+            fill: d.selected_fill(),
+            anchor,
+            can_anchor,
+            can_wrap: d.can_wrap_selection(),
+            can_unwrap: d.unwrap_target().is_some(),
+            resizable: w || h,
+            range: d.selection_hosts().len(),
+            align: ALL_ALIGN
+                .iter()
+                .map(|a| (*a, d.can_align(*a), a.writes(&form.egui_path)))
+                .collect(),
+        }
+    }
+}
+
+/// The context menu of a node (canvas and outline): arrange, Fill, anchor, size, copy and delete.
+fn node_menu(ui: &mut egui::Ui, m: &MenuState, out: &mut Option<MenuAction>) {
+    if !m.any {
+        ui.label("The form itself");
+        return;
+    }
+    fn pick(
+        ui: &mut egui::Ui,
+        on: bool,
+        label: &str,
+        shortcut: &str,
+        a: MenuAction,
+        out: &mut Option<MenuAction>,
+    ) {
+        let button = egui::Button::new(label).shortcut_text(shortcut);
+        if ui.add_enabled(on, button).clicked() {
+            *out = Some(a);
+            ui.close();
+        }
+    }
+    let wrap = if m.range > 1 {
+        format!("Wrap {} in row", m.range)
+    } else {
+        "Wrap in row".to_string()
+    };
+    pick(ui, m.can_wrap, &wrap, "⌘J", MenuAction::WrapRow, out);
+    pick(ui, m.can_unwrap, "Unwrap", "⇧⌘J", MenuAction::Unwrap, out);
+    ui.menu_button("Align", |ui| {
+        for (k, (a, on, writes)) in m.align.iter().enumerate() {
+            if k == 7 || k == 9 {
+                ui.separator();
+            }
+            let r = ui
+                .add_enabled(*on, egui::Button::new(a.label()))
+                .on_hover_text(writes)
+                .on_disabled_hover_text(writes);
+            if r.clicked() {
+                *out = Some(MenuAction::Align(*a));
+                ui.close();
+            }
+        }
+    });
+    ui.separator();
+    if let Some(fill) = m.fill {
+        let label = if fill { "✔ Fill width" } else { "Fill width" };
+        pick(ui, true, label, "⌘E", MenuAction::Fill(!fill), out);
+    }
+    ui.add_enabled_ui(m.can_anchor, |ui| {
+        ui.menu_button("Anchor", |ui| {
+            let mut choice = |ui: &mut egui::Ui, a: Option<Anchor>, label: &str| {
+                if ui.selectable_label(m.anchor == a, label).clicked() {
+                    *out = Some(MenuAction::Anchor(a));
+                    ui.close();
+                }
+            };
+            choice(ui, None, "None (normal flow)");
+            for &a in ALL_ANCHORS {
+                choice(ui, Some(a), a.label());
+            }
+        });
+    });
+    pick(
+        ui,
+        m.resizable,
+        "Reset size",
+        "",
+        MenuAction::ResetSize,
+        out,
+    );
+    ui.separator();
+    pick(ui, true, "Duplicate", "⌘D", MenuAction::Duplicate, out);
+    pick(ui, true, "Delete", "⌫", MenuAction::Delete, out);
+}
+
+fn run_menu_action(d: &mut Designer, a: MenuAction) {
+    match a {
+        MenuAction::WrapRow => {
+            d.wrap_selected();
+        }
+        MenuAction::Unwrap => {
+            d.unwrap_selected();
+        }
+        MenuAction::Fill(on) => {
+            d.set_fill(on);
+        }
+        MenuAction::Anchor(anchor) => {
+            d.set_anchor(anchor);
+        }
+        MenuAction::ResetSize => {
+            d.reset_size();
+        }
+        MenuAction::Duplicate => {
+            d.duplicate_selected();
+        }
+        MenuAction::Delete => {
+            d.delete_selected();
+        }
+        MenuAction::Align(a) => {
+            d.align(a);
+        }
+    }
 }
 
 // ---- Drag and drop -------------------------------------------------------------------------
@@ -551,9 +862,76 @@ fn finish_drag(d: &mut Designer, ctx: &egui::Context) {
             d.add(item, Some((drop.parent, drop.index)));
         }
         Payload::Move(id) => {
-            d.move_to(id, drop.parent, drop.index);
+            if d.selection_len() > 1 && d.selection_hosts().contains(&id) {
+                d.move_selection_to(drop.parent, drop.index);
+            } else {
+                d.move_to(id, drop.parent, drop.index);
+            }
         }
     }
+}
+
+/// A rubber band on the canvas: while the pointer is down, a rectangle from where the drag began;
+/// on release, the nodes entirely inside it are selected (the outermost ones, not the form).
+fn rubber_band(
+    d: &mut Designer,
+    ui: &egui::Ui,
+    pal: &Palette,
+    form: &Form,
+    layer: egui::LayerId,
+    area: Rect,
+) {
+    let Some(origin) = d.band else { return };
+    let (latest, down) = ui.input(|i| (i.pointer.latest_pos(), i.pointer.any_down()));
+    let Some(now) = latest else { return };
+    let band = Rect::from_two_pos(origin, now);
+    if down {
+        let painter = ui.ctx().layer_painter(layer).with_clip_rect(area);
+        painter.rect(
+            band,
+            0.0,
+            pal.accent.gamma_multiply(0.12),
+            Stroke::new(1.0, pal.accent),
+            StrokeKind::Inside,
+        );
+        return;
+    }
+    d.band = None;
+    let picked = band_pick(form, &d.rects, band);
+    if !picked.is_empty() {
+        d.select_all_of(&picked);
+    }
+}
+
+/// The outermost nodes whose rects lie entirely inside `band`, in tree order (anchor wrappers as
+/// their node).
+pub fn band_pick(
+    form: &Form,
+    rects: &std::collections::HashMap<NodeId, Rect>,
+    band: Rect,
+) -> Vec<NodeId> {
+    fn walk(
+        n: &Node,
+        form: &Form,
+        rects: &std::collections::HashMap<NodeId, Rect>,
+        band: Rect,
+        out: &mut Vec<NodeId>,
+    ) {
+        if n.id != form.root.id
+            && !form.is_locked_branch(n.id)
+            && rects.get(&n.id).is_some_and(|r| band.contains_rect(*r))
+        {
+            out.push(form.anchor_child(n.id));
+            return;
+        }
+        for c in n.children() {
+            walk(c, form, rects, band, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(&form.root, form, rects, band, &mut out);
+    out.dedup();
+    out
 }
 
 // ---- Inspector -----------------------------------------------------------------------------
@@ -576,6 +954,27 @@ enum Change {
     AddEvent(EventId),
     SetEvent(EventId, String),
     RemoveEvent(EventId),
+    Act(MenuAction),
+    Tab(TabOp),
+    Table(TableOp),
+}
+
+/// A table's size from the inspector.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TableOp {
+    Columns(usize),
+    Rows(usize),
+}
+
+/// An edit of a Tabs' tabs from the inspector: each changes a tab and its page together.
+#[derive(Clone, Debug, PartialEq)]
+enum TabOp {
+    Add,
+    Remove(usize),
+    Rename(usize, String),
+    Move(usize, usize),
+    /// Show this page on the canvas (no edit).
+    Show(usize),
 }
 
 fn inspector(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
@@ -588,6 +987,8 @@ fn inspector(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
         .clone();
     let reason = f.custom_reason(node.id).map(str::to_string);
     let form_key = form.id();
+    let menu = MenuState::of(d);
+    let measured = d.rects.get(&node.id).map(|r| r.size());
     let mut changes: Vec<(Change, bool)> = Vec::new();
     egui::ScrollArea::vertical().id_salt("designer-properties-rows").auto_shrink([false, false]).show(ui, |ui| {
         ui.label(RichText::new(node_title(&node)).strong().color(pal.text));
@@ -603,7 +1004,17 @@ fn inspector(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
             }
             NodeKind::Widget { def, props, events, extra_chain, response_chain, .. } => {
                 let wd = widget_def(*def);
-                prop_sections(ui, pal, wd.props, wd.size_props, props, node.id, &mut changes);
+                if *def == WidgetId::Image {
+                    let shown = super::preview::image_path(props, d.loaded.as_ref().and_then(|l| l.path.parent())).is_some_and(|p| p.is_file());
+                    let note = if shown {
+                        "The canvas shows the file (a PNG). At runtime egui needs image loaders: see Use in code."
+                    } else {
+                        "The canvas shows a placeholder: only a local PNG is drawn here. At runtime egui needs image loaders: see Use in code."
+                    };
+                    ui.label(RichText::new(note).small().color(pal.text_tertiary));
+                }
+                layout_section(ui, pal, &menu, measured, &mut changes);
+                prop_sections(ui, pal, &form.egui_path, wd.props, wd.size_props, props, node.id, &mut changes);
                 events_section(ui, pal, &node, *def, events, &mut changes);
                 chain_list(ui, pal, "OTHER BUILDER METHODS", extra_chain);
                 chain_list(ui, pal, "ON THE RESPONSE", response_chain);
@@ -617,7 +1028,22 @@ fn inspector(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
                     form_section(ui, pal, &form);
                 } else {
                     let cd = container_def(*def);
-                    prop_sections(ui, pal, cd.props, cd.size_props, props, node.id, &mut changes);
+                    layout_section(ui, pal, &menu, measured, &mut changes);
+                    if *def == ContainerId::Window {
+                        window_anchor_editor(ui, pal, &form.egui_path, props, &mut changes);
+                    }
+                    if def.is_tabs() {
+                        let shown = d.tab_pages.get(&node.id).copied();
+                        tabs_editor(ui, pal, &form, &node, shown, &mut changes);
+                    }
+                    if *def == ContainerId::Table {
+                        ui.label(RichText::new("Requires egui_extras: TableBuilder is in the egui_extras crate, which your Cargo.toml must list (Formust doesn't add it).").small().color(pal.warning));
+                        table_editor(ui, pal, &form, &node, &mut changes);
+                    }
+                    if matches!(def, ContainerId::MenuBar | ContainerId::MenuButton) {
+                        ui.label(RichText::new("Select a menu to see it open on the canvas. Menu items are buttons; end a handler with ui.close(); to close the menu.").small().color(pal.text_tertiary));
+                    }
+                    prop_sections(ui, pal, &form.egui_path, cd.props, cd.size_props, props, node.id, &mut changes);
                     chain_list(ui, pal, "OTHER BUILDER METHODS", extra_chain);
                 }
             }
@@ -647,8 +1073,350 @@ fn inspector(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
             Change::RemoveEvent(e) => {
                 d.try_edit(None, |f| f.remove_event(id, e));
             }
+            Change::Act(a) => run_menu_action(d, a),
+            Change::Tab(op) => run_tab_op(d, id, op, typing),
+            Change::Table(TableOp::Columns(n)) => {
+                d.try_edit(None, |f| f.set_table_columns(id, n));
+            }
+            Change::Table(TableOp::Rows(n)) => {
+                d.try_edit(None, |f| f.set_table_rows(id, n));
+            }
         }
     }
+}
+
+/// The tabs of a Tabs: each with its label (and value), up and down, remove, and Add tab.
+fn tabs_editor(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    form: &Form,
+    node: &Node,
+    shown: Option<NodeId>,
+    changes: &mut Vec<(Change, bool)>,
+) {
+    section(ui, pal, "TABS");
+    let tabs = form.tabs(node.id).unwrap_or_default();
+    let pages = node.children();
+    let count = tabs.len();
+    let shown = shown
+        .and_then(|s| pages.iter().position(|p| p.id == s))
+        .unwrap_or(0);
+    egui::Grid::new(("designer-tabs", node.id.0))
+        .num_columns(2)
+        .spacing(vec2(6.0, 4.0))
+        .show(ui, |ui| {
+            for (k, tab) in tabs.iter().enumerate() {
+                let r = ui.radio(k == shown, "").on_hover_text(format!(
+                    "Show this page on the canvas (value {})",
+                    tab.value
+                ));
+                if r.clicked() {
+                    changes.push((Change::Tab(TabOp::Show(k)), false));
+                }
+                ui.horizontal(|ui| {
+                    let mut label = match &tab.label {
+                        PropValue::Text(t) | PropValue::Expr(t) => t.clone(),
+                        other => show_value(other),
+                    };
+                    let edit = ui
+                        .add(egui::TextEdit::singleline(&mut label).desired_width(110.0))
+                        .on_hover_text(match &tab.label {
+                            PropValue::Expr(_) => "Label (a Rust expression)",
+                            _ => "Label",
+                        });
+                    if edit.changed() {
+                        changes.push((Change::Tab(TabOp::Rename(k, label)), true));
+                    }
+                    if ui
+                        .add_enabled(k > 0, egui::Button::new("↑").small())
+                        .on_hover_text("Move this tab (and its page) left or up")
+                        .clicked()
+                    {
+                        changes.push((Change::Tab(TabOp::Move(k, k - 1)), false));
+                    }
+                    if ui
+                        .add_enabled(k + 1 < count, egui::Button::new("↓").small())
+                        .on_hover_text("Move this tab (and its page) right or down")
+                        .clicked()
+                    {
+                        changes.push((Change::Tab(TabOp::Move(k, k + 1)), false));
+                    }
+                    if ui
+                        .add_enabled(count > 1, egui::Button::new("×").small())
+                        .on_hover_text("Remove this tab and its page")
+                        .clicked()
+                    {
+                        changes.push((Change::Tab(TabOp::Remove(k)), false));
+                    }
+                });
+                ui.end_row();
+            }
+        });
+    let can_add = form.can_add_tab(node.id);
+    let add = ui
+        .add_enabled(can_add, egui::Button::new("Add tab").small())
+        .on_hover_text("A new tab with the next number and an empty page")
+        .on_disabled_hover_text(
+            "These tabs are an enum's variants: add a variant to the enum and an arm by hand",
+        );
+    if add.clicked() {
+        changes.push((Change::Tab(TabOp::Add), false));
+    }
+}
+
+/// A table's size (columns, body rows) and the kind of each column (`egui_extras::Column::..`).
+fn table_editor(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    form: &Form,
+    node: &Node,
+    changes: &mut Vec<(Change, bool)>,
+) {
+    let Some((columns, rows, _)) = form.table_size(node.id) else {
+        return;
+    };
+    section(ui, pal, "TABLE");
+    egui::Grid::new(("designer-table", node.id.0))
+        .num_columns(2)
+        .spacing(vec2(8.0, 4.0))
+        .min_col_width(80.0)
+        .show(ui, |ui| {
+            let mut c = columns;
+            let label = ui.label(RichText::new("Columns").color(pal.text));
+            if ui
+                .add(egui::DragValue::new(&mut c).range(1..=formust_model::MAX_TABLE_COLUMNS))
+                .labelled_by(label.id)
+                .changed()
+            {
+                changes.push((Change::Table(TableOp::Columns(c)), false));
+            }
+            ui.end_row();
+            let mut r = rows;
+            let label = ui.label(RichText::new("Rows").color(pal.text));
+            if ui
+                .add(egui::DragValue::new(&mut r).range(1..=formust_model::MAX_TABLE_ROWS))
+                .labelled_by(label.id)
+                .on_hover_text("Body rows; the header row is the Header height property")
+                .changed()
+            {
+                changes.push((Change::Table(TableOp::Rows(r)), false));
+            }
+            ui.end_row();
+            let kinds = match &node.kind {
+                NodeKind::Container { props, .. } => match props.get("columns") {
+                    Some(PropValue::Items(items)) => items.clone(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            for (k, kind) in kinds.iter().enumerate() {
+                ui.label(RichText::new(format!("Column {}", k + 1)).color(pal.text_secondary));
+                let mut text = kind.value.clone();
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut text)
+                            .code_editor()
+                            .desired_width(180.0),
+                    )
+                    .on_hover_text("An egui_extras::Column: auto(), remainder(), exact(80.0), initial(120.0).resizable(true) ..")
+                    .changed()
+                {
+                    let mut all = kinds.clone();
+                    all[k].value = text;
+                    changes.push((Change::Set("columns", PropValue::Items(all)), true));
+                }
+                ui.end_row();
+            }
+        });
+}
+
+/// Applies a tab edit; Show only changes the page the canvas shows.
+fn run_tab_op(d: &mut Designer, id: NodeId, op: TabOp, typing: bool) {
+    let form_key = d.current().map(|f| f.form().id()).unwrap_or_default();
+    match op {
+        TabOp::Show(k) => {
+            let page = d
+                .current()
+                .and_then(|f| f.form().find(id))
+                .and_then(|n| n.children().get(k))
+                .map(|p| p.id);
+            if let Some(page) = page {
+                d.tab_pages.insert(id, page);
+            }
+        }
+        TabOp::Add => {
+            let mut added = None;
+            let label = format!(
+                "Tab {}",
+                d.current()
+                    .and_then(|f| f.form().tabs(id))
+                    .map_or(1, |t| t.len() + 1)
+            );
+            d.try_edit(None, |f| {
+                added = Some(f.add_tab(id, &label)?);
+                Ok(())
+            });
+            if let Some(page) = added {
+                d.tab_pages.insert(id, page);
+            }
+        }
+        TabOp::Remove(k) => {
+            d.try_edit(None, |f| f.remove_tab(id, k));
+        }
+        TabOp::Move(from, to) => {
+            d.try_edit(None, |f| f.move_tab(id, from, to));
+        }
+        TabOp::Rename(k, label) => {
+            let key = typing.then(|| format!("{form_key}:{}:tab{k}", id.0));
+            let value = match d
+                .current()
+                .and_then(|f| f.form().tabs(id))
+                .and_then(|t| t.get(k).map(|t| t.label.clone()))
+            {
+                Some(PropValue::Expr(_)) => PropValue::Expr(label),
+                _ => PropValue::Text(label),
+            };
+            d.try_edit(key.as_deref(), |f| f.rename_tab(id, k, value));
+        }
+    }
+}
+
+/// Fill, the anchor, wrapping and the size on the canvas, with Reset size.
+fn layout_section(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    m: &MenuState,
+    measured: Option<egui::Vec2>,
+    changes: &mut Vec<(Change, bool)>,
+) {
+    section(ui, pal, "LAYOUT");
+    egui::Grid::new("designer-layout")
+        .num_columns(2)
+        .spacing(vec2(8.0, 4.0))
+        .min_col_width(80.0)
+        .show(ui, |ui| {
+            if let Some(fill) = m.fill {
+                let label = ui.label(RichText::new("Fill").color(pal.text));
+                let mut on = fill;
+                let r = ui
+                    .checkbox(&mut on, "")
+                    .labelled_by(label.id)
+                    .on_hover_text("As wide as there is room (Cmd+E)");
+                if r.changed() {
+                    changes.push((Change::Act(MenuAction::Fill(on)), false));
+                }
+                ui.end_row();
+            }
+            if m.can_anchor {
+                ui.label(RichText::new("Anchor").color(pal.text))
+                    .on_hover_text("Written as ui.with_layout(..) around this node");
+                let mut choice = m.anchor;
+                let shown = |a: Option<Anchor>| a.map_or("None", Anchor::label);
+                egui::ComboBox::from_id_salt("designer-anchor")
+                    .selected_text(shown(choice))
+                    .width(130.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut choice, None, "None (normal flow)");
+                        for &a in ALL_ANCHORS {
+                            ui.selectable_value(&mut choice, Some(a), a.label());
+                        }
+                    });
+                if choice != m.anchor {
+                    changes.push((Change::Act(MenuAction::Anchor(choice)), false));
+                }
+                ui.end_row();
+            }
+            if let Some(size) = measured {
+                ui.label(RichText::new("On canvas").color(pal.text_secondary));
+                ui.label(
+                    RichText::new(format!("{:.0} × {:.0} pt", size.x, size.y)).color(pal.text),
+                );
+                ui.end_row();
+            }
+        });
+    ui.horizontal_wrapped(|ui| {
+        let wrap = if m.range > 1 {
+            format!("Wrap {} in row", m.range)
+        } else {
+            "Wrap in row".to_string()
+        };
+        if ui
+            .add_enabled(m.can_wrap, egui::Button::new(wrap).small())
+            .on_hover_text("Put the selection in a new Horizontal here (Cmd+J; shift-click a sibling for a range)")
+            .clicked()
+        {
+            changes.push((Change::Act(MenuAction::WrapRow), false));
+        }
+        if ui
+            .add_enabled(m.can_unwrap, egui::Button::new("Unwrap").small())
+            .on_hover_text("Move this container's children out into its place (Cmd+Shift+J)")
+            .clicked()
+        {
+            changes.push((Change::Act(MenuAction::Unwrap), false));
+        }
+        if ui
+            .add_enabled(m.resizable, egui::Button::new("Reset size").small())
+            .on_hover_text("Remove the size properties: back to egui's own size")
+            .clicked()
+        {
+            changes.push((Change::Act(MenuAction::ResetSize), false));
+        }
+    });
+}
+
+/// A Window's `.anchor(egui::Align2::X, [dx, dy])`: a corner or side, and an offset.
+fn window_anchor_editor(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    egui_path: &str,
+    props: &formust_model::Props,
+    changes: &mut Vec<(Change, bool)>,
+) {
+    let current = match props.get("anchor") {
+        Some(PropValue::Expr(t)) => Some(parse_window_anchor(t)),
+        _ => None,
+    };
+    if current == Some(None) {
+        // An anchor that isn't literal: edited as text in the properties below.
+        return;
+    }
+    let current = current.flatten();
+    let label = |a: &str| a.to_lowercase().replace('_', " ");
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Window anchor").color(pal.text));
+        let mut choice = current.map(|c| c.0);
+        egui::ComboBox::from_id_salt("designer-window-anchor")
+            .selected_text(choice.map_or_else(|| "None".to_string(), label))
+            .width(120.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut choice, None, "None");
+                for &a in ALIGN2 {
+                    ui.selectable_value(&mut choice, Some(a), label(a));
+                }
+            });
+        let (mut dx, mut dy) = current.map_or((0.0, 0.0), |c| (c.1, c.2));
+        let mut typing = false;
+        if choice.is_some() {
+            typing |= ui
+                .add(egui::DragValue::new(&mut dx).prefix("dx ").speed(1.0))
+                .changed();
+            typing |= ui
+                .add(egui::DragValue::new(&mut dy).prefix("dy ").speed(1.0))
+                .changed();
+        }
+        if choice != current.map(|c| c.0) || typing {
+            changes.push(match choice {
+                Some(a) => (
+                    Change::Set(
+                        "anchor",
+                        PropValue::Expr(window_anchor_text(egui_path, a, dx, dy)),
+                    ),
+                    typing,
+                ),
+                None => (Change::Clear("anchor"), false),
+            });
+        }
+    });
 }
 
 /// The `<x>` of a new handler `self.on_<x>_clicked();`: the widget's text, else its kind.
@@ -664,6 +1432,27 @@ fn handler_name(n: &Node) -> String {
         return widget_def(*def).name.to_string();
     }
     "item".to_string()
+}
+
+/// The FORM panel's "Dialog" row: for a dialog (a function taking `&egui::Context` that shows a
+/// Window, a Modal or a dialog helper call), what it shows; widgets go in there. `None` for a
+/// form drawn into a `Ui` and for a legacy `update`.
+pub fn dialog_note(form: &Form) -> Option<String> {
+    if !form.context_root {
+        return None;
+    }
+    let shown = form.widget_root();
+    let free = if form.owner.is_empty() {
+        "free fn, "
+    } else {
+        ""
+    };
+    Some(if shown == form.root.id {
+        format!("{free}takes &egui::Context")
+    } else {
+        let title = form.find(shown).map(node_title).unwrap_or_default();
+        format!("{free}shows {title}")
+    })
 }
 
 fn form_section(ui: &mut egui::Ui, pal: &Palette, form: &Form) {
@@ -683,6 +1472,9 @@ fn form_section(ui: &mut egui::Ui, pal: &Palette, form: &Form) {
             grid_row(ui, "State field", &form.state_field);
             if form.legacy_ctx.is_some() {
                 grid_row(ui, "Legacy", "fn update (exported as fn ui)");
+            }
+            if let Some(dialog) = dialog_note(form) {
+                grid_row(ui, "Dialog", &dialog);
             }
         });
     if !form.state.is_empty() {
@@ -726,25 +1518,66 @@ fn chain_list(ui: &mut egui::Ui, pal: &Palette, title: &str, chain: &[String]) {
     }
 }
 
-/// The size properties first, then the rest, each with its editor.
+/// Which inspector group a property is in.
+#[derive(Clone, Copy, PartialEq)]
+enum Group {
+    Properties,
+    TextStyle,
+    Behaviour,
+    Spacing,
+    Size,
+}
+
+fn group_of(def: &PropDef, size: &[&str]) -> Group {
+    if size.contains(&def.name) {
+        return Group::Size;
+    }
+    match def.role {
+        PropRole::Rich(_) => Group::TextStyle,
+        PropRole::Response(_)
+        | PropRole::AddEnabled
+        | PropRole::AddVisible
+        | PropRole::InitialFocus => Group::Behaviour,
+        PropRole::Spacing(_) => Group::Spacing,
+        PropRole::UiSet(_) => Group::Size,
+        PropRole::Arg
+        | PropRole::Builder(_)
+        | PropRole::Flag(_)
+        | PropRole::Ctor
+        | PropRole::AddSized
+        | PropRole::Body => Group::Properties,
+    }
+}
+
+/// The properties by group (their own, text style, tooltip and enabled/visible, spacing, size),
+/// each with its editor.
+#[allow(clippy::too_many_arguments)]
 fn prop_sections(
     ui: &mut egui::Ui,
     pal: &Palette,
+    egui_path: &str,
     defs: &'static [PropDef],
     size: &[&str],
     props: &formust_model::Props,
     id: NodeId,
     changes: &mut Vec<(Change, bool)>,
 ) {
-    let sized: Vec<&'static PropDef> = defs.iter().filter(|d| size.contains(&d.name)).collect();
-    let rest: Vec<&'static PropDef> = defs.iter().filter(|d| !size.contains(&d.name)).collect();
-    if !rest.is_empty() {
-        section(ui, pal, "PROPERTIES");
-        prop_grid(ui, pal, ("designer-props", id.0), &rest, props, changes);
-    }
-    if !sized.is_empty() {
-        section(ui, pal, "SIZE");
-        prop_grid(ui, pal, ("designer-size", id.0), &sized, props, changes);
+    for (group, title, salt) in [
+        (Group::Properties, "PROPERTIES", "designer-props"),
+        (Group::TextStyle, "TEXT STYLE", "designer-text-style"),
+        (Group::Behaviour, "BEHAVIOUR", "designer-behaviour"),
+        (Group::Spacing, "SPACING AND PADDING", "designer-spacing"),
+        (Group::Size, "SIZE", "designer-size"),
+    ] {
+        // A Tabs' list of tabs has its own editor (`tabs_editor`), which keeps the pages in step.
+        let list: Vec<&'static PropDef> = defs
+            .iter()
+            .filter(|d| group_of(d, size) == group && d.name != "tabs" && d.name != "columns")
+            .collect();
+        if !list.is_empty() {
+            section(ui, pal, title);
+            prop_grid(ui, pal, egui_path, (salt, id.0), &list, props, changes);
+        }
     }
 }
 
@@ -753,6 +1586,7 @@ fn prop_sections(
 fn prop_grid(
     ui: &mut egui::Ui,
     pal: &Palette,
+    egui_path: &str,
     salt: (&str, u32),
     defs: &[&'static PropDef],
     props: &formust_model::Props,
@@ -773,7 +1607,7 @@ fn prop_grid(
                 let label = label.on_hover_text(format!("{} ({})", def.name, role_text(def.role)));
                 ui.horizontal(|ui| {
                     let label_id = label.id;
-                    if let Some(c) = prop_editor(ui, pal, def, set, label_id) {
+                    if let Some(c) = prop_editor(ui, pal, egui_path, def, set, label_id) {
                         changes.push(c);
                     }
                 });
@@ -792,6 +1626,13 @@ fn role_text(role: PropRole) -> String {
         PropRole::AddEnabled => "ui.add_enabled(..)".to_string(),
         PropRole::AddVisible => "ui.add_visible(..)".to_string(),
         PropRole::Body => "in the body".to_string(),
+        PropRole::Rich(m) => format!("RichText .{m}(..)"),
+        PropRole::Response(m) => format!("response .{m}(..)"),
+        PropRole::UiSet(m) => format!("ui.{m}(..) in the body"),
+        PropRole::Spacing(f) => format!("ui.spacing_mut().{f} in the body"),
+        PropRole::InitialFocus => {
+            "response.request_focus() while nothing has the focus".to_string()
+        }
     }
 }
 
@@ -806,12 +1647,63 @@ fn reset(ui: &mut egui::Ui, def: &'static PropDef) -> Option<(Change, bool)> {
 fn prop_editor(
     ui: &mut egui::Ui,
     pal: &Palette,
+    egui_path: &str,
     def: &'static PropDef,
     value: Option<&PropValue>,
     label: egui::Id,
 ) -> Option<(Change, bool)> {
     let default = def.default.to_value();
     let optional = def.role != PropRole::Arg;
+    // A pair: two numbers while it is literal, else its text below.
+    if def.kind == PropKind::Vec2 {
+        match value {
+            None => {
+                let (x, y) = start_pair(def);
+                return ui.small_button("Set").clicked().then(|| {
+                    (
+                        Change::Set(def.name, PropValue::Expr(vec2_text(egui_path, x, y))),
+                        false,
+                    )
+                });
+            }
+            Some(PropValue::Expr(t)) if let Some((mut x, mut y)) = parse_vec2(t) => {
+                let mut typing = false;
+                typing |= ui
+                    .add(
+                        egui::DragValue::new(&mut x)
+                            .speed(0.5)
+                            .max_decimals(1)
+                            .prefix("x "),
+                    )
+                    .labelled_by(label)
+                    .changed();
+                typing |= ui
+                    .add(
+                        egui::DragValue::new(&mut y)
+                            .speed(0.5)
+                            .max_decimals(1)
+                            .prefix("y "),
+                    )
+                    .changed();
+                if typing {
+                    return Some((
+                        Change::Set(def.name, PropValue::Expr(vec2_text(egui_path, x, y))),
+                        true,
+                    ));
+                }
+                return reset(ui, def);
+            }
+            Some(_) => {}
+        }
+    }
+    // Fill (an infinite width, or `add_sized` at the available width): no number to edit.
+    if let Some(PropValue::Float(x)) = value
+        && x.is_infinite()
+    {
+        ui.label(RichText::new("Fill").color(pal.text))
+            .on_hover_text("As wide as there is room: the Fill checkbox under Layout");
+        return reset(ui, def);
+    }
     // A non-literal value of a literal property: its source text, editable as such.
     if let Some(PropValue::Expr(e)) = value
         && def.kind != PropKind::Expr
@@ -840,8 +1732,10 @@ fn prop_editor(
                 _ => None,
             };
             if matches!(def.default, DefaultValue::None) {
-                // No default: unset, true or false.
+                // No default: unset, true, false, or an expression such as `self.ready`, which
+                // the text field above then edits.
                 let mut choice = current;
+                let mut expression = false;
                 let shown = |c: Option<bool>| c.map_or("(not set)".to_string(), |b| b.to_string());
                 egui::ComboBox::from_id_salt(("designer-bool", def.name))
                     .selected_text(shown(choice))
@@ -850,7 +1744,20 @@ fn prop_editor(
                         for c in [None, Some(true), Some(false)] {
                             ui.selectable_value(&mut choice, c, shown(c));
                         }
+                        if ui
+                            .selectable_label(false, "Expression…")
+                            .on_hover_text("A bool expression, such as self.ready")
+                            .clicked()
+                        {
+                            expression = true;
+                        }
                     });
+                if expression {
+                    return Some((
+                        Change::Set(def.name, PropValue::Expr(EXPRESSION_START.to_string())),
+                        false,
+                    ));
+                }
                 return (choice != current).then(|| match choice {
                     Some(b) => (Change::Set(def.name, PropValue::Bool(b)), false),
                     None => (Change::Clear(def.name), false),
@@ -958,7 +1865,64 @@ fn prop_editor(
         }
         PropKind::Color => color_editor(ui, pal, def, value),
         PropKind::Items => items_editor(ui, def, value),
+        PropKind::Stroke => stroke_editor(ui, pal, def, value),
+        // Handled above, and a non-literal one as an expression.
+        PropKind::Vec2 => None,
     }
+}
+
+/// What "Expression…" puts in a bool property for the user to type over (`self.ready`): valid code
+/// meanwhile.
+pub const EXPRESSION_START: &str = "true";
+
+/// The pair a Set button starts from: egui's own defaults for the spacing.
+fn start_pair(def: &PropDef) -> (f64, f64) {
+    match def.name {
+        "item_spacing" => (8.0, 3.0),
+        "button_padding" => (4.0, 1.0),
+        _ => (40.0, 20.0),
+    }
+}
+
+/// A stroke: its width, and a colour for both modes or a light and a dark one.
+fn stroke_editor(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    def: &'static PropDef,
+    value: Option<&PropValue>,
+) -> Option<(Change, bool)> {
+    let Some(&PropValue::Stroke { width, light, dark }) = value else {
+        return ui.small_button("Set").clicked().then(|| {
+            (
+                Change::Set(
+                    def.name,
+                    PropValue::stroke(
+                        1.0,
+                        [0xA0, 0xA0, 0xA0, 0xFF],
+                        Some([0x60, 0x60, 0x60, 0xFF]),
+                    ),
+                ),
+                false,
+            )
+        });
+    };
+    let mut w = width;
+    let mut changed = ui
+        .add(
+            egui::DragValue::new(&mut w)
+                .speed(0.1)
+                .range(0.0..=64.0)
+                .max_decimals(1)
+                .suffix(" pt"),
+        )
+        .on_hover_text("Width")
+        .changed();
+    let (mut l, mut dk) = (light, dark);
+    changed |= color_buttons(ui, pal, &mut l, &mut dk);
+    if changed {
+        return Some((Change::Set(def.name, PropValue::stroke(w, l, dk)), true));
+    }
+    reset(ui, def)
 }
 
 fn start_int(def: &PropDef) -> i64 {
@@ -995,12 +1959,28 @@ fn color_editor(
         });
     };
     let (mut l, mut dk) = (*light, *dark);
-    let mut changed = false;
-    changed |= ui
-        .color_edit_button_srgba_unmultiplied(&mut l)
+    let changed = color_buttons(ui, pal, &mut l, &mut dk);
+    if changed {
+        return Some((
+            Change::Set(def.name, PropValue::Color { light: l, dark: dk }),
+            true,
+        ));
+    }
+    reset(ui, def)
+}
+
+/// A light colour, a "dark" checkbox and the dark colour when it is on. Returns whether one changed.
+fn color_buttons(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    light: &mut [u8; 4],
+    dark: &mut Option<[u8; 4]>,
+) -> bool {
+    let mut changed = ui
+        .color_edit_button_srgba_unmultiplied(light)
         .on_hover_text("Light mode")
         .changed();
-    let mut pair = dk.is_some();
+    let mut pair = dark.is_some();
     if ui
         .checkbox(
             &mut pair,
@@ -1009,22 +1989,16 @@ fn color_editor(
         .on_hover_text("A separate colour in dark mode")
         .changed()
     {
-        dk = pair.then_some(dk.unwrap_or(l));
+        *dark = pair.then_some(dark.unwrap_or(*light));
         changed = true;
     }
-    if let Some(d) = dk.as_mut() {
+    if let Some(d) = dark.as_mut() {
         changed |= ui
             .color_edit_button_srgba_unmultiplied(d)
             .on_hover_text("Dark mode")
             .changed();
     }
-    if changed {
-        return Some((
-            Change::Set(def.name, PropValue::Color { light: l, dark: dk }),
-            true,
-        ));
-    }
-    reset(ui, def)
+    changed
 }
 
 /// A combo box's items: each a value expression and a label.
@@ -1209,6 +2183,12 @@ fn usage(
             section(ui, pal, &format!("Add to {frm_name}: the handlers the form calls"));
             code(ui, stubs);
         }
+        if !u.requirements.is_empty() {
+            section(ui, pal, "What the program needs");
+            for need in &u.requirements {
+                ui.label(RichText::new(need).color(pal.text));
+            }
+        }
         if let Some(state) = &u.state {
             section(ui, pal, "The form's state");
             ui.label(RichText::new(state).color(pal.text));
@@ -1271,12 +2251,28 @@ fn canvas(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
 
     let dark = d.dark.unwrap_or(pal.dark);
     window_chrome(ui, &view, area, &form.id(), dark);
+    let also = d.also_selected();
+    let handles = d
+        .selected
+        .and_then(|s| form.find(s))
+        .map_or((false, false), resize_axes);
+    // The pages around the selection are the ones shown, and the menus around it are open.
+    let open_menus = shown_parts(d, &form);
+    let base_dir = d
+        .loaded
+        .as_ref()
+        .and_then(|l| l.path.parent().map(std::path::Path::to_path_buf));
     let opts = Options {
         dark,
         selected: d.selected,
         hovered: d.hovered,
+        also: &also,
+        handles,
         accent: pal.accent,
         stash_accesskit: !d.open_accesskit,
+        pages: &d.tab_pages,
+        open_menus: &open_menus,
+        base_dir: base_dir.as_deref(),
     };
     let drawn = preview::show(ui, area, view.client(), &form, &opts);
     let pass = drawn.pass;
@@ -1285,6 +2281,7 @@ fn canvas(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
     d.client = Some(view.client());
     if pass.kept {
         d.rects = pass.rects;
+        d.tab_buttons = pass.tab_buttons;
         let content = pass.content;
         if (content - d.content).length() > 0.5 {
             d.content = content;
@@ -1293,21 +2290,72 @@ fn canvas(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
         // Act only on the kept pass: Grid's discarded sizing pass has wrong rects.
         let pointer = drawn.shield.hover_pos();
         let hit = pointer.and_then(|p| preview::hit_test(&form.root, &d.rects, p));
-        d.hovered = hit;
+        // An anchor wrapper is shown as its node.
+        d.hovered = hit.map(|h| form.anchor_child(h));
+        let (shift, command) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
         if drawn.shield.clicked() {
             let at = drawn.shield.interact_pointer_pos();
+            // A tab button shows its page, and selects it so a drop or a paste goes there.
+            let tab = at.and_then(|p| {
+                d.tab_buttons
+                    .iter()
+                    .rev()
+                    .find(|(r, _)| r.contains(p))
+                    .map(|(_, page)| *page)
+            });
             let hit = at.and_then(|p| preview::hit_test(&form.root, &d.rects, p));
-            d.select(hit, true);
+            // Only where the Tabs itself is hit: an open menu or a modal over the bar wins.
+            let tab = tab.filter(|page| form.page_of(*page).map(|(t, _)| t) == hit);
+            match (tab, hit) {
+                (Some(page), _) if !command && !shift => {
+                    if let Some((tabs, _)) = form.page_of(page) {
+                        d.tab_pages.insert(tabs, page);
+                    }
+                    d.select(Some(page), true);
+                }
+                (_, Some(h)) if command => d.toggle_select(h, true),
+                (_, Some(h)) if shift => d.select_range(h, true),
+                _ => d.select(hit, true),
+            }
         }
-        // A drag on a node moves it.
+        // A right-click selects what it is on (unless that is in the selection) for the menu.
+        if drawn.shield.secondary_clicked() {
+            let at = drawn.shield.interact_pointer_pos();
+            let hit = at
+                .and_then(|p| preview::hit_test(&form.root, &d.rects, p))
+                .map(|h| form.anchor_child(h));
+            let in_selection = hit.is_some_and(|h| d.selected == Some(h) || also.contains(&h));
+            if !in_selection {
+                d.select(hit, true);
+            }
+        }
+        // A drag on a node moves it (an anchored node with its wrapper), or the whole selection
+        // when it is in one; a drag on empty space draws a rubber band.
         if drawn.shield.drag_started()
+            && d.resize.is_none()
             && let Some(at) = ui.input(|i| i.pointer.press_origin())
-            && let Some(hit) = preview::hit_test(&form.root, &d.rects, at)
-            && hit != form.root.id
         {
-            d.select(Some(hit), true);
-            d.drag = Some(Payload::Move(hit));
+            match preview::hit_test(&form.root, &d.rects, at) {
+                Some(hit) if hit != form.root.id => {
+                    let shown = form.anchor_child(hit);
+                    let in_set = d.selected == Some(shown) || also.contains(&shown);
+                    if !in_set {
+                        d.select(Some(hit), true);
+                    }
+                    d.drag = Some(Payload::Move(form.anchor_host(hit)));
+                }
+                _ => d.band = Some(at),
+            }
         }
+        rubber_band(d, ui, pal, &form, drawn.layer, area);
+    }
+    let menu = MenuState::of(d);
+    let mut action = None;
+    drawn
+        .shield
+        .context_menu(|ui| node_menu(ui, &menu, &mut action));
+    if let Some(a) = action {
+        run_menu_action(d, a);
     }
     // A drop over the canvas: the indicator line, on the preview's layer above the form.
     if let Some(payload) = d.drag
@@ -1335,8 +2383,11 @@ fn canvas(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
             }
         }
     }
+    paint_overlays(d, ui, pal, &form, drawn.layer, area, view.client());
+    let resizing = resize_handles(d, ui, pal, &form, area);
     grip(d, ui, pal, view.client(), area);
     if ui.input(|i| i.key_pressed(egui::Key::Escape))
+        && !resizing
         && d.drag.is_none()
         && d.selected.is_some()
         && ui.memory(|m| m.focused().is_none())
@@ -1351,6 +2402,138 @@ fn canvas(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
     }
     d.scroll = view.scroll;
     ui.allocate_rect(avail, Sense::hover());
+}
+
+/// Brings the parts around the selection into view: each Tabs around it shows the page it is on
+/// (remembered in `tab_pages` for when the selection moves elsewhere), and returns the menus
+/// around it (the selected menu too), which are drawn open.
+pub fn shown_parts(d: &mut Designer, form: &Form) -> Vec<NodeId> {
+    let mut open = Vec::new();
+    let Some(selected) = d.selected.filter(|s| form.find(*s).is_some()) else {
+        return open;
+    };
+    let mut at = Some(selected);
+    while let Some(id) = at {
+        if let Some(Node {
+            kind:
+                NodeKind::Container {
+                    def: ContainerId::MenuButton,
+                    ..
+                },
+            ..
+        }) = form.find(id)
+        {
+            open.push(id);
+        }
+        if let Some((tabs, k)) = form.page_of(id)
+            && form.parent_of(id).map(|(p, _)| p) == Some(tabs)
+            && let Some(page) = form.find(tabs).and_then(|t| t.children().get(k))
+        {
+            d.tab_pages.insert(tabs, page.id);
+        }
+        at = form.parent_of(id).map(|(p, _)| p);
+    }
+    open
+}
+
+/// The selected node's resize handles: dragging the right edge, the bottom edge or the corner sets
+/// its size properties live; Shift keeps the aspect ratio on the corner, Alt snaps to 4pt, Escape
+/// cancels, and one drag is one undo step. Returns whether a resize was going on this frame.
+fn resize_handles(
+    d: &mut Designer,
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    form: &Form,
+    area: Rect,
+) -> bool {
+    let active = d.resize.is_some();
+    if active && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        d.cancel_resize();
+        return true;
+    }
+    let Some(id) = d.selected else {
+        d.cancel_resize();
+        return active;
+    };
+    let Some(node) = form.find(id) else {
+        d.cancel_resize();
+        return active;
+    };
+    let edges = resize_axes(node);
+    let rect = match (&d.resize, d.rects.get(&id)) {
+        // The handles stay on the rect the drag started from until it ends.
+        (Some(r), _) if r.id == id => r.start,
+        (_, Some(r)) => *r,
+        _ => return active,
+    };
+    let kinds = [
+        ((true, false), egui::CursorIcon::ResizeHorizontal),
+        ((false, true), egui::CursorIcon::ResizeVertical),
+        ((true, true), egui::CursorIcon::ResizeNwSe),
+    ];
+    let (shift, alt, origin, latest, down) = ui.input(|i| {
+        (
+            i.modifiers.shift,
+            i.modifiers.alt,
+            i.pointer.press_origin(),
+            i.pointer.latest_pos(),
+            i.pointer.any_down(),
+        )
+    });
+    for (k, square) in preview::handle_rects(rect, edges).into_iter().enumerate() {
+        let Some(square) = square else { continue };
+        if !area.intersects(square) {
+            continue;
+        }
+        let (kind, cursor) = kinds[k];
+        let r = ui
+            .interact(
+                square.expand(2.0),
+                ui.scope_id().with(("designer-resize", k)),
+                Sense::drag(),
+            )
+            .on_hover_cursor(cursor);
+        if r.drag_started() {
+            let row_height = ui.ctx().fonts_mut(|f| {
+                f.row_height(&egui::TextStyle::Body.resolve(&egui::Style::default()))
+            });
+            d.begin_resize(id, kind, rect, row_height);
+        }
+        if r.dragged() && d.resize.as_ref().is_some_and(|z| z.edges == kind) {
+            ui.ctx().set_cursor_icon(cursor);
+            if let (Some(from), Some(to)) = (origin, latest) {
+                d.drag_resize(to - from, shift, alt);
+            }
+        }
+        if r.drag_stopped() {
+            d.end_resize();
+        }
+    }
+    if d.resize.is_some() && !down {
+        d.end_resize();
+    }
+    // The size under the pointer while it changes.
+    if let (Some(z), Some(pos)) = (&d.resize, latest)
+        && let Some(r) = d.rects.get(&z.id)
+    {
+        egui::Area::new(egui::Id::unique("designer-resize-size"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(pos + vec2(14.0, 10.0))
+            .interactable(false)
+            .show(ui.ctx(), |ui| {
+                Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("{:.0} × {:.0}", r.width(), r.height()))
+                                .small()
+                                .color(pal.text),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                    );
+                });
+            });
+    }
+    active || d.resize.is_some()
 }
 
 /// The corner grip: dragging it sets the preview's width (not a property of the form; a double
@@ -1516,6 +2699,664 @@ fn scroll_bar(ui: &mut egui::Ui, pal: &Palette, view: &mut View, strip: Rect, ho
         pal.text_tertiary
     };
     painter.rect_filled(thumb, 4.0, fill.gamma_multiply(0.7));
+}
+
+// ---- Several selected ----------------------------------------------------------------------
+
+/// The inspector for a selection of several nodes: how many, the align actions (each says what
+/// it writes), and the properties they all have. A change sets it on every one of them, as one
+/// undo step; a value that differs between them shows as unset and is listed as mixed.
+fn multi_inspector(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
+    let Some(f) = d.current() else { return };
+    let form = f.form().clone();
+    let hosts = d.selection_hosts();
+    let ids: Vec<NodeId> = hosts.iter().map(|h| form.anchor_child(*h)).collect();
+    let nodes: Vec<&Node> = ids.iter().filter_map(|i| form.find(*i)).collect();
+    let menu = MenuState::of(d);
+    let mut changes: Vec<(Change, bool)> = Vec::new();
+    egui::ScrollArea::vertical()
+        .id_salt("designer-multi-rows")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(format!("{} selected", nodes.len()))
+                    .strong()
+                    .color(pal.text),
+            );
+            ui.label(
+                RichText::new("Cmd-click adds or removes a node; a drag on empty canvas selects what it encloses.")
+                    .small()
+                    .color(pal.text_tertiary),
+            );
+            section(ui, pal, "ALIGN");
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Size").color(pal.text_secondary));
+                let mut typed = d.size_value.is_some();
+                if ui
+                    .checkbox(&mut typed, "typed")
+                    .on_hover_text("Off: same width/height as the largest selected node. On: the value here.")
+                    .changed()
+                {
+                    d.size_value = typed.then_some(100.0);
+                }
+                if let Some(v) = d.size_value.as_mut() {
+                    ui.add(egui::DragValue::new(v).range(8.0..=4000.0).suffix(" pt"));
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Spacing").color(pal.text_secondary));
+                let mut v = d.spacing();
+                if ui
+                    .add(egui::DragValue::new(&mut v).range(0.0..=200.0).suffix(" pt"))
+                    .on_hover_text("For \"Spacing of the parent\"")
+                    .changed()
+                {
+                    d.spacing_value = Some(v);
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                for (a, on, writes) in &menu.align {
+                    if ui
+                        .add_enabled(*on, egui::Button::new(a.label()).small())
+                        .on_hover_text(writes)
+                        .on_disabled_hover_text(writes)
+                        .clicked()
+                    {
+                        changes.push((Change::Act(MenuAction::Align(*a)), false));
+                    }
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(menu.can_wrap, egui::Button::new("Wrap in row").small())
+                    .clicked()
+                {
+                    changes.push((Change::Act(MenuAction::WrapRow), false));
+                }
+                if ui.add(egui::Button::new("Duplicate").small()).clicked() {
+                    changes.push((Change::Act(MenuAction::Duplicate), false));
+                }
+                if ui.add(egui::Button::new("Delete").small()).clicked() {
+                    changes.push((Change::Act(MenuAction::Delete), false));
+                }
+            });
+            let (common, mixed) = common_props(&nodes);
+            if common.is_empty() {
+                section(ui, pal, "COMMON PROPERTIES");
+                ui.label(
+                    RichText::new("They have no property in common.")
+                        .small()
+                        .color(pal.text_tertiary),
+                );
+            } else {
+                section(ui, pal, "COMMON PROPERTIES");
+                let shown: formust_model::Props = common
+                    .iter()
+                    .filter_map(|(def, v)| v.clone().map(|v| (def.name, v)))
+                    .collect();
+                let defs: Vec<&'static PropDef> = common.iter().map(|(d, _)| *d).collect();
+                prop_grid(
+                    ui,
+                    pal,
+                    &form.egui_path,
+                    ("designer-multi-props", 0),
+                    &defs,
+                    &shown,
+                    &mut changes,
+                );
+                if !mixed.is_empty() {
+                    ui.label(
+                        RichText::new(format!("Mixed values: {}", mixed.join(", ")))
+                            .small()
+                            .color(pal.text_tertiary),
+                    );
+                }
+            }
+        });
+    let key = format!("{}:multi", form.id());
+    for (change, typing) in changes {
+        match change {
+            Change::Set(name, value) => {
+                let k = typing.then(|| format!("{key}:{name}"));
+                d.try_edit(k.as_deref(), |f| {
+                    for id in &ids {
+                        f.set_prop(*id, name, value.clone())?;
+                    }
+                    Ok(())
+                });
+            }
+            Change::Clear(name) => {
+                d.try_edit(None, |f| {
+                    for id in &ids {
+                        f.clear_prop(*id, name)?;
+                    }
+                    Ok(())
+                });
+            }
+            Change::Act(a) => run_menu_action(d, a),
+            Change::AddEvent(_)
+            | Change::SetEvent(..)
+            | Change::RemoveEvent(_)
+            | Change::Tab(_)
+            | Change::Table(_) => {}
+        }
+    }
+}
+
+/// The properties every node has (same name and kind), with their value when it is the same in
+/// all of them; and the names of those whose values differ. Custom code has none.
+pub fn common_props(
+    nodes: &[&Node],
+) -> (
+    Vec<(&'static PropDef, Option<PropValue>)>,
+    Vec<&'static str>,
+) {
+    fn defs_of(n: &Node) -> Option<(&'static [PropDef], &formust_model::Props)> {
+        match &n.kind {
+            NodeKind::Widget { def, props, .. } => Some((widget_def(*def).props, props)),
+            NodeKind::Container { def, props, .. } => Some((container_def(*def).props, props)),
+            NodeKind::Custom { .. } => None,
+        }
+    }
+    let Some(all) = nodes.iter().map(|n| defs_of(n)).collect::<Option<Vec<_>>>() else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some((first, _)) = all.first() else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut common = Vec::new();
+    let mut mixed = Vec::new();
+    for def in first.iter() {
+        // Items and bindings belong to one widget; they are not edited for several at once.
+        if matches!(def.kind, PropKind::Items) || def.role == PropRole::Body {
+            continue;
+        }
+        let shared = all.iter().all(|(defs, _)| {
+            defs.iter()
+                .any(|d| d.name == def.name && d.kind == def.kind && d.role == def.role)
+        });
+        if !shared {
+            continue;
+        }
+        let values: Vec<Option<&PropValue>> = all.iter().map(|(_, p)| p.get(def.name)).collect();
+        let same = values.windows(2).all(|w| w[0] == w[1]);
+        if !same {
+            mixed.push(def.name);
+        }
+        common.push((def, if same { values[0].cloned() } else { None }));
+    }
+    (common, mixed)
+}
+
+// ---- Canvas toolbar and overlays -------------------------------------------------------------
+
+/// Preset preview widths, in points.
+pub const PRESET_WIDTHS: &[f32] = &[320.0, 480.0, 640.0, 800.0, 1024.0];
+
+/// The bar above the canvas: the preview's width (presets; the corner grip drags any width), its
+/// light or dark mode (follows the IDE until picked), and the design-time overlays.
+fn canvas_bar(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
+    Frame::new()
+        .fill(pal.editor)
+        .inner_margin(Margin::symmetric(10, 4))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let label = ui.label(RichText::new("Width").color(pal.text_secondary));
+                let shown = d
+                    .preview_width
+                    .map_or_else(|| "Default".to_string(), |w| format!("{w:.0} pt"));
+                let mut chosen = d.preview_width;
+                egui::ComboBox::from_id_salt("designer-width")
+                    .selected_text(shown)
+                    .width(90.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut chosen, None, "Default");
+                        for w in PRESET_WIDTHS {
+                            ui.selectable_value(&mut chosen, Some(*w), format!("{w:.0} pt"));
+                        }
+                    })
+                    .response
+                    .labelled_by(label.id)
+                    .on_hover_text("The preview's width; drag the canvas corner for any other");
+                if chosen != d.preview_width {
+                    d.preview_width = chosen;
+                }
+                ui.separator();
+                if ui
+                    .selectable_label(d.rulers, "Rulers")
+                    .on_hover_text("Rulers in points along the top and left (design time only)")
+                    .clicked()
+                {
+                    d.rulers = !d.rulers;
+                }
+                if ui
+                    .selectable_label(d.grid.is_some(), "Grid lines")
+                    .on_hover_text("Lines every 8 or 16 points over the form (design time only)")
+                    .clicked()
+                {
+                    d.grid = if d.grid.is_some() { None } else { Some(8.0) };
+                }
+                if let Some(g) = d.grid {
+                    for step in [8.0, 16.0] {
+                        if ui
+                            .selectable_label(g == step, format!("{step:.0}"))
+                            .on_hover_text(format!("A line every {step:.0} pt"))
+                            .clicked()
+                        {
+                            d.grid = Some(step);
+                        }
+                    }
+                }
+                if ui
+                    .selectable_label(!d.guides_off, "Guides")
+                    .on_hover_text("The distance from the selected node to its neighbours and its container's edges")
+                    .clicked()
+                {
+                    d.guides_off = !d.guides_off;
+                }
+                if ui
+                    .selectable_label(d.tab_order, "Tab order")
+                    .on_hover_text("Number the widgets in the order Tab visits them, and list them to reorder")
+                    .clicked()
+                {
+                    d.tab_order = !d.tab_order;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let dark = d.dark.unwrap_or(pal.dark);
+                    pill(ui, pal, |ui| {
+                        // Added right to left.
+                        if segment(ui, pal, "Dark", dark).clicked() {
+                            d.dark = Some(true);
+                        }
+                        if segment(ui, pal, "Light", !dark).clicked() {
+                            d.dark = Some(false);
+                        }
+                    });
+                });
+            });
+        });
+}
+
+/// The width of a ruler strip.
+pub const RULER: f32 = 14.0;
+/// The colour of the distance guides.
+const GUIDE: Color32 = Color32::from_rgb(232, 62, 140);
+
+/// Rulers, grid lines, distance guides and tab numbers on the preview's layer, above the form.
+/// Design time only: none of it is in the form or its code.
+#[allow(clippy::too_many_arguments)]
+fn paint_overlays(
+    d: &Designer,
+    ui: &egui::Ui,
+    pal: &Palette,
+    form: &Form,
+    layer: egui::LayerId,
+    area: Rect,
+    client: Rect,
+) {
+    let painter = ui.ctx().layer_painter(layer).with_clip_rect(area);
+    let origin = client.min;
+    if let Some(step) = d.grid {
+        let color = pal.accent.gamma_multiply(0.16);
+        let clip = client.intersect(area);
+        let grid = painter.with_clip_rect(clip);
+        for x in grid_lines(origin.x, clip.left(), clip.right(), step) {
+            grid.line_segment(
+                [egui::pos2(x, clip.top()), egui::pos2(x, clip.bottom())],
+                Stroke::new(1.0, color),
+            );
+        }
+        for y in grid_lines(origin.y, clip.top(), clip.bottom(), step) {
+            grid.line_segment(
+                [egui::pos2(clip.left(), y), egui::pos2(clip.right(), y)],
+                Stroke::new(1.0, color),
+            );
+        }
+    }
+    let single = d.selection_len() == 1;
+    if !d.guides_off
+        && single
+        && let Some(id) = d.selected
+        && let Some(r) = d.rects.get(&id)
+    {
+        for (from, to, label_at) in distance_guides(form, &d.rects, id, *r) {
+            painter.line_segment([from, to], Stroke::new(1.0, GUIDE));
+            for p in [from, to] {
+                let tick = if (from.x - to.x).abs() > (from.y - to.y).abs() {
+                    egui::vec2(0.0, 3.0)
+                } else {
+                    egui::vec2(3.0, 0.0)
+                };
+                painter.line_segment([p - tick, p + tick], Stroke::new(1.0, GUIDE));
+            }
+            let text = format!("{:.0}", (to - from).length());
+            let galley =
+                painter.layout_no_wrap(text, egui::FontId::proportional(10.0), Color32::WHITE);
+            let rect = Rect::from_center_size(label_at, galley.size() + egui::vec2(6.0, 2.0));
+            painter.rect_filled(rect, 3.0, GUIDE);
+            painter.galley(rect.center() - galley.size() / 2.0, galley, Color32::WHITE);
+        }
+    }
+    if d.tab_order {
+        for (k, id) in form.tab_order().into_iter().enumerate() {
+            let Some(r) = d.rects.get(&id) else { continue };
+            let focus = matches!(&form.find(id).map(|n| &n.kind), Some(NodeKind::Widget { props, .. }) if props.get("initial_focus") == Some(&PropValue::Bool(true)));
+            let text = if focus {
+                format!("{} ★", k + 1)
+            } else {
+                format!("{}", k + 1)
+            };
+            let galley =
+                painter.layout_no_wrap(text, egui::FontId::proportional(10.5), Color32::WHITE);
+            let size = galley.size() + egui::vec2(8.0, 2.0);
+            let rect = Rect::from_min_size(r.left_top() - egui::vec2(4.0, 6.0), size);
+            painter.rect_filled(rect, 7.0, pal.accent);
+            painter.galley(rect.center() - galley.size() / 2.0, galley, Color32::WHITE);
+        }
+    }
+    if d.rulers {
+        paint_rulers(
+            &painter,
+            pal,
+            area,
+            origin,
+            d.selected.and_then(|s| d.rects.get(&s)).copied(),
+        );
+    }
+}
+
+/// The positions of grid lines every `step` from `origin`, between `lo` and `hi`.
+pub fn grid_lines(origin: f32, lo: f32, hi: f32, step: f32) -> Vec<f32> {
+    if step <= 0.0 || hi <= lo {
+        return Vec::new();
+    }
+    let first = ((lo - origin) / step).ceil();
+    let mut out = Vec::new();
+    let mut k = first;
+    while origin + k * step <= hi && out.len() < 2000 {
+        out.push(origin + k * step);
+        k += 1.0;
+    }
+    out
+}
+
+/// The distance guides of a selected node at `r`: from each side to the nearest sibling that faces
+/// it, else to its container's edge. Each is (from, to, where its label goes).
+pub fn distance_guides(
+    form: &Form,
+    rects: &std::collections::HashMap<NodeId, Rect>,
+    id: NodeId,
+    r: Rect,
+) -> Vec<(egui::Pos2, egui::Pos2, egui::Pos2)> {
+    let host = form.anchor_host(id);
+    let Some((parent, _)) = form.parent_of(host) else {
+        return Vec::new();
+    };
+    let Some(outer) = rects.get(&parent).copied() else {
+        return Vec::new();
+    };
+    let siblings: Vec<Rect> = form
+        .find(parent)
+        .map(|p| {
+            p.children()
+                .iter()
+                .filter(|c| c.id != host)
+                .filter_map(|c| rects.get(&form.anchor_child(c.id)).copied())
+                .collect()
+        })
+        .unwrap_or_default();
+    let overlaps_y = |s: &Rect| s.top() < r.bottom() && s.bottom() > r.top();
+    let overlaps_x = |s: &Rect| s.left() < r.right() && s.right() > r.left();
+    let left = siblings
+        .iter()
+        .filter(|s| overlaps_y(s) && s.right() <= r.left() + 0.5)
+        .map(|s| s.right())
+        .fold(outer.left(), f32::max);
+    let right = siblings
+        .iter()
+        .filter(|s| overlaps_y(s) && s.left() >= r.right() - 0.5)
+        .map(|s| s.left())
+        .fold(outer.right(), f32::min);
+    let top = siblings
+        .iter()
+        .filter(|s| overlaps_x(s) && s.bottom() <= r.top() + 0.5)
+        .map(|s| s.bottom())
+        .fold(outer.top(), f32::max);
+    let bottom = siblings
+        .iter()
+        .filter(|s| overlaps_x(s) && s.top() >= r.bottom() - 0.5)
+        .map(|s| s.top())
+        .fold(outer.bottom(), f32::min);
+    let (cx, cy) = (r.center().x, r.center().y);
+    let mut out = Vec::new();
+    let mut push = |a: egui::Pos2, b: egui::Pos2| {
+        if (b - a).length() >= 0.5 {
+            out.push((a, b, a + (b - a) / 2.0));
+        }
+    };
+    push(egui::pos2(left, cy), egui::pos2(r.left(), cy));
+    push(egui::pos2(r.right(), cy), egui::pos2(right, cy));
+    push(egui::pos2(cx, top), egui::pos2(cx, r.top()));
+    push(egui::pos2(cx, r.bottom()), egui::pos2(cx, bottom));
+    out
+}
+
+/// Rulers along the top and left of the canvas, in points from the form's top-left corner, with
+/// the selected node's extent marked.
+fn paint_rulers(
+    painter: &egui::Painter,
+    pal: &Palette,
+    area: Rect,
+    origin: egui::Pos2,
+    selected: Option<Rect>,
+) {
+    let top = Rect::from_min_max(area.min, egui::pos2(area.right(), area.top() + RULER));
+    let left = Rect::from_min_max(
+        egui::pos2(area.left(), area.top() + RULER),
+        egui::pos2(area.left() + RULER, area.bottom()),
+    );
+    for strip in [top, left] {
+        painter.rect_filled(strip, 0.0, pal.chrome);
+    }
+    painter.line_segment(
+        [top.left_bottom(), top.right_bottom()],
+        Stroke::new(1.0, pal.separator),
+    );
+    painter.line_segment(
+        [left.right_top(), left.right_bottom()],
+        Stroke::new(1.0, pal.separator),
+    );
+    if let Some(s) = selected {
+        let mark = pal.accent.gamma_multiply(0.35);
+        painter.rect_filled(
+            Rect::from_min_max(
+                egui::pos2(s.left().max(top.left() + RULER), top.top()),
+                egui::pos2(s.right(), top.bottom()),
+            ),
+            0.0,
+            mark,
+        );
+        painter.rect_filled(
+            Rect::from_min_max(
+                egui::pos2(left.left(), s.top().max(left.top())),
+                egui::pos2(left.right(), s.bottom()),
+            ),
+            0.0,
+            mark,
+        );
+    }
+    let font = egui::FontId::proportional(8.5);
+    for x in grid_lines(origin.x, top.left() + RULER, top.right(), 10.0) {
+        let units = ((x - origin.x) / 10.0).round() as i64;
+        let len = if units % 10 == 0 {
+            RULER
+        } else if units % 5 == 0 {
+            7.0
+        } else {
+            4.0
+        };
+        painter.line_segment(
+            [
+                egui::pos2(x, top.bottom() - len),
+                egui::pos2(x, top.bottom()),
+            ],
+            Stroke::new(1.0, pal.text_tertiary),
+        );
+        if units % 10 == 0 {
+            painter.text(
+                egui::pos2(x + 2.0, top.top()),
+                egui::Align2::LEFT_TOP,
+                format!("{}", units * 10),
+                font.clone(),
+                pal.text_secondary,
+            );
+        }
+    }
+    for y in grid_lines(origin.y, left.top(), left.bottom(), 10.0) {
+        let units = ((y - origin.y) / 10.0).round() as i64;
+        let len = if units % 10 == 0 {
+            RULER
+        } else if units % 5 == 0 {
+            7.0
+        } else {
+            4.0
+        };
+        painter.line_segment(
+            [
+                egui::pos2(left.right() - len, y),
+                egui::pos2(left.right(), y),
+            ],
+            Stroke::new(1.0, pal.text_tertiary),
+        );
+        if units % 10 == 0 {
+            painter.text(
+                egui::pos2(left.left() + 1.0, y + 2.0),
+                egui::Align2::LEFT_TOP,
+                format!("{}", units * 10),
+                font.clone(),
+                pal.text_secondary,
+            );
+        }
+    }
+}
+
+// ---- Tab order -------------------------------------------------------------------------------
+
+/// The focusable widgets in the order Tab visits them (egui moves the focus in the order widgets
+/// are created: tree order). Dragging a row moves that widget in the code, before or after the row
+/// it is dropped on; the star sets the widget that takes the focus first.
+fn tab_order_panel(d: &mut Designer, ui: &mut egui::Ui, pal: &Palette) {
+    let Some(form) = d.current().map(|f| f.form().clone()) else {
+        return;
+    };
+    section(ui, pal, "TAB ORDER");
+    ui.label(
+        RichText::new("Tab visits the widgets in the order they are created. Drag a row to move that widget in the code; ★ gives a widget the focus when nothing else has it (response.request_focus()).")
+            .small()
+            .color(pal.text_tertiary),
+    );
+    ui.add_space(4.0);
+    let order = form.tab_order();
+    if order.is_empty() {
+        ui.label(RichText::new("No focusable widgets").color(pal.text_secondary));
+        return;
+    }
+    let mut rows: Vec<(NodeId, Rect)> = Vec::new();
+    let mut dragged = None;
+    let mut clicked = None;
+    let mut star = None;
+    egui::ScrollArea::vertical()
+        .id_salt("designer-tab-order")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for (k, id) in order.iter().enumerate() {
+                let Some(node) = form.find(*id) else { continue };
+                let (has_focus_prop, on) = match &node.kind {
+                    NodeKind::Widget { def, props, .. } => (
+                        widget_def(*def).prop("initial_focus").is_some(),
+                        props.get("initial_focus") == Some(&PropValue::Bool(true)),
+                    ),
+                    _ => (false, false),
+                };
+                ui.horizontal(|ui| {
+                    let s = ui
+                        .add_enabled(
+                            has_focus_prop,
+                            egui::Button::new(if on { "★" } else { "☆" })
+                                .small()
+                                .frame(false),
+                        )
+                        .on_hover_text("Initial focus: takes the focus while nothing else has it")
+                        .on_disabled_hover_text("A combo box has no initial focus here");
+                    if s.clicked() {
+                        star = Some((*id, !on));
+                    }
+                    let width = ui.available_width().max(80.0);
+                    let (rect, resp) =
+                        ui.allocate_exact_size(vec2(width, 20.0), Sense::click_and_drag());
+                    let selected = d.selected == Some(*id);
+                    if selected {
+                        ui.painter().rect_filled(rect, 4.0, pal.row_selected);
+                    } else if resp.hovered() {
+                        ui.painter().rect_filled(rect, 4.0, pal.row_hover);
+                    }
+                    let title = format!("{}  {}", k + 1, node_title(node));
+                    ui.painter().text(
+                        egui::pos2(rect.left() + 6.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        &title,
+                        egui::FontId::proportional(12.5),
+                        pal.text,
+                    );
+                    resp.widget_info(|| {
+                        egui::WidgetInfo::selected(egui::Role::ListItem, true, selected, &title)
+                    });
+                    if resp.drag_started() {
+                        dragged = Some(*id);
+                    } else if resp.clicked() {
+                        clicked = Some(*id);
+                    }
+                    rows.push((*id, rect));
+                });
+            }
+        });
+    if let Some((id, on)) = star {
+        d.set_initial_focus(id, on);
+    }
+    if let Some(id) = clicked {
+        d.select(Some(id), false);
+    }
+    if let Some(id) = dragged {
+        d.tab_drag = Some(id);
+    }
+    let Some(moving) = d.tab_drag else { return };
+    let (pos, released) = ui.input(|i| (i.pointer.latest_pos(), !i.pointer.any_down()));
+    let target = pos.and_then(|p| {
+        rows.iter()
+            .find(|(_, r)| r.y_range().contains(p.y))
+            .map(|(id, r)| (*id, p.y > r.center().y, *r))
+    });
+    if let Some((_, after, r)) = target {
+        let y = if after {
+            r.bottom() + 1.0
+        } else {
+            r.top() - 1.0
+        };
+        ui.painter().line_segment(
+            [egui::pos2(r.left(), y), egui::pos2(r.right(), y)],
+            Stroke::new(2.0, pal.accent),
+        );
+    }
+    if released {
+        d.tab_drag = None;
+        if let Some((to, after, _)) = target
+            && to != moving
+        {
+            d.move_in_tab_order(moving, to, after);
+        }
+    }
 }
 
 // ---- Conflict prompt and difference --------------------------------------------------------

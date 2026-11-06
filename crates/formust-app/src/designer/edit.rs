@@ -110,6 +110,109 @@ pub fn palette() -> Vec<Item> {
     items
 }
 
+/// The palette's groups, in the order shown.
+pub const CATEGORIES: &[&str] = &[
+    "Text",
+    "Buttons and choices",
+    "Input",
+    "Display",
+    "Layout",
+    "Navigation",
+    "Panels",
+];
+
+/// The palette group of an item.
+pub fn category(item: Item) -> &'static str {
+    match item {
+        Item::Widget(w) => match w {
+            WidgetId::Label
+            | WidgetId::Heading
+            | WidgetId::Small
+            | WidgetId::Strong
+            | WidgetId::Weak
+            | WidgetId::Monospace
+            | WidgetId::Link
+            | WidgetId::Hyperlink => "Text",
+            WidgetId::Button
+            | WidgetId::Checkbox
+            | WidgetId::ToggleValue
+            | WidgetId::RadioValue
+            | WidgetId::SelectableValue
+            | WidgetId::ComboBox => "Buttons and choices",
+            WidgetId::TextEditSingleline
+            | WidgetId::TextEditMultiline
+            | WidgetId::Slider
+            | WidgetId::DragValue
+            | WidgetId::RangeSlider
+            | WidgetId::ColorEdit
+            | WidgetId::ColorEditRgb => "Input",
+            WidgetId::ProgressBar
+            | WidgetId::Spinner
+            | WidgetId::Separator
+            | WidgetId::AddSpace
+            | WidgetId::EndRow
+            | WidgetId::Image => "Display",
+        },
+        Item::Container(c) => match c {
+            ContainerId::PanelTop
+            | ContainerId::PanelBottom
+            | ContainerId::PanelLeft
+            | ContainerId::PanelRight
+            | ContainerId::CentralPanel
+            | ContainerId::Window
+            | ContainerId::Modal
+            | ContainerId::DialogCall => "Panels",
+            ContainerId::Tabs
+            | ContainerId::TabsVertical
+            | ContainerId::TabPage
+            | ContainerId::MenuBar
+            | ContainerId::MenuButton => "Navigation",
+            ContainerId::Root
+            | ContainerId::Horizontal
+            | ContainerId::HorizontalWrapped
+            | ContainerId::Vertical
+            | ContainerId::VerticalCentered
+            | ContainerId::Grid
+            | ContainerId::ScrollArea
+            | ContainerId::CollapsingHeader
+            | ContainerId::Group
+            | ContainerId::Indent
+            | ContainerId::HorizontalCentered
+            | ContainerId::HorizontalTop
+            | ContainerId::VerticalCenteredJustified
+            | ContainerId::CenteredAndJustified
+            | ContainerId::Scope
+            | ContainerId::WithLayout
+            | ContainerId::AddEnabledUi
+            | ContainerId::Frame
+            | ContainerId::Columns
+            | ContainerId::Column
+            | ContainerId::Sides
+            | ContainerId::Side
+            | ContainerId::Flow
+            | ContainerId::FlowGroup
+            | ContainerId::Table
+            | ContainerId::TableRow
+            | ContainerId::TableCell => "Layout",
+        },
+    }
+}
+
+/// Does the palette filter `text` match the item (by label or egui name, any case)?
+pub fn matches_filter(item: Item, text: &str) -> bool {
+    let t = text.trim().to_lowercase();
+    if t.is_empty() {
+        return true;
+    }
+    let name = match item {
+        Item::Widget(w) => widget_def(w).name,
+        Item::Container(c) => container_def(c).name,
+    };
+    item.label().to_lowercase().contains(&t)
+        || name.contains(&t)
+        || category(item).to_lowercase().contains(&t)
+}
+
 /// What is being dragged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Payload {
@@ -127,14 +230,25 @@ pub struct Drop {
 }
 
 /// Do a container's children run across (left to right, wrapping into rows) or down?
-fn runs_across(def: ContainerId) -> bool {
+pub(crate) fn runs_across(def: ContainerId) -> bool {
     match def {
         ContainerId::Horizontal
         | ContainerId::HorizontalWrapped
         | ContainerId::HorizontalCentered
         | ContainerId::HorizontalTop
-        | ContainerId::Grid => true,
+        | ContainerId::Grid
+        | ContainerId::Columns
+        | ContainerId::Sides
+        | ContainerId::Side
+        | ContainerId::MenuBar
+        | ContainerId::TableRow => true,
         ContainerId::Root
+        | ContainerId::Modal
+        | ContainerId::Tabs
+        | ContainerId::TabsVertical
+        | ContainerId::TabPage
+        | ContainerId::Table
+        | ContainerId::TableCell
         | ContainerId::Vertical
         | ContainerId::VerticalCentered
         | ContainerId::VerticalCenteredJustified
@@ -153,6 +267,7 @@ fn runs_across(def: ContainerId) -> bool {
         | ContainerId::MenuButton
         | ContainerId::AddEnabledUi
         | ContainerId::Frame
+        | ContainerId::Column
         | ContainerId::Window
         | ContainerId::DialogCall
         | ContainerId::Flow
@@ -217,8 +332,24 @@ pub fn canvas_drop(
     let mut best = None;
     walk(form, &form.root, 0, rects, pos, moving, &mut best);
     let (_, target) = best?;
-    let drop = canvas_drop_at(form, rects, pos, moving, target);
-    drop.filter(|d| fits(form, d.parent, moving))
+    let drop = canvas_drop_at(form, rects, pos, moving, target).map(|d| beside_anchor(form, d));
+    drop.filter(|d| fits(form, d.parent, moving) && !in_moving(form, moving, d.parent))
+}
+
+/// An anchor wrapper holds its one node and nothing else: a drop into it goes beside it instead,
+/// before it at the start and after it otherwise. The line stays where it was shown.
+pub fn beside_anchor(form: &Form, drop: Drop) -> Drop {
+    if !form.is_anchor_wrapper(drop.parent) {
+        return drop;
+    }
+    match form.parent_of(drop.parent) {
+        Some((parent, at)) => Drop {
+            parent,
+            index: at + usize::from(drop.index > 0),
+            line: drop.line,
+        },
+        None => drop,
+    }
 }
 
 /// Can the moving node (or a new palette item, never a `Window`) go under `parent`? A dialog's root
@@ -414,6 +545,7 @@ pub fn outline_drop(form: &Form, rows: &[Row], pos: Pos2, moving: Option<NodeId>
             (false, None) => None,
         }
     }?;
+    let result = beside_anchor(form, result);
     (!in_moving(form, moving, result.parent) && fits(form, result.parent, moving)).then_some(result)
 }
 
@@ -461,6 +593,10 @@ fn field_hint(def: WidgetId) -> String {
         .unwrap_or_else(|| wd.name.to_string())
 }
 
+/// The line of a new Frame in light and in dark mode.
+pub const FRAME_LINE_LIGHT: [u8; 4] = [0xB4, 0xB4, 0xB4, 0xFF];
+pub const FRAME_LINE_DARK: [u8; 4] = [0x5A, 0x5A, 0x5A, 0xFF];
+
 /// A new node for a palette item, with fresh ids: a stateful widget bound to a new field of the
 /// form's state struct, a combo box with two items, and the containers whose id must be unique at
 /// runtime (grid, indent, panels) with one made from their node id.
@@ -499,12 +635,35 @@ pub fn new_node(form: &mut Form, item: Item) -> Node {
             node
         }
         Item::Container(def) => {
-            let mut node = form.new_container(def);
+            // Tabs bind a new `usize` field for the selected tab.
+            let mut node = if def.is_tabs() {
+                form.new_tabs(def)
+            } else {
+                form.new_container(def)
+            };
             let id = node.id.0;
-            if let NodeKind::Container { props, .. } = &mut node.kind
-                && let Some(PropValue::Text(name)) = props.get("id").cloned()
+            if def == ContainerId::Modal
+                && let NodeKind::Container { props, .. } = &mut node.kind
             {
-                props.insert("id", PropValue::Text(format!("{name}_{id}")));
+                props.insert(
+                    "id",
+                    PropValue::Expr(format!("{}Id::unique(\"modal_{id}\")", form.egui_path)),
+                );
+            }
+            if let NodeKind::Container { props, .. } = &mut node.kind {
+                if let Some(PropValue::Text(name)) = props.get("id").cloned() {
+                    props.insert("id", PropValue::Text(format!("{name}_{id}")));
+                }
+                // A bare `Frame::new()` draws nothing: a new one gets a margin, rounded corners
+                // and a thin line that suits light and dark mode.
+                if def == ContainerId::Frame {
+                    props.insert("inner_margin", PropValue::Float(8.0));
+                    props.insert("corner_radius", PropValue::Float(4.0));
+                    props.insert(
+                        "stroke",
+                        PropValue::stroke(1.0, FRAME_LINE_LIGHT, Some(FRAME_LINE_DARK)),
+                    );
+                }
             }
             node
         }
@@ -733,7 +892,40 @@ mod tests {
             value(&grid, "id"),
             Some(PropValue::Text(format!("grid_{}", grid.id.0)))
         );
-        assert_eq!(palette().len(), formust_model::ALL_WIDGETS.len() + 14);
+        // 17 containers before batch D, then Menu, Menu bar, Modal, the two Tabs and Table.
+        assert_eq!(palette().len(), formust_model::ALL_WIDGETS.len() + 23);
+        assert!(CATEGORIES.contains(&"Navigation"));
+        assert_eq!(
+            category(Item::Container(ContainerId::TabsVertical)),
+            "Navigation"
+        );
+        // Every item is in a group the palette shows.
+        for item in palette() {
+            assert!(CATEGORIES.contains(&category(item)), "{item:?}");
+        }
+        assert!(matches_filter(
+            Item::Container(ContainerId::Columns),
+            "colu"
+        ));
+        assert!(!matches_filter(Item::Widget(WidgetId::Label), "slider"));
+    }
+
+    /// A drop never goes into an anchor wrapper: before or after it, in its parent.
+    #[test]
+    fn a_drop_into_an_anchor_wrapper_goes_beside_it() {
+        let (mut f, mut rects, [root, a, ..]) = sample();
+        f.set_anchor(a, Some(formust_model::Anchor::Right)).unwrap();
+        let wrapper = f.anchor_host(a);
+        rects.insert(wrapper, r(0.0, 10.0, 400.0, 30.0));
+        // Over the wrapper, left of the label at its right: before the wrapper.
+        rects.insert(a, r(300.0, 10.0, 390.0, 30.0));
+        let d = canvas_drop(&f, &rects, pos2(100.0, 15.0), None).unwrap();
+        assert_eq!((d.parent, d.index), (root, 0));
+        let d = canvas_drop(&f, &rects, pos2(100.0, 25.0), None).unwrap();
+        assert_eq!((d.parent, d.index), (root, 1));
+        // Moving the anchored label means moving its wrapper; it never lands in itself.
+        let d = canvas_drop(&f, &rects, pos2(200.0, 300.0), Some(wrapper)).unwrap();
+        assert_eq!(d.parent, root);
     }
 
     #[test]

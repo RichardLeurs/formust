@@ -955,7 +955,8 @@ fn form_param(sig: &syn::Signature, block: &syn::Block) -> Option<Param> {
     ctx
 }
 
-/// Does the body have a top-level statement (or tail) `[egui::]Window::new(..)...show(ctx, |ui| ..)`?
+/// Does the body have a top-level statement (or tail) `[egui::]Window::new(..)...show(ctx, |ui| ..)`
+/// (or `[egui::]Modal::new(id)...show(ctx, |ui| ..)`)?
 /// That makes a method taking a `&Context` a dialog form, whatever its name. With no closure
 /// (`.show(ctx, add)`, a helper's own body) there is nothing to design, so it is not one.
 fn shows_window(block: &syn::Block, ctx: &str) -> bool {
@@ -976,7 +977,7 @@ fn shows_window(block: &syn::Block, ctx: &str) -> bool {
         let Some(show) = links.last() else {
             return false;
         };
-        ty == "Window"
+        (ty == "Window" || ty == "Modal")
             && ctor == "new"
             && show.method == "show"
             && show.args.len() == 2
@@ -1039,6 +1040,20 @@ pub(crate) fn owner_of(ty: &Type) -> Option<String> {
 /// A node's text from its original parts, ignoring `src`, for the check against the source.
 fn verbatim_text(node: &Node) -> String {
     match &node.kind {
+        // A column has no text of its own: its statements, as they follow each other.
+        NodeKind::Container {
+            def: ContainerId::Column,
+            children,
+            ..
+        } => {
+            let mut text = String::new();
+            for child in children {
+                text.push_str(&child.leading);
+                text.push_str(&verbatim_text(child));
+                text.push_str(&child.trailing);
+            }
+            text
+        }
         NodeKind::Container {
             children,
             closing,
@@ -1161,6 +1176,32 @@ fn flatten(expr: &Expr) -> Option<(&Expr, Vec<&ExprMethodCall>)> {
     Some((current, links))
 }
 
+/// A `Ui` receiver or argument: a name, or a column of `ui.columns(..)` as `cols[0]` (also passed
+/// as `&mut cols[0]`), written without spaces so it compares with the column's ident.
+fn ui_ref(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Index(ix) if ix.attrs.is_empty() => {
+            let base = single_ident(&ix.expr)?;
+            let Expr::Lit(lit) = &*ix.index else {
+                return None;
+            };
+            let Lit::Int(i) = &lit.lit else { return None };
+            if !i.suffix().is_empty() || !lit.attrs.is_empty() {
+                return None;
+            }
+            Some(format!("{base}[{}]", i.base10_digits()))
+        }
+        Expr::Reference(r)
+            if r.attrs.is_empty()
+                && r.mutability.is_some()
+                && matches!(*r.expr, Expr::Index(_)) =>
+        {
+            ui_ref(&r.expr)
+        }
+        _ => single_ident(expr),
+    }
+}
+
 fn single_ident(expr: &Expr) -> Option<String> {
     if let Expr::Path(p) = expr
         && p.qself.is_none()
@@ -1179,7 +1220,15 @@ fn type_path(path: &syn::Path) -> Option<(String, String, String)> {
     }
     let ctor = segments[segments.len() - 1].ident.to_string();
     let ty = segments[segments.len() - 2].ident.to_string();
-    let front = &segments[..segments.len() - 2];
+    let mut front = &segments[..segments.len() - 2];
+    // `egui::containers::Sides` is `egui::Sides` too; the prefix is egui's.
+    if ty == "Sides"
+        && front.len() >= 2
+        && front[front.len() - 1].ident == "containers"
+        && front[front.len() - 2].ident == "egui"
+    {
+        front = &front[..front.len() - 1];
+    }
     let prefix = if front.is_empty() {
         String::new()
     } else {
@@ -1254,27 +1303,55 @@ impl<'a> BodyCx<'a> {
         ident: &str,
         top: bool,
     ) -> (Vec<Node>, String, usize) {
+        self.block_from(block, inner, ident, top, 0)
+    }
+
+    /// [`Self::block`] from statement `skip` on: the ones before it belong to the head (a
+    /// container's body statements, see [`Self::body_props`]).
+    fn block_from(
+        &mut self,
+        block: &syn::Block,
+        inner: Range<usize>,
+        ident: &str,
+        top: bool,
+        skip: usize,
+    ) -> (Vec<Node>, String, usize) {
         let mut nodes: Vec<Node> = Vec::new();
-        let first = block
-            .stmts
-            .first()
-            .and_then(range_of)
-            .map_or(inner.end, |r| r.start);
-        let start = inner.start + inner_attrs_end(self.text(inner.start..first));
+        let start = match skip.checked_sub(1).and_then(|i| block.stmts.get(i)) {
+            Some(last) => range_of(last).map_or(inner.start, |r| r.end),
+            None => {
+                let first = block
+                    .stmts
+                    .first()
+                    .and_then(range_of)
+                    .map_or(inner.end, |r| r.start);
+                inner.start + inner_attrs_end(self.text(inner.start..first))
+            }
+        };
         let mut cursor = start;
         let count = block.stmts.len();
-        for (index, stmt) in block.stmts.iter().enumerate() {
+        let mut index = skip;
+        while index < count {
+            let stmt = &block.stmts[index];
             let Some(range) = range_of(stmt) else {
+                index += 1;
                 continue;
             };
             let gap = self.text(cursor..range.start);
             let leading = take_trailing(&mut nodes, gap);
             let is_tail = index + 1 == count;
-            let mut node = self.statement(stmt, range.clone(), ident, top, is_tail);
+            // A function's returned tail stays what it is.
+            let may_end = !(top && self.has_return);
+            let (mut node, used) = match self.tabs_at(&block.stmts[index..], ident, may_end) {
+                Some(found) => found,
+                None => (self.statement(stmt, range.clone(), ident, top, is_tail), 1),
+            };
+            let last = &block.stmts[index + used - 1];
             node.leading = leading.to_string();
-            node.bare_tail = is_bare_tail(stmt);
+            node.bare_tail = is_bare_tail(last);
             nodes.push(node);
-            cursor = range.end;
+            cursor = range_of(last).map_or(range.end, |r| r.end);
+            index += used;
         }
         let closing = take_trailing(&mut nodes, self.text(cursor..inner.end)).to_string();
         (nodes, closing, start)
@@ -1367,7 +1444,8 @@ impl<'a> BodyCx<'a> {
                 self.dialog_call(stmt, call, ident)
             }
             Expr::Macro(mac) => Err(macro_reason(&mac.mac)),
-            Expr::Field(_) => Err(base_reason(expr)),
+            // `ui.add_enabled_ui(e, |ui| ui.heading("x")).inner;`: a widget with a wrapper.
+            Expr::Field(_) => self.call(stmt, expr, id, ident),
             other => Err(expr_kind(other).to_string()),
         }
     }
@@ -1575,6 +1653,16 @@ impl<'a> BodyCx<'a> {
         let name = pat.ident.to_string();
         let mut events = Vec::new();
         let mut handlers = Vec::new();
+        // Initial focus: `if <ui>.memory(|m| m.focused().is_none()) { response.request_focus(); }`
+        // first, exactly as the emitter writes it (spaces aside).
+        let squeeze = |t: &str| t.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        let focus_text =
+            squeeze(&crate::emit::focus_statement(ident).replace("response.", &format!("{name}.")));
+        let focus = rest
+            .first()
+            .and_then(range_of)
+            .is_some_and(|r| squeeze(self.text(r)) == focus_text);
+        let rest = if focus { &rest[1..] } else { rest };
         for stmt in rest {
             let Stmt::Expr(Expr::If(branch), None) = stmt else {
                 return Err(plain());
@@ -1590,7 +1678,17 @@ impl<'a> BodyCx<'a> {
             events.push((event, self.text(range.start + 1..range.end - 1).to_string()));
             handlers.push(range);
         }
-        let parts = self.widget(&init.expr, ident).map_err(|_| plain())?;
+        let mut parts = self.widget(&init.expr, ident).map_err(|_| plain())?;
+        if focus {
+            let prop = widget_def(parts.def)
+                .props
+                .iter()
+                .find(|p| p.role == PropRole::InitialFocus)
+                .ok_or_else(plain)?;
+            parts.props.insert(prop.name, PropValue::Bool(true));
+        } else if events.is_empty() {
+            return Err(plain());
+        }
         self.refuse_comments(stmt, &handlers)?;
         Ok(widget_kind(parts, events))
     }
@@ -1628,6 +1726,9 @@ impl<'a> BodyCx<'a> {
         let Some((base, links)) = flatten(expr) else {
             return Err("very long method chain".to_string());
         };
+        if let Some(kind) = self.table(stmt, base, &links, ident) {
+            return Ok(kind);
+        }
         if let Some(result) = self.container(stmt, base, &links, id, ident) {
             return result;
         }
@@ -1645,7 +1746,7 @@ impl<'a> BodyCx<'a> {
         id: NodeId,
         ident: &str,
     ) -> Option<Result<NodeKind, String>> {
-        if let Some(name) = single_ident(base) {
+        if let Some(name) = ui_ref(base) {
             if name != ident {
                 return None;
             }
@@ -1658,6 +1759,9 @@ impl<'a> BodyCx<'a> {
             })?;
             if links.len() > 1 {
                 return Some(Err("container result used".to_string()));
+            }
+            if def == ContainerId::Columns {
+                return Some(self.columns(stmt, first, ident));
             }
             let (_, arg_props) = forms::container_forms(def).shorthand?;
             let args: Vec<&Expr> = first.args.iter().collect();
@@ -1725,9 +1829,11 @@ impl<'a> BodyCx<'a> {
         }
 
         // The last link must be `.show(ui, closure)`; anything after it uses the result.
-        let show_at = links
-            .iter()
-            .position(|l| matches!(l.method.to_string().as_str(), "show" | "show_inside"));
+        let shown_with = forms::show_method(def);
+        let show_at = links.iter().position(|l| {
+            let m = l.method.to_string();
+            m == shown_with || (shown_with == "show" && m == "show_inside")
+        });
         let Some(show_at) = show_at else {
             return Some(Err(format!("container show variant: {ty}::{ctor}")));
         };
@@ -1736,12 +1842,13 @@ impl<'a> BodyCx<'a> {
         }
         let show = links[show_at];
         let args: Vec<&Expr> = show.args.iter().collect();
-        if args.len() != 2 {
+        let closures = if def == ContainerId::Sides { 2 } else { 1 };
+        if args.len() != closures + 1 {
             return Some(Err(format!(
                 "container with unexpected arguments: {ty}.show"
             )));
         }
-        let Some(recv) = single_ident(args[0]) else {
+        let Some(recv) = ui_ref(args[0]) else {
             return Some(Err(format!(
                 "container receiver is not the current ui: {ty}"
             )));
@@ -1773,6 +1880,9 @@ impl<'a> BodyCx<'a> {
                         self.legacy_panels.push(id);
                     }
                 }
+                (Some(prop), n) if n > 1 && is_expr_builder(prop) => {
+                    props.insert(prop.name, PropValue::Expr(self.args_text(link)));
+                }
                 (Some(prop), 0) if matches!(prop.role, PropRole::Flag(_)) => {
                     props.insert(prop.name, PropValue::Bool(true));
                 }
@@ -1783,7 +1893,832 @@ impl<'a> BodyCx<'a> {
             self.legacy_panels.push(id);
         }
         self.first_path.get_or_insert(prefix);
+        if def == ContainerId::Sides {
+            return Some(self.sides(stmt, props, extra_chain, args[1], args[2], &recv));
+        }
         Some(self.finish_container(stmt, def, props, extra_chain, args[1], &recv))
+    }
+
+    /// `ui.columns(n, |cols| { cols[0].label(..); cols[1].button(..); })`: a Columns with one
+    /// Column per column, each holding the statements on its `cols[i]`. Only the exact shape is
+    /// read: a literal count, a braced body whose every statement uses one column (`cols[i]` with a
+    /// literal index below the count, and `cols` nowhere else), in column order. Anything else
+    /// (a computed count, a loop over the columns, statements that go back to an earlier column,
+    /// `columns_const`) stays custom code.
+    fn columns(
+        &mut self,
+        stmt: &Stmt,
+        call: &ExprMethodCall,
+        ident: &str,
+    ) -> Result<NodeKind, String> {
+        let args: Vec<&Expr> = call.args.iter().collect();
+        if args.len() != 2 {
+            return Err("container with unexpected arguments: ui.columns".to_string());
+        }
+        let not_literal = || "columns: the count is not a literal number".to_string();
+        let Expr::Lit(lit) = args[0] else {
+            return Err(not_literal());
+        };
+        let Lit::Int(int) = &lit.lit else {
+            return Err(not_literal());
+        };
+        if !matches!(int.suffix(), "" | "usize") {
+            return Err(not_literal());
+        }
+        let count: usize = int.base10_parse().map_err(|_| not_literal())?;
+        if count == 0 || count > formust_model::MAX_COLUMNS {
+            return Err(format!(
+                "columns: {count} columns (the designer reads 1 to {})",
+                formust_model::MAX_COLUMNS
+            ));
+        }
+        let closure = self.closure(args[1])?;
+        let ClosureBody::Block(block) = closure.body else {
+            return Err("columns: the closure has no braces".to_string());
+        };
+        let cols = closure.ident.clone();
+        let mut columns_of = Vec::new();
+        for st in &block.stmts {
+            let i = column_of(st.to_token_stream(), &cols)
+                .ok_or_else(|| format!("columns: a statement doesn't use exactly one {cols}[i]"))?;
+            if i >= count {
+                return Err(format!("columns: {cols}[{i}] is past the {count} columns"));
+            }
+            if columns_of.last().is_some_and(|&last| i < last) {
+                return Err("columns: the statements are not in column order".to_string());
+            }
+            columns_of.push(i);
+        }
+        self.refuse_comments(stmt, std::slice::from_ref(&closure.body_range))?;
+        let range = range_of(stmt).ok_or("statement has no tokens")?;
+        let body = closure.body_range.clone();
+        let inner = body.start + 1..body.end - 1;
+        let first = block
+            .stmts
+            .first()
+            .and_then(range_of)
+            .map_or(inner.end, |r| r.start);
+        if inner_attrs_end(self.text(inner.start..first)) != 0 {
+            return Err("columns: the body has inner attributes".to_string());
+        }
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut node_columns: Vec<usize> = Vec::new();
+        let mut cursor = inner.start;
+        let total = block.stmts.len();
+        let mut k = 0;
+        while k < total {
+            let (st, i) = (&block.stmts[k], columns_of[k]);
+            let Some(r) = range_of(st) else {
+                k += 1;
+                continue;
+            };
+            let gap = self.text(cursor..r.start);
+            let leading = take_trailing(&mut nodes, gap).to_string();
+            let column = format!("{cols}[{i}]");
+            // Tabs on one column: its bar and its `match` are both on `cols[i]`.
+            let same_next = columns_of.get(k + 1) == Some(&i);
+            let tabs = if same_next {
+                self.tabs_at(&block.stmts[k..], &column, true)
+            } else {
+                self.tabs_at(&block.stmts[k..k + 1], &column, true)
+            };
+            let (mut node, used) = match tabs {
+                Some(found) => found,
+                None => (
+                    self.statement(st, r.clone(), &column, false, k + 1 == total),
+                    1,
+                ),
+            };
+            let last = &block.stmts[k + used - 1];
+            node.leading = leading;
+            node.bare_tail = is_bare_tail(last);
+            nodes.push(node);
+            node_columns.push(i);
+            cursor = range_of(last).map_or(r.end, |r| r.end);
+            k += used;
+        }
+        let closing = take_trailing(&mut nodes, self.text(cursor..inner.end)).to_string();
+        let mut parts: Vec<Vec<Node>> = (0..count).map(|_| Vec::new()).collect();
+        for (node, i) in nodes.into_iter().zip(node_columns) {
+            parts[i].push(node);
+        }
+        // A column's range runs from its first statement to its last (empty: where it would be).
+        let mut at = inner.start;
+        let mut spans = Vec::new();
+        for kids in &parts {
+            let first = kids
+                .first()
+                .and_then(|k| self.ranges.get(&k.id))
+                .map(|r| r.start);
+            let last = kids
+                .last()
+                .and_then(|k| self.ranges.get(&k.id))
+                .map(|r| r.end);
+            let span = first.unwrap_or(at)..last.unwrap_or(at);
+            at = span.end;
+            spans.push(span);
+        }
+        let children = parts
+            .into_iter()
+            .zip(spans)
+            .enumerate()
+            .map(|(i, (kids, span))| Node {
+                id: {
+                    let id = self.alloc();
+                    self.ranges.insert(id, span);
+                    id
+                },
+                leading: String::new(),
+                trailing: String::new(),
+                bare_tail: false,
+                src: None,
+                kind: NodeKind::Container {
+                    def: ContainerId::Column,
+                    props: Props::new(),
+                    children: kids,
+                    closing: String::new(),
+                    extra_chain: Vec::new(),
+                    ident: format!("{cols}[{i}]"),
+                    recv: cols.clone(),
+                    closure: String::new(),
+                    braced: true,
+                    shell: None,
+                },
+            })
+            .collect();
+        let mut props = Props::new();
+        props.insert("count", PropValue::Int(count as i64));
+        Ok(NodeKind::Container {
+            def: ContainerId::Columns,
+            props,
+            children,
+            closing,
+            extra_chain: Vec::new(),
+            ident: cols,
+            recv: ident.to_string(),
+            closure: closure.text,
+            braced: true,
+            shell: Some(ContainerShell {
+                head: Some(self.text(range.start..inner.start).to_string()),
+                tail: self.text(inner.end..range.end).to_string(),
+            }),
+        })
+    }
+
+    /// Tabs at the start of `stmts`, in exactly the shape the emitter writes (whitespace aside,
+    /// and no comment outside the pages): a horizontal bar of `selectable_value`s (or buttons) on
+    /// one field followed by `match field { value => { .. } .. }` with the same values in the same
+    /// order (two statements), or the vertical form, one `ui.horizontal(..)` with the bar in a
+    /// `ui.vertical`, a separator, and the `match` in another `ui.vertical`. A final `_ => {}` arm
+    /// is allowed. Returns the node and the number of statements it takes. Anything else is left
+    /// to the ordinary rules, with nothing recorded.
+    fn tabs_at(&mut self, stmts: &[Stmt], ident: &str, may_end: bool) -> Option<(Node, usize)> {
+        let squeeze = |t: &str| t.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        let Some(Stmt::Expr(Expr::MethodCall(outer), Some(_))) = stmts.first() else {
+            return None;
+        };
+        if ui_ref(&outer.receiver).as_deref() != Some(ident)
+            || outer.method != "horizontal"
+            || outer.args.len() != 1
+            || outer.turbofish.is_some()
+            || !outer.attrs.is_empty()
+        {
+            return None;
+        }
+        let closure = self.closure(&outer.args[0]).ok()?;
+        let ClosureBody::Block(body) = closure.body else {
+            return None;
+        };
+        // The vertical form: `vertical(bar); separator(); vertical(match)` in one statement.
+        let on = |stmt: &Stmt, method: &str, args: usize| -> Option<ExprMethodCall> {
+            match stmt {
+                Stmt::Expr(Expr::MethodCall(m), Some(_))
+                    if m.method == method
+                        && m.args.len() == args
+                        && m.attrs.is_empty()
+                        && ui_ref(&m.receiver).as_deref() == Some(closure.ident.as_str()) =>
+                {
+                    Some(m.clone())
+                }
+                _ => None,
+            }
+        };
+        let vertical = match body.stmts.as_slice() {
+            [a, b, c] => (|| {
+                let bar = on(a, "vertical", 1)?;
+                on(b, "separator", 0)?;
+                let pages = on(c, "vertical", 1)?;
+                Some((bar, pages))
+            })(),
+            _ => None,
+        };
+        let (def, used, bar, match_expr, page_ui) = match &vertical {
+            Some((bar, pages)) => {
+                let bar = self.closure(&bar.args[0]).ok()?;
+                let ClosureBody::Block(bar_block) = bar.body else {
+                    return None;
+                };
+                let pages = self.closure(&pages.args[0]).ok()?;
+                let ClosureBody::Block(pages_block) = pages.body else {
+                    return None;
+                };
+                let [Stmt::Expr(Expr::Match(m), None)] = pages_block.stmts.as_slice() else {
+                    return None;
+                };
+                (
+                    ContainerId::TabsVertical,
+                    1,
+                    (bar.ident.clone(), bar_block),
+                    m,
+                    pages.ident.clone(),
+                )
+            }
+            None => {
+                let Some(Stmt::Expr(Expr::Match(m), None)) = stmts.get(1) else {
+                    return None;
+                };
+                (
+                    ContainerId::Tabs,
+                    2,
+                    (closure.ident.clone(), body),
+                    m,
+                    ident.to_string(),
+                )
+            }
+        };
+        if !may_end && stmts.len() == used {
+            return None;
+        }
+        let (style, path, items) = self.tab_bar(bar.1, &bar.0)?;
+        let field = &items.first()?.0;
+        if items.iter().any(|(f, ..)| squeeze(f) != squeeze(field))
+            || squeeze(&self.expr_text(&*match_expr.expr)) != squeeze(field)
+            || !match_expr.attrs.is_empty()
+        {
+            return None;
+        }
+        // The arms: one per tab, in the bar's order, each a braced page; then maybe `_ => {}`.
+        let mut arms: Vec<&syn::Arm> = match_expr.arms.iter().collect();
+        let wildcard = arms.last().is_some_and(|arm| {
+            matches!(arm.pat, Pat::Wild(_))
+                && matches!(&*arm.body, Expr::Block(b) if b.block.stmts.is_empty() && b.label.is_none() && b.attrs.is_empty())
+        });
+        if wildcard {
+            arms.pop();
+        }
+        if arms.len() != items.len() {
+            return None;
+        }
+        let mut blocks = Vec::new();
+        for (arm, (_, value, _)) in arms.iter().zip(&items) {
+            let Expr::Block(block) = &*arm.body else {
+                return None;
+            };
+            // A guard is part of the pattern in syn 3, so it fails the comparison with the value.
+            if !arm.attrs.is_empty()
+                || block.label.is_some()
+                || !block.attrs.is_empty()
+                || squeeze(&self.expr_text(&arm.pat)) != squeeze(value)
+            {
+                return None;
+            }
+            blocks.push(&block.block);
+        }
+        let bodies: Vec<Range<usize>> = blocks
+            .iter()
+            .map(|b| group_range(b.brace_token.span))
+            .collect();
+        let start = range_of(&stmts[0])?.start;
+        let end = range_of(&stmts[used - 1])?.end;
+        // No comment outside the pages: the bar and the `match` are regenerated on an edit.
+        if used == 2 {
+            let first_end = range_of(&stmts[0])?.end;
+            let second_start = range_of(&stmts[1])?.start;
+            if has_comment(self.src, stmts[0].to_token_stream(), &[])
+                || !self.text(first_end..second_start).trim().is_empty()
+                || has_comment(self.src, stmts[1].to_token_stream(), &bodies)
+            {
+                return None;
+            }
+        } else if has_comment(self.src, stmts[0].to_token_stream(), &bodies) {
+            return None;
+        }
+        let mut props = Props::new();
+        let label_def = container_def(def).prop("tabs")?;
+        let tabs: Vec<ComboItem> = items
+            .iter()
+            .map(|(_, value, label)| ComboItem {
+                value: value.trim().to_string(),
+                label: match lit(label) {
+                    Some(Lit::Str(s)) if s.suffix().is_empty() => PropValue::Text(s.value()),
+                    _ => PropValue::Expr(self.expr_text(*label)),
+                },
+            })
+            .collect();
+        let _ = label_def;
+        props.insert("field", PropValue::Expr(field.trim().to_string()));
+        props.insert("tabs", PropValue::Items(tabs));
+        props.insert("style", PropValue::Enum(style));
+        let brace = group_range(match_expr.brace_token.span);
+        let head_src = self.text(start..brace.start + 1);
+        let tail_src = self.text(brace.end - 1..end);
+        let (head, tail) = crate::emit::tabs_parts(
+            def,
+            &props,
+            ident,
+            "",
+            path.as_deref().unwrap_or("egui::"),
+            "\n",
+        );
+        if squeeze(&head) != squeeze(head_src) || squeeze(&tail) != squeeze(tail_src) {
+            return None;
+        }
+        // The shape is right: now the nodes.
+        if let Some(prefix) = path {
+            self.first_path.get_or_insert(prefix);
+        }
+        let id = self.alloc();
+        self.ranges.insert(id, start..end);
+        let mut pages = Vec::new();
+        let mut cursor = brace.start + 1;
+        for (arm, block) in arms.iter().zip(&blocks) {
+            let arm_range = range_of(*arm)?;
+            let body = group_range(block.brace_token.span);
+            let page_id = self.alloc();
+            self.ranges.insert(page_id, arm_range.clone());
+            let (children, closing, statements) =
+                self.block(block, body.start + 1..body.end - 1, &page_ui, false);
+            pages.push(Node {
+                id: page_id,
+                leading: self.text(cursor..arm_range.start).to_string(),
+                trailing: String::new(),
+                bare_tail: false,
+                src: Some(self.text(arm_range.clone()).to_string()),
+                kind: NodeKind::Container {
+                    def: ContainerId::TabPage,
+                    props: Props::new(),
+                    children,
+                    closing,
+                    extra_chain: Vec::new(),
+                    ident: page_ui.clone(),
+                    recv: page_ui.clone(),
+                    closure: String::new(),
+                    braced: true,
+                    shell: Some(ContainerShell {
+                        head: Some(self.text(arm_range.start..statements).to_string()),
+                        tail: self.text(body.end - 1..arm_range.end).to_string(),
+                    }),
+                },
+            });
+            cursor = arm_range.end;
+        }
+        let node = Node {
+            id,
+            leading: String::new(),
+            trailing: String::new(),
+            bare_tail: false,
+            src: Some(self.text(start..end).to_string()),
+            kind: NodeKind::Container {
+                def,
+                props,
+                children: pages,
+                closing: self.text(cursor..brace.end - 1).to_string(),
+                extra_chain: Vec::new(),
+                ident: page_ui,
+                recv: ident.to_string(),
+                closure: String::new(),
+                braced: true,
+                shell: Some(ContainerShell {
+                    head: Some(head_src.to_string()),
+                    tail: tail_src.to_string(),
+                }),
+            },
+        };
+        Some((node, used))
+    }
+
+    /// The statements of a tab bar on `ui`: all `ui.selectable_value(&mut field, value, label);`,
+    /// or all `if ui.add([egui::]Button::new(label)[.frame(false)].selected(field == value))
+    /// .clicked() { field = value; }`. Returns the style, the egui path of `Button` and, per tab,
+    /// the field's text, the value's text and the label.
+    #[allow(clippy::type_complexity)]
+    fn tab_bar<'b>(
+        &self,
+        block: &'b syn::Block,
+        ui: &str,
+    ) -> Option<(
+        &'static str,
+        Option<String>,
+        Vec<(String, String, &'b Expr)>,
+    )> {
+        let squeeze = |t: &str| t.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        let mut style = None;
+        let mut path = None;
+        let mut items = Vec::new();
+        for stmt in &block.stmts {
+            let (this, item) = match stmt {
+                Stmt::Expr(Expr::MethodCall(m), Some(_))
+                    if m.method == "selectable_value"
+                        && m.args.len() == 3
+                        && m.turbofish.is_none()
+                        && ui_ref(&m.receiver).as_deref() == Some(ui) =>
+                {
+                    let Expr::Reference(r) = &m.args[0] else {
+                        return None;
+                    };
+                    r.mutability?;
+                    (
+                        "selectable",
+                        (
+                            self.expr_text(&*r.expr),
+                            self.expr_text(&m.args[1]),
+                            &m.args[2],
+                        ),
+                    )
+                }
+                Stmt::Expr(Expr::If(branch), None) if branch.else_branch.is_none() => {
+                    let Expr::MethodCall(clicked) = &*branch.cond else {
+                        return None;
+                    };
+                    let Expr::MethodCall(add) = &*clicked.receiver else {
+                        return None;
+                    };
+                    if clicked.method != "clicked"
+                        || !clicked.args.is_empty()
+                        || add.method != "add"
+                        || add.args.len() != 1
+                        || ui_ref(&add.receiver).as_deref() != Some(ui)
+                    {
+                        return None;
+                    }
+                    let (base, links) = flatten(&add.args[0])?;
+                    let Expr::Call(call) = base else { return None };
+                    let Expr::Path(p) = &*call.func else {
+                        return None;
+                    };
+                    let (prefix, ty, ctor) = type_path(&p.path)?;
+                    if ty != "Button" || ctor != "new" || call.args.len() != 1 {
+                        return None;
+                    }
+                    let (frameless, selected) = match links.as_slice() {
+                        [sel] => (false, *sel),
+                        [frame, sel] if frame.method == "frame" => (true, *sel),
+                        _ => return None,
+                    };
+                    if selected.method != "selected" || selected.args.len() != 1 {
+                        return None;
+                    }
+                    let Expr::Binary(eq) = &selected.args[0] else {
+                        return None;
+                    };
+                    if !matches!(eq.op, syn::BinOp::Eq(_)) {
+                        return None;
+                    }
+                    let field = self.expr_text(&*eq.left);
+                    let value = self.expr_text(&*eq.right);
+                    // The handler sets the field to the value, and nothing else.
+                    let [Stmt::Expr(Expr::Assign(set), Some(_))] =
+                        branch.then_branch.stmts.as_slice()
+                    else {
+                        return None;
+                    };
+                    if squeeze(&self.expr_text(&*set.left)) != squeeze(&field)
+                        || squeeze(&self.expr_text(&*set.right)) != squeeze(&value)
+                    {
+                        return None;
+                    }
+                    if path.get_or_insert(prefix.clone()) != &prefix {
+                        return None;
+                    }
+                    (
+                        if frameless { "frameless" } else { "button" },
+                        (field, value, &call.args[0]),
+                    )
+                }
+                _ => return None,
+            };
+            if *style.get_or_insert(this) != this {
+                return None;
+            }
+            items.push(item);
+        }
+        Some((style?, path, items))
+    }
+
+    /// `egui_extras::TableBuilder::new(ui)..column(c)..[.header(h, |mut header| { header.col(|ui| {
+    /// .. }); .. })].body(|mut body| { body.row(h, |mut row| { row.col(|ui| { .. }); .. }); .. });`
+    /// in exactly the shape the emitter writes (whitespace aside, no comment outside the cells, the
+    /// same number of cells as columns in every row, one height for all body rows, only known
+    /// builder methods): a Table with its rows and cells. Anything else is left to the ordinary
+    /// rules, with nothing recorded.
+    fn table(
+        &mut self,
+        stmt: &Stmt,
+        base: &Expr,
+        links: &[&ExprMethodCall],
+        ident: &str,
+    ) -> Option<NodeKind> {
+        let squeeze = |t: &str| t.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        let Stmt::Expr(_, Some(_)) = stmt else {
+            return None;
+        };
+        let Expr::Call(call) = base else { return None };
+        let Expr::Path(path) = &*call.func else {
+            return None;
+        };
+        let names: Vec<String> = path
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
+        let [.., ty, ctor] = names.as_slice() else {
+            return None;
+        };
+        if ty != "TableBuilder"
+            || ctor != "new"
+            || call.args.len() != 1
+            || ui_ref(&call.args[0]).as_deref() != Some(ident)
+        {
+            return None;
+        }
+        let defs = container_def(ContainerId::Table).props;
+        let mut props = Props::new();
+        let mut columns = Vec::new();
+        let mut header: Option<(&Expr, &Expr)> = None;
+        let mut body: Option<&Expr> = None;
+        for link in links {
+            if body.is_some() || link.turbofish.is_some() {
+                return None;
+            }
+            let method = link.method.to_string();
+            match (method.as_str(), link.args.len()) {
+                ("column", 1) if header.is_none() => columns.push(ComboItem {
+                    value: self.expr_text(&link.args[0]),
+                    label: PropValue::Text(String::new()),
+                }),
+                ("header", 2) if header.is_none() => header = Some((&link.args[0], &link.args[1])),
+                ("body", 1) => body = Some(&link.args[0]),
+                (_, 1) if header.is_none() && columns.is_empty() => {
+                    let prop = find_builder_prop(defs, &method, &props)?;
+                    if !matches!(prop.role, PropRole::Builder(_)) {
+                        return None;
+                    }
+                    props.insert(prop.name, self.value(&link.args[0], prop));
+                }
+                _ => return None,
+            }
+        }
+        let body = body?;
+        if columns.is_empty() || columns.len() > formust_model::MAX_TABLE_COLUMNS {
+            return None;
+        }
+        // The cells of a row closure: `<param>.col(|ui| { .. });` each.
+        let cells_of = |closure: &'_ Expr| -> Option<Vec<Expr>> {
+            let Expr::Closure(c) = closure else {
+                return None;
+            };
+            let Expr::Block(block) = &*c.body else {
+                return None;
+            };
+            let [Pat::Ident(_)] = c.inputs.iter().collect::<Vec<_>>().as_slice() else {
+                return None;
+            };
+            let mut out = Vec::new();
+            for st in &block.block.stmts {
+                let Stmt::Expr(Expr::MethodCall(m), Some(_)) = st else {
+                    return None;
+                };
+                if m.method != "col" || m.args.len() != 1 {
+                    return None;
+                }
+                out.push(m.args[0].clone());
+            }
+            (out.len() == columns.len()).then_some(out)
+        };
+        let mut rows: Vec<(Range<usize>, Vec<Expr>)> = Vec::new();
+        if let Some((height, closure)) = header {
+            let prop = container_def(ContainerId::Table).prop("header")?;
+            props.insert(prop.name, self.value(height, prop));
+            rows.push((range_of(closure)?, cells_of(closure)?));
+        }
+        let Expr::Closure(body_closure) = body else {
+            return None;
+        };
+        let Expr::Block(body_block) = &*body_closure.body else {
+            return None;
+        };
+        let mut row_height: Option<&Expr> = None;
+        for st in &body_block.block.stmts {
+            let Stmt::Expr(Expr::MethodCall(m), Some(_)) = st else {
+                return None;
+            };
+            if m.method != "row" || m.args.len() != 2 {
+                return None;
+            }
+            match row_height {
+                Some(h) if squeeze(&self.expr_text(h)) != squeeze(&self.expr_text(&m.args[0])) => {
+                    return None;
+                }
+                _ => row_height = Some(&m.args[0]),
+            }
+            rows.push((range_of(st)?, cells_of(&m.args[1])?));
+        }
+        let row_height = row_height?;
+        if rows.len() - usize::from(header.is_some()) > formust_model::MAX_TABLE_ROWS {
+            return None;
+        }
+        let prop = container_def(ContainerId::Table).prop("row_height")?;
+        props.insert(prop.name, self.value(row_height, prop));
+        props.insert("columns", PropValue::Items(columns));
+        // Every cell a closure with braces; no comment outside the cells.
+        let mut bodies = Vec::new();
+        for (_, cells) in &rows {
+            for cell in cells {
+                let closure = self.closure(cell).ok()?;
+                let ClosureBody::Block(_) = closure.body else {
+                    return None;
+                };
+                bodies.push(closure.body_range.clone());
+            }
+        }
+        if has_comment(self.src, stmt.to_token_stream(), &bodies) {
+            return None;
+        }
+        // The nodes; undone if the text doesn't come out the same.
+        let saved_id = self.next_id;
+        let saved_custom = self.custom.len();
+        let mut row_nodes = Vec::new();
+        for (row_range, cells) in &rows {
+            let row_id = self.alloc();
+            self.ranges.insert(row_id, row_range.clone());
+            let mut cell_nodes = Vec::new();
+            for cell in cells {
+                let closure = self.closure(cell).ok()?;
+                let ClosureBody::Block(block) = closure.body else {
+                    return None;
+                };
+                let whole = range_of(cell)?;
+                let brace = closure.body_range.clone();
+                let cell_id = self.alloc();
+                self.ranges.insert(cell_id, whole.clone());
+                let (children, closing, statements) =
+                    self.block(block, brace.start + 1..brace.end - 1, &closure.ident, false);
+                cell_nodes.push(Node {
+                    id: cell_id,
+                    leading: String::new(),
+                    trailing: String::new(),
+                    bare_tail: false,
+                    src: Some(self.text(whole.clone()).to_string()),
+                    kind: NodeKind::Container {
+                        def: ContainerId::TableCell,
+                        props: Props::new(),
+                        children,
+                        closing,
+                        extra_chain: Vec::new(),
+                        ident: closure.ident.clone(),
+                        recv: closure.ident.clone(),
+                        closure: closure.text.clone(),
+                        braced: true,
+                        shell: Some(ContainerShell {
+                            head: Some(self.text(whole.start..statements).to_string()),
+                            tail: self.text(brace.end - 1..whole.end).to_string(),
+                        }),
+                    },
+                });
+            }
+            row_nodes.push(Node {
+                id: row_id,
+                leading: String::new(),
+                trailing: String::new(),
+                bare_tail: false,
+                src: Some(self.text(row_range.clone()).to_string()),
+                kind: NodeKind::Container {
+                    def: ContainerId::TableRow,
+                    props: Props::new(),
+                    children: cell_nodes,
+                    closing: String::new(),
+                    extra_chain: Vec::new(),
+                    ident: ident.to_string(),
+                    recv: ident.to_string(),
+                    closure: String::new(),
+                    braced: true,
+                    shell: None,
+                },
+            });
+        }
+        let kind = NodeKind::Container {
+            def: ContainerId::Table,
+            props,
+            children: row_nodes,
+            closing: String::new(),
+            extra_chain: Vec::new(),
+            ident: ident.to_string(),
+            recv: ident.to_string(),
+            closure: String::new(),
+            braced: true,
+            shell: None,
+        };
+        let check = Node {
+            id: NodeId(u32::MAX),
+            leading: String::new(),
+            trailing: String::new(),
+            bare_tail: false,
+            src: None,
+            kind,
+        };
+        let range = range_of(stmt)?;
+        let written = crate::emit::table_text_for(&check, ident, "egui::", "\n");
+        if squeeze(&written) != squeeze(self.text(range)) {
+            self.next_id = saved_id;
+            self.custom.truncate(saved_custom);
+            self.ranges.retain(|id, _| id.0 < saved_id);
+            self.legacy_panels.retain(|id| id.0 < saved_id);
+            return None;
+        }
+        Some(check.kind)
+    }
+
+    /// `egui::Sides::new()..show(ui, |ui| { .. }, |ui| { .. })`: a Sides holding its two closures as
+    /// Side containers, left then right. Both need braces.
+    fn sides(
+        &mut self,
+        stmt: &Stmt,
+        props: Props,
+        extra_chain: Vec<String>,
+        left: &Expr,
+        right: &Expr,
+        recv: &str,
+    ) -> Result<NodeKind, String> {
+        let mut closures = Vec::new();
+        for e in [left, right] {
+            let closure = self.closure(e).map_err(|e| format!("Sides: {e}"))?;
+            let ClosureBody::Block(block) = closure.body else {
+                return Err("Sides: a closure has no braces".to_string());
+            };
+            let whole = range_of(e).ok_or("closure has no tokens")?;
+            closures.push((
+                closure.ident,
+                closure.text,
+                block,
+                closure.body_range,
+                whole,
+            ));
+        }
+        let bodies: Vec<Range<usize>> = closures.iter().map(|c| c.3.clone()).collect();
+        self.refuse_comments(stmt, &bodies)?;
+        let range = range_of(stmt).ok_or("statement has no tokens")?;
+        let mut sides = Vec::new();
+        let mut cursor: Option<usize> = None;
+        for (ident, closure, block, body, whole) in closures {
+            let id = self.alloc();
+            self.ranges.insert(id, whole.clone());
+            let (children, closing, statements) =
+                self.block(block, body.start + 1..body.end - 1, &ident, false);
+            let leading =
+                cursor.map_or_else(String::new, |c| self.text(c..whole.start).to_string());
+            sides.push(Node {
+                id,
+                leading,
+                trailing: String::new(),
+                bare_tail: false,
+                src: Some(self.text(whole.clone()).to_string()),
+                kind: NodeKind::Container {
+                    def: ContainerId::Side,
+                    props: Props::new(),
+                    children,
+                    closing,
+                    extra_chain: Vec::new(),
+                    ident,
+                    recv: recv.to_string(),
+                    closure,
+                    braced: true,
+                    shell: Some(ContainerShell {
+                        head: Some(self.text(whole.start..statements).to_string()),
+                        tail: self.text(body.end - 1..whole.end).to_string(),
+                    }),
+                },
+            });
+            cursor = Some(whole.end);
+        }
+        let left_start = range_of(left).ok_or("closure has no tokens")?.start;
+        Ok(NodeKind::Container {
+            def: ContainerId::Sides,
+            props,
+            children: sides,
+            closing: String::new(),
+            extra_chain,
+            ident: recv.to_string(),
+            recv: recv.to_string(),
+            closure: String::new(),
+            braced: true,
+            shell: Some(ContainerShell {
+                head: Some(self.text(range.start..left_start).to_string()),
+                tail: self
+                    .text(cursor.unwrap_or(range.end)..range.end)
+                    .to_string(),
+            }),
+        })
     }
 
     /// A dialog helper call, `crate::style::dialog(ctx, "about", |ui| { .. })`: the call up to its
@@ -1814,7 +2749,7 @@ impl<'a> BodyCx<'a> {
         &mut self,
         stmt: &Stmt,
         def: ContainerId,
-        props: Props,
+        mut props: Props,
         extra_chain: Vec<String>,
         closure: &Expr,
         recv: &str,
@@ -1826,8 +2761,18 @@ impl<'a> BodyCx<'a> {
         let (head, tail, children, closing, braced) = match closure.body {
             ClosureBody::Block(block) => {
                 let tail = self.text(body.end - 1..range.end).to_string();
-                let (children, closing, statements) =
-                    self.block(block, body.start + 1..body.end - 1, &closure.ident, false);
+                // Spacing and size statements opening the body are the container's properties;
+                // their text joins the head, which an edit of the properties regenerates.
+                let (statements_props, skip) =
+                    self.body_props(block, body.start + 1, &closure.ident, def);
+                props.extend(statements_props);
+                let (children, closing, statements) = self.block_from(
+                    block,
+                    body.start + 1..body.end - 1,
+                    &closure.ident,
+                    false,
+                    skip,
+                );
                 let head = self.text(range.start..statements).to_string();
                 (head, tail, children, closing, true)
             }
@@ -1856,6 +2801,42 @@ impl<'a> BodyCx<'a> {
                 tail,
             }),
         })
+    }
+
+    /// The statements at the start of a container's body that are its properties:
+    /// `<ui>.set_min_width(<v>);` ([`PropRole::UiSet`]) and `<ui>.spacing_mut().<f> = <v>;`
+    /// ([`PropRole::Spacing`]), on the body's own `Ui`. They stop at the first other statement, a
+    /// comment or attribute before one, a comment inside one, or a property seen twice, so nothing
+    /// but these statements and white space goes into the head. Returns them and their count.
+    fn body_props(
+        &self,
+        block: &syn::Block,
+        inner_start: usize,
+        ui: &str,
+        def: ContainerId,
+    ) -> (Props, usize) {
+        let defs = container_def(def).props;
+        let mut props = Props::new();
+        let mut cursor = inner_start;
+        let mut count = 0;
+        for stmt in &block.stmts {
+            let Some(range) = range_of(stmt) else { break };
+            if !self.text(cursor..range.start).trim().is_empty()
+                || has_comment(self.src, stmt.to_token_stream(), &[])
+            {
+                break;
+            }
+            let Some((prop, value)) = body_statement(stmt, ui, defs) else {
+                break;
+            };
+            if props.contains_key(prop.name) {
+                break;
+            }
+            props.insert(prop.name, self.value(value, prop));
+            cursor = range.end;
+            count += 1;
+        }
+        (props, count)
     }
 
     fn closure<'e>(&self, expr: &'e Expr) -> Result<ClosureParts<'e>, String> {
@@ -1907,7 +2888,22 @@ impl<'a> BodyCx<'a> {
         if let Expr::Call(_) = base {
             return self.combo_box(base, &links, ident);
         }
-        let Some(name) = single_ident(base) else {
+        // `ui.add_enabled_ui(e, |ui| <widget>).inner` and the visible `ui.scope(..).inner`: what
+        // the emitter writes for a widget that has no `ui.add` form, or more than one wrapper.
+        if let Expr::Field(field) = base
+            && let Some(result) = self.ui_wrapper(field, ident)
+        {
+            let mut parts = result?;
+            let mut previous_end = range_of(base).ok_or("chain has no tokens")?.end;
+            for link in &links {
+                let end = range_of(*link).ok_or("chain has no tokens")?.end;
+                let text = self.text(previous_end..end).trim_start().to_string();
+                previous_end = end;
+                self.response_link(&mut parts, link, text);
+            }
+            return Ok(parts);
+        }
+        let Some(name) = ui_ref(base) else {
             return Err(base_reason(base));
         };
         if name != ident {
@@ -1930,12 +2926,148 @@ impl<'a> BodyCx<'a> {
         let mut previous_end = range_of(*first).ok_or("chain has no tokens")?.end;
         for link in &links[1..] {
             let end = range_of(*link).ok_or("chain has no tokens")?.end;
-            parts
-                .response_chain
-                .push(self.text(previous_end..end).trim_start().to_string());
+            let text = self.text(previous_end..end).trim_start().to_string();
             previous_end = end;
+            self.response_link(&mut parts, link, text);
         }
         Ok(parts)
+    }
+
+    /// A method on a widget's response: a property such as the tooltip
+    /// (`.on_hover_text("..")`) while nothing unknown came before it, else kept verbatim.
+    fn response_link(&self, parts: &mut WidgetParts, link: &ExprMethodCall, text: String) {
+        let method = link.method.to_string();
+        let prop = widget_def(parts.def)
+            .props
+            .iter()
+            .find(|p| matches!(p.role, PropRole::Response(m) if m == method));
+        if let Some(prop) = prop
+            && parts.response_chain.is_empty()
+            && link.args.len() == 1
+            && link.turbofish.is_none()
+            && !parts.props.contains_key(prop.name)
+        {
+            let value = self.value(&link.args[0], prop);
+            parts.props.insert(prop.name, value);
+            return;
+        }
+        parts.response_chain.push(text);
+    }
+
+    /// `<ui>.add_enabled_ui(<e>, |<ui>| <widget>).inner` or
+    /// `<ui>.scope(|<ui>| { if !(<v>) { <ui>.set_invisible(); } <widget> }).inner`, `field` being
+    /// the `.inner`. `None` if it isn't one of these shapes; an error if it is, around something
+    /// that can't be a widget with that property.
+    fn ui_wrapper(
+        &mut self,
+        field: &syn::ExprField,
+        ident: &str,
+    ) -> Option<Result<WidgetParts, String>> {
+        let syn::Member::Named(member) = &field.member else {
+            return None;
+        };
+        let Expr::MethodCall(call) = &*field.base else {
+            return None;
+        };
+        if member != "inner"
+            || !field.attrs.is_empty()
+            || ui_ref(&call.receiver).as_deref() != Some(ident)
+            || call.turbofish.is_some()
+        {
+            return None;
+        }
+        // Inside the closures the `Ui` is their parameter: the same name, or any name where the
+        // outer `Ui` is a column `cols[0]`, which can't name a parameter.
+        let inner_ident = if formust_model::is_plain_ui(ident) {
+            ident.to_string()
+        } else {
+            match call.args.last() {
+                Some(Expr::Closure(c)) => match c.inputs.first() {
+                    Some(Pat::Ident(p)) => p.ident.to_string(),
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        };
+        let outer_ident = ident;
+        let ident = inner_ident.as_str();
+        let used = || Err("container result used".to_string());
+        // The closure `|ui| ..` on the same `Ui` name, and its body's statements.
+        let body = |closure: &Expr| -> Option<Vec<Stmt>> {
+            let Expr::Closure(c) = closure else {
+                return None;
+            };
+            let [Pat::Ident(param)] = c.inputs.iter().collect::<Vec<_>>()[..] else {
+                return None;
+            };
+            if param.ident != ident
+                || param.by_ref.is_some()
+                || param.mutability.is_some()
+                || param.subpat.is_some()
+                || c.capture.is_some()
+                || !matches!(c.output, ReturnType::Default)
+            {
+                return None;
+            }
+            match &*c.body {
+                Expr::Block(b) if b.label.is_none() && b.attrs.is_empty() => {
+                    Some(b.block.stmts.clone())
+                }
+                Expr::Block(_) => None,
+                other => Some(vec![Stmt::Expr(other.clone(), None)]),
+            }
+        };
+        let (role, cond, inner) = match (call.method.to_string().as_str(), call.args.len()) {
+            ("add_enabled_ui", 2) => {
+                let stmts = body(&call.args[1])?;
+                let [Stmt::Expr(inner, None)] = &stmts[..] else {
+                    return Some(used());
+                };
+                (PropRole::AddEnabled, call.args[0].clone(), inner.clone())
+            }
+            ("scope", 1) => {
+                let stmts = body(&call.args[0])?;
+                let [Stmt::Expr(Expr::If(test), None), Stmt::Expr(inner, None)] = &stmts[..] else {
+                    return None;
+                };
+                let Expr::Unary(not) = &*test.cond else {
+                    return None;
+                };
+                let hides = match &test.then_branch.stmts[..] {
+                    [Stmt::Expr(Expr::MethodCall(m), Some(_))] => {
+                        m.method == "set_invisible"
+                            && m.args.is_empty()
+                            && single_ident(&m.receiver).as_deref() == Some(ident)
+                    }
+                    _ => false,
+                };
+                if !matches!(not.op, UnOp::Not(_)) || test.else_branch.is_some() || !hides {
+                    return None;
+                }
+                let cond = match &*not.expr {
+                    Expr::Paren(p) if p.attrs.is_empty() => (*p.expr).clone(),
+                    other => other.clone(),
+                };
+                (PropRole::AddVisible, cond, inner.clone())
+            }
+            _ => return None,
+        };
+        let mut parts = match self.widget(&inner, ident) {
+            Ok(parts) => parts,
+            Err(_) => return Some(used()),
+        };
+        parts.recv = outer_ident.to_string();
+        let Some(prop) = widget_def(parts.def)
+            .props
+            .iter()
+            .find(|p| p.role == role)
+            .filter(|p| !parts.props.contains_key(p.name))
+        else {
+            return Some(used());
+        };
+        let value = self.value(&cond, prop);
+        parts.props.insert(prop.name, value);
+        Some(Ok(parts))
     }
 
     fn shorthand(
@@ -1956,7 +3088,7 @@ impl<'a> BodyCx<'a> {
                 let mut props = Props::new();
                 for (prop_name, arg) in arg_props.iter().zip(call.args.iter()) {
                     let prop = wdef.prop(prop_name).ok_or("registry has no such prop")?;
-                    props.insert(prop.name, self.value(arg, prop));
+                    self.widget_arg(wdef.props, prop, arg, &mut props);
                 }
                 return Ok(WidgetParts {
                     def,
@@ -2037,7 +3169,7 @@ impl<'a> BodyCx<'a> {
         let mut props = Props::new();
         for (name, arg) in arg_props.iter().zip(call.args.iter()) {
             let prop = wdef.prop(name).ok_or("registry has no such prop")?;
-            props.insert(prop.name, self.value(arg, prop));
+            self.widget_arg(wdef.props, prop, arg, &mut props);
         }
         let extra_chain = self.builder_chain(wdef.props, base, &links, &mut props)?;
         self.first_path.get_or_insert(prefix);
@@ -2070,6 +3202,9 @@ impl<'a> BodyCx<'a> {
                 (Some(prop), 1) if matches!(prop.role, PropRole::Builder(_)) => {
                     let value = self.value(&link.args[0], prop);
                     props.insert(prop.name, value);
+                }
+                (Some(prop), n) if n > 1 && is_expr_builder(prop) => {
+                    props.insert(prop.name, PropValue::Expr(self.args_text(link)));
                 }
                 (Some(prop), 0) if matches!(prop.role, PropRole::Flag(_)) => {
                     props.insert(prop.name, PropValue::Bool(true));
@@ -2126,7 +3261,7 @@ impl<'a> BodyCx<'a> {
                 format!("ComboBox variant: {}", show.method)
             });
         }
-        if single_ident(&show.args[0]).as_deref() != Some(ident) {
+        if ui_ref(&show.args[0]).as_deref() != Some(ident) {
             return Err("container receiver is not the current ui: ComboBox".to_string());
         }
         let closure = self
@@ -2179,11 +3314,174 @@ impl<'a> BodyCx<'a> {
         })
     }
 
+    /// A widget's positional argument. The `text` of a widget with text styling may be
+    /// `egui::RichText::new(<text>).size(..).strong()..`: then the text and each method are
+    /// properties, if every method is one of them, each once; otherwise the argument is kept whole.
+    fn widget_arg(
+        &mut self,
+        defs: &'static [PropDef],
+        prop: &'static PropDef,
+        arg: &Expr,
+        props: &mut Props,
+    ) {
+        if prop.name == "text"
+            && defs.iter().any(|d| matches!(d.role, PropRole::Rich(_)))
+            && let Some((text, styles, prefix)) = self.rich_text(defs, prop, arg)
+        {
+            props.insert(prop.name, text);
+            props.extend(styles);
+            self.first_path.get_or_insert(prefix);
+            return;
+        }
+        props.insert(prop.name, self.value(arg, prop));
+    }
+
+    /// `[egui::]RichText::new(<text>)` and its known methods: the text, the style properties and the
+    /// path prefix.
+    fn rich_text(
+        &self,
+        defs: &'static [PropDef],
+        text_prop: &PropDef,
+        arg: &Expr,
+    ) -> Option<(PropValue, Props, String)> {
+        let (base, links) = flatten(arg)?;
+        let Expr::Call(call) = base else { return None };
+        let Expr::Path(path) = &*call.func else {
+            return None;
+        };
+        let (prefix, ty, ctor) = type_path(&path.path)?;
+        if ty != "RichText" || ctor != "new" || call.args.len() != 1 || !call.attrs.is_empty() {
+            return None;
+        }
+        let mut styles = Props::new();
+        for link in &links {
+            let method = link.method.to_string();
+            let prop = defs
+                .iter()
+                .find(|d| matches!(d.role, PropRole::Rich(m) if m == method))?;
+            if styles.contains_key(prop.name) || link.turbofish.is_some() {
+                return None;
+            }
+            let value = match (prop.kind, link.args.len()) {
+                (PropKind::Bool, 0) => PropValue::Bool(true),
+                (PropKind::Bool, _) | (_, 0) => return None,
+                (_, 1) => self.value(&link.args[0], prop),
+                _ => return None,
+            };
+            styles.insert(prop.name, value);
+        }
+        Some((self.value(&call.args[0], text_prop), styles, prefix))
+    }
+
+    /// All arguments of a call as written, from the first to the last: `egui::Align2::LEFT_TOP, [0.0, 0.0]`.
+    fn args_text(&self, call: &ExprMethodCall) -> String {
+        let first = call.args.first().and_then(range_of);
+        let last = call.args.last().and_then(range_of);
+        match (first, last) {
+            (Some(a), Some(b)) => self.text(a.start..b.end).to_string(),
+            _ => String::new(),
+        }
+    }
+
     /// An argument's value: typed if it is a literal of the property's kind, else its source text.
     fn value(&self, expr: &Expr, prop: &PropDef) -> PropValue {
         literal_value(expr, prop, &self.current_ui)
             .unwrap_or_else(|| PropValue::Expr(self.expr_text(expr)))
     }
+}
+
+/// `<ui>.<m>(<v>);` for a [`PropRole::UiSet`] property `m`, or `<ui>.spacing_mut().<f> = <v>;` for a
+/// [`PropRole::Spacing`] one: the property and the value's expression.
+fn body_statement<'s>(
+    stmt: &'s Stmt,
+    ui: &str,
+    defs: &'static [PropDef],
+) -> Option<(&'static PropDef, &'s Expr)> {
+    let Stmt::Expr(expr, Some(_)) = stmt else {
+        return None;
+    };
+    match expr {
+        Expr::MethodCall(call)
+            if call.attrs.is_empty()
+                && call.turbofish.is_none()
+                && call.args.len() == 1
+                && ui_ref(&call.receiver).as_deref() == Some(ui) =>
+        {
+            let method = call.method.to_string();
+            let prop = defs
+                .iter()
+                .find(|d| matches!(d.role, PropRole::UiSet(m) if m == method))?;
+            Some((prop, &call.args[0]))
+        }
+        Expr::Assign(assign) if assign.attrs.is_empty() => {
+            let Expr::Field(field) = &*assign.left else {
+                return None;
+            };
+            let (syn::Member::Named(name), Expr::MethodCall(call)) = (&field.member, &*field.base)
+            else {
+                return None;
+            };
+            if call.method != "spacing_mut"
+                || !call.args.is_empty()
+                || call.turbofish.is_some()
+                || !field.attrs.is_empty()
+                || ui_ref(&call.receiver).as_deref() != Some(ui)
+            {
+                return None;
+            }
+            let name = name.to_string();
+            let prop = defs
+                .iter()
+                .find(|d| matches!(d.role, PropRole::Spacing(f) if f == name))?;
+            Some((prop, &assign.right))
+        }
+        _ => None,
+    }
+}
+
+/// The one column a statement of `ui.columns(..)` uses: every `cols` in it is `cols[<literal>]` with
+/// the same literal. `None` for none, several, or another use of `cols`.
+fn column_of(stream: TokenStream, cols: &str) -> Option<usize> {
+    fn walk(stream: TokenStream, cols: &str, found: &mut Option<usize>) -> bool {
+        let tokens: Vec<TokenTree> = stream.into_iter().collect();
+        let mut k = 0;
+        while k < tokens.len() {
+            match &tokens[k] {
+                TokenTree::Ident(i) if i == cols => {
+                    let Some(TokenTree::Group(g)) = tokens.get(k + 1) else {
+                        return false;
+                    };
+                    if g.delimiter() != Delimiter::Bracket {
+                        return false;
+                    }
+                    let inner: Vec<TokenTree> = g.stream().into_iter().collect();
+                    let [TokenTree::Literal(lit)] = &inner[..] else {
+                        return false;
+                    };
+                    let text = lit.to_string();
+                    let text = text.strip_suffix("usize").unwrap_or(&text);
+                    let Ok(index) = text.parse::<usize>() else {
+                        return false;
+                    };
+                    if found.is_some_and(|f| f != index) {
+                        return false;
+                    }
+                    *found = Some(index);
+                    k += 2;
+                }
+                TokenTree::Group(g) => {
+                    if !walk(g.stream(), cols, found) {
+                        return false;
+                    }
+                    k += 1;
+                }
+                _ => k += 1,
+            }
+        }
+        true
+    }
+    let mut found = None;
+    walk(stream, cols, &mut found).then_some(found).flatten()
 }
 
 /// A statement's trailing same-line comment moves from the gap to the node before it. The rest of
@@ -2329,6 +3627,12 @@ fn find_builder_prop(
         .filter(|p| !props.contains_key(p.name))
 }
 
+/// A builder property holding an expression, which takes a call's arguments as one text when the
+/// method has several (`Window::anchor(align, offset)`); the emitter writes them back as they are.
+fn is_expr_builder(prop: &PropDef) -> bool {
+    matches!(prop.role, PropRole::Builder(_)) && prop.kind == PropKind::Expr
+}
+
 fn legacy_panel_method(method: &str) -> Option<&'static str> {
     LEGACY_PANEL_METHODS
         .iter()
@@ -2384,8 +3688,37 @@ fn literal_value(expr: &Expr, prop: &PropDef, ui: &str) -> Option<PropValue> {
             Some(rgba) => Some(PropValue::color(rgba)),
             None => color_pair(expr, ui),
         },
-        PropKind::Expr | PropKind::Items => None,
+        PropKind::Stroke => stroke_literal(expr, ui),
+        PropKind::Expr | PropKind::Items | PropKind::Vec2 => None,
     }
+}
+
+/// `[egui::]Stroke::new(<float>, <colour>)` with a literal width and a colour [`literal_value`]
+/// reads (one, or a light and dark pair on the current `ui`). Others stay `Expr`.
+fn stroke_literal(expr: &Expr, ui: &str) -> Option<PropValue> {
+    let Expr::Call(call) = expr else { return None };
+    let Expr::Path(path) = &*call.func else {
+        return None;
+    };
+    let (_, ty, ctor) = type_path(&path.path)?;
+    if ty != "Stroke" || ctor != "new" || call.args.len() != 2 || !call.attrs.is_empty() {
+        return None;
+    }
+    let width = match lit(&call.args[0])? {
+        Lit::Float(f) if f.suffix().is_empty() => f.base10_parse::<f64>().ok()?,
+        _ => return None,
+    };
+    let color = &call.args[1];
+    let (light, dark) = match color_literal(color) {
+        Some(rgba) => (rgba, None),
+        None => match color_pair(color, ui)? {
+            PropValue::Color { light, dark } => (light, dark),
+            _ => return None,
+        },
+    };
+    width
+        .is_finite()
+        .then_some(PropValue::stroke(width, light, dark))
 }
 
 fn lit(expr: &Expr) -> Option<&Lit> {
@@ -2421,7 +3754,7 @@ fn color_pair(expr: &Expr, ui: &str) -> Option<PropValue> {
     if member != "dark_mode"
         || call.method != "visuals"
         || !call.args.is_empty()
-        || single_ident(&call.receiver).as_deref() != Some(ui)
+        || ui_ref(&call.receiver).as_deref() != Some(ui)
     {
         return None;
     }
@@ -2505,7 +3838,7 @@ fn local_reason(local: &syn::Local, ident: &str) -> String {
     let Some((base, links)) = flatten(&init.expr) else {
         return "let: plain".to_string();
     };
-    if single_ident(base).as_deref() == Some(ident) && !links.is_empty() {
+    if ui_ref(base).as_deref() == Some(ident) && !links.is_empty() {
         let method = links[0].method.to_string();
         let is_container = ALL_CONTAINERS.iter().any(|&c| {
             forms::container_forms(c)

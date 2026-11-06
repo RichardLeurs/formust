@@ -16,6 +16,7 @@
 //! `.frm.rs` tab shows its own forms, compared with its source for the conflict state. An open
 //! tab's text wins over the disk. A form file that doesn't parse blocks the designer.
 
+pub mod align;
 pub mod edit;
 pub mod export;
 pub mod preview;
@@ -27,7 +28,8 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui::{Rect, Vec2};
 use formust_model::{
-    ContainerId, EditError, Form, Node, NodeId, NodeKind, PropValue, container_def, widget_def,
+    Anchor, ContainerId, EditError, Form, Node, NodeId, NodeKind, PropValue, SizeRequest,
+    container_def, is_fill, widget_def,
 };
 use formust_rust::{Conflict, FileKind, Header, ImportedForm, Origin, Severity, file_kind};
 
@@ -134,9 +136,32 @@ impl Loaded {
     }
 }
 
-/// Reads `text` (the file at `path`) for the designer. `companion` is the other file of the pair,
-/// with its text: the form file of a source, or the source of a form file.
+/// The importer's options for the designer: `extended` reads control flow (`if`, `for`, `match`..)
+/// holding widgets and `let x = <widget>;` as nodes (`ImportOptions::extended`), else they are
+/// locked custom code.
+pub fn import_options(extended: bool) -> formust_rust::ImportOptions {
+    formust_rust::ImportOptions {
+        extended,
+        ..formust_rust::ImportOptions::default()
+    }
+}
+
+/// [`load_with`] with extended import off, as the designer starts.
+#[cfg(test)]
 pub fn load(path: &Path, text: &str, companion: Option<(&Path, &str)>) -> Loaded {
+    load_with(path, text, companion, false)
+}
+
+/// Reads `text` (the file at `path`) for the designer. `companion` is the other file of the pair,
+/// with its text: the form file of a source, or the source of a form file. `extended` is the
+/// designer's extended import switch (see [`Designer::extended`]).
+pub fn load_with(
+    path: &Path,
+    text: &str,
+    companion: Option<(&Path, &str)>,
+    extended: bool,
+) -> Loaded {
+    let options = import_options(extended);
     let mut out = Loaded {
         path: path.to_path_buf(),
         companion: companion.map(|(p, _)| p.to_path_buf()),
@@ -153,7 +178,7 @@ pub fn load(path: &Path, text: &str, companion: Option<(&Path, &str)>) -> Loaded
     };
     match file_kind(path) {
         FileKind::Form => {
-            let frm = match formust_rust::parse_frm(text) {
+            let frm = match formust_rust::parse_frm_with(text, options) {
                 Ok(frm) => frm,
                 Err(e) => {
                     out.error = Some(format!(
@@ -169,7 +194,8 @@ pub fn load(path: &Path, text: &str, companion: Option<(&Path, &str)>) -> Loaded
             for d in &frm.diagnostics {
                 note(&mut out, d);
             }
-            let source = companion.and_then(|(p, t)| Some((p, formust_rust::import(t).ok()?)));
+            let source =
+                companion.and_then(|(p, t)| Some((p, formust_rust::import_with(t, options).ok()?)));
             match source {
                 Some((src_path, source)) => {
                     out.forms = formust_rust::merge(&name(src_path), &source, &frm)
@@ -194,7 +220,7 @@ pub fn load(path: &Path, text: &str, companion: Option<(&Path, &str)>) -> Loaded
             out.frm_text = Some(text.to_string());
         }
         FileKind::Source | FileKind::Other => {
-            let source = match formust_rust::import(text) {
+            let source = match formust_rust::import_with(text, options) {
                 Ok(s) => s,
                 Err(e) => {
                     out.error = Some(format!(
@@ -211,7 +237,8 @@ pub fn load(path: &Path, text: &str, companion: Option<(&Path, &str)>) -> Loaded
                 note(&mut out, d);
             }
             match companion {
-                Some((frm_path, frm_text)) => match formust_rust::parse_frm(frm_text) {
+                Some((frm_path, frm_text)) => match formust_rust::parse_frm_with(frm_text, options)
+                {
                     Ok(frm) => {
                         for d in &frm.diagnostics {
                             note(&mut out, d);
@@ -274,6 +301,16 @@ pub fn key_of(path: &Path, text: &str, companion: Option<(&Path, &str)>) -> u64 
     h.finish()
 }
 
+/// The fingerprint of a load with the extended import switch: turning it on or off reads the file
+/// again.
+pub fn load_key(path: &Path, text: &str, companion: Option<(&Path, &str)>, extended: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key_of(path, text, companion).hash(&mut h);
+    extended.hash(&mut h);
+    h.finish()
+}
+
 /// The designer's state: what was read, the form shown and the selection.
 #[derive(Default)]
 pub struct Designer {
@@ -287,6 +324,10 @@ pub struct Designer {
     pub hovered: Option<NodeId>,
     /// The preview's mode; `None` follows the IDE.
     pub dark: Option<bool>,
+    /// Extended import (`ImportOptions::extended`): control flow holding widgets and
+    /// `let x = <widget>;` become nodes instead of locked custom code. Off by default; switched in
+    /// the top bar, which reads the file again. Kept for the session.
+    pub extended: bool,
     /// Canvas scroll offset.
     pub scroll: Vec2,
     /// Node rects of the last kept preview pass, for hit-testing.
@@ -329,6 +370,82 @@ pub struct Designer {
     pub show_usage: bool,
     /// What the designer asks the app to do (save, the prompt's answers), run after drawing.
     pub actions: Vec<ui::Action>,
+    /// The other end of a shift-click range of siblings, from the selected node.
+    pub range_to: Option<NodeId>,
+    /// A resize drag on a selection handle, while it lasts.
+    pub resize: Option<Resizing>,
+    /// More selected nodes, added with Cmd-click or a rubber band (as drawn: an anchored node, not
+    /// its wrapper). The selected node is the primary one the inspector and handles follow.
+    pub multi: Vec<NodeId>,
+    /// A rubber-band selection being dragged on the canvas, from this point.
+    pub band: Option<eframe::egui::Pos2>,
+    /// The palette's filter text and its closed categories.
+    pub palette_filter: String,
+    pub palette_closed: std::collections::HashSet<&'static str>,
+    /// Canvas overlays, never exported: rulers in points, a grid of lines every so many points,
+    /// and the distances from the selected node to its neighbours.
+    pub rulers: bool,
+    pub grid: Option<f32>,
+    /// The distance guides are on unless turned off.
+    pub guides_off: bool,
+    /// Tab order mode: numbers on the focusable widgets and the order list in the right panel.
+    pub tab_order: bool,
+    /// The value typed for "same width" and "same height" (`None`: the largest of the selection).
+    pub size_value: Option<f32>,
+    /// The spacing typed for "spacing of the parent" (`None`: 8 pt).
+    pub spacing_value: Option<f32>,
+    /// A row of the tab order list being dragged.
+    pub tab_drag: Option<NodeId>,
+    /// The page each Tabs shows on the canvas, by Tabs id: the one last selected in or clicked.
+    pub tab_pages: HashMap<NodeId, NodeId>,
+    /// The tab buttons of the last kept pass, with the page each shows.
+    pub tab_buttons: Vec<(Rect, NodeId)>,
+}
+
+/// A resize drag: which node and edges, its rect when it started, and the forms as they were, which
+/// each step starts from (so the drag never drifts) and Escape goes back to.
+#[derive(Clone, Debug)]
+pub struct Resizing {
+    pub id: NodeId,
+    /// The right edge, the bottom edge, or both (the corner).
+    pub edges: (bool, bool),
+    pub start: Rect,
+    pub before: Vec<Form>,
+    /// A row-based height: the rows at the start and the height of one row.
+    pub rows: Option<(i64, f32)>,
+}
+
+/// The least size a resize gives.
+pub const MIN_SIZE: f32 = 8.0;
+
+/// The size a resize drag of `start` by `delta` asks for. Shift keeps the aspect ratio on the corner;
+/// Alt snaps the dragged axes to a 4pt grid; otherwise whole points.
+pub fn drag_size(start: Vec2, edges: (bool, bool), delta: Vec2, shift: bool, alt: bool) -> Vec2 {
+    let mut w = if edges.0 { start.x + delta.x } else { start.x };
+    let mut h = if edges.1 { start.y + delta.y } else { start.y };
+    if shift && edges.0 && edges.1 && start.x > 0.0 && start.y > 0.0 {
+        let scale = (w / start.x).max(h / start.y);
+        w = start.x * scale;
+        h = start.y * scale;
+    }
+    let snap = |v: f32| {
+        let v = if alt {
+            (v / 4.0).round() * 4.0
+        } else {
+            v.round()
+        };
+        v.max(MIN_SIZE)
+    };
+    // The other axis is written too (`add_sized` and `min_size` take both): in whole points.
+    Vec2::new(
+        if edges.0 { snap(w) } else { start.x.round() },
+        if edges.1 { snap(h) } else { start.y.round() },
+    )
+}
+
+/// Is `id` somewhere below `n`?
+fn contains(n: &Node, id: NodeId) -> bool {
+    n.children().iter().any(|c| c.id == id || contains(c, id))
 }
 
 /// Two texts side by side, for the conflict prompt.
@@ -352,6 +469,9 @@ impl Designer {
         if !same_file {
             self.form_id = None;
             self.selected = None;
+            self.multi.clear();
+            self.range_to = None;
+            self.resize = None;
             self.hovered = None;
             self.scroll = Vec2::ZERO;
             self.rects.clear();
@@ -570,9 +690,24 @@ impl Designer {
         moved
     }
 
-    /// One place earlier (`-1`) or later (`1`) among its siblings.
+    /// The node that stands for `id` among its siblings: its anchor wrapper, if it has one.
+    pub fn host(&self, id: NodeId) -> NodeId {
+        self.current().map_or(id, |f| f.form().anchor_host(id))
+    }
+
+    /// The selected node's host, see [`Designer::host`].
+    fn selected_host(&self) -> Option<NodeId> {
+        self.selected.map(|id| self.host(id))
+    }
+
+    /// One place earlier (`-1`) or later (`1`) among its siblings; a selection of siblings moves
+    /// together, as one undo step.
     pub fn nudge(&mut self, delta: i32) -> bool {
-        let Some(id) = self.selected else {
+        let hosts = self.selection_hosts();
+        if hosts.len() > 1 {
+            return self.nudge_set(&hosts, delta);
+        }
+        let Some(id) = self.selected_host() else {
             return false;
         };
         let Some((parent, at)) = self.current().and_then(|f| f.form().parent_of(id)) else {
@@ -589,9 +724,104 @@ impl Designer {
         self.try_edit(None, |f| f.move_node(id, parent, to as usize))
     }
 
+    fn nudge_set(&mut self, hosts: &[NodeId], delta: i32) -> bool {
+        let Some(form) = self.current().map(|f| f.form().clone()) else {
+            return false;
+        };
+        let places: Vec<(NodeId, usize)> =
+            hosts.iter().filter_map(|h| form.parent_of(*h)).collect();
+        let parent = places[0].0;
+        if places.len() != hosts.len() || places.iter().any(|(p, _)| *p != parent) {
+            self.status = Some("Only siblings move together with the arrow keys".to_string());
+            return false;
+        }
+        let len = form.find(parent).map_or(0, |p| p.children().len());
+        let mut order: Vec<(usize, NodeId)> = hosts
+            .iter()
+            .zip(&places)
+            .map(|(h, (_, i))| (*i, *h))
+            .collect();
+        order.sort();
+        if (delta < 0 && order[0].0 == 0) || (delta > 0 && order[order.len() - 1].0 + 1 >= len) {
+            return false;
+        }
+        if delta > 0 {
+            order.reverse();
+        }
+        self.try_edit(None, |f| {
+            for (i, id) in &order {
+                let to = if delta < 0 { i - 1 } else { i + 1 };
+                f.move_node(*id, parent, to)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Moves the whole selection to the drop place `index` among `parent`'s current children, in
+    /// tree order, as one undo step. The selection stays on the moved nodes.
+    pub fn move_selection_to(&mut self, parent: NodeId, index: usize) -> bool {
+        let hosts = self.selection_hosts();
+        let Some(form) = self.current().map(|f| f.form().clone()) else {
+            return false;
+        };
+        if hosts.iter().any(|h| {
+            form.find(*h)
+                .is_some_and(|n| n.id == parent || contains(n, parent))
+        }) {
+            self.status = Some(edit_error_text(&EditError::IntoOwnSubtree));
+            return false;
+        }
+        let before = hosts
+            .iter()
+            .filter(|h| {
+                form.parent_of(**h)
+                    .is_some_and(|(p, i)| p == parent && i < index)
+            })
+            .count();
+        let (keep, multi) = (self.selected, self.multi.clone());
+        let done = self.try_edit(None, |f| {
+            let mut nodes = Vec::new();
+            for h in &hosts {
+                if f.is_locked_branch(*h) {
+                    return Err(EditError::Locked(*h));
+                }
+                if !f.fits(parent, f.find(*h).ok_or(EditError::NoSuchNode(*h))?) {
+                    return Err(EditError::NeedsUi(parent));
+                }
+            }
+            for h in &hosts {
+                nodes.push(f.remove(*h)?);
+            }
+            let mut at = index - before;
+            for node in nodes {
+                f.insert(parent, at, node)?;
+                at += 1;
+            }
+            Ok(())
+        });
+        if done {
+            self.selected = keep;
+            self.multi = multi;
+            self.range_to = None;
+        }
+        done
+    }
+
     /// Deletes the selected node and selects its neighbour (or its parent).
     pub fn delete_selected(&mut self) -> bool {
-        let Some(id) = self.selected else {
+        let hosts = self.selection_hosts();
+        if hosts.len() > 1 {
+            let parent = self
+                .current()
+                .and_then(|f| f.form().parent_of(hosts[0]))
+                .map(|p| p.0);
+            let done = self.try_edit(None, |f| f.remove_all(&hosts));
+            if done {
+                self.select(parent, true);
+            }
+            return done;
+        }
+        let Some(id) = self.selected_host() else {
             return false;
         };
         let Some((parent, at)) = self.current().and_then(|f| f.form().parent_of(id)) else {
@@ -613,9 +843,33 @@ impl Designer {
         true
     }
 
-    /// Duplicates the selected node after itself and selects the copy.
+    /// Duplicates the selected node after itself and selects the copy; with several selected, each
+    /// is copied after itself, as one undo step, and the copies are selected.
     pub fn duplicate_selected(&mut self) -> Option<NodeId> {
-        let id = self.selected?;
+        let hosts = self.selection_hosts();
+        if hosts.len() > 1 {
+            let copies = self
+                .edit(None, |f| {
+                    let mut copies = Vec::new();
+                    for h in hosts.iter().rev() {
+                        let (parent, at) = f.parent_of(*h).ok_or(EditError::IsRoot)?;
+                        let copy = f.clone_subtree(*h)?;
+                        copies.push(copy.id);
+                        f.insert(parent, at + 1, copy)?;
+                    }
+                    copies.reverse();
+                    Ok(copies)
+                })
+                .map_err(|e| self.status = Some(edit_error_text(&e)))
+                .ok()?;
+            let shown: Vec<NodeId> = copies
+                .iter()
+                .map(|c| self.current().map_or(*c, |f| f.form().anchor_child(*c)))
+                .collect();
+            self.select_all_of(&shown);
+            return self.selected;
+        }
+        let id = self.selected_host()?;
         let new = self
             .edit(None, |f| {
                 let (parent, at) = f.parent_of(id).ok_or(EditError::IsRoot)?;
@@ -625,18 +879,20 @@ impl Designer {
             })
             .map_err(|e| self.status = Some(edit_error_text(&e)))
             .ok()?;
+        // The copy of an anchored node is its wrapper's copy; the node in it is selected.
         self.select(Some(new), true);
-        Some(new)
+        self.selected
     }
 
     /// The selected node as Rust text (custom code too: it is copied, never opened).
     pub fn copy_selected(&mut self) -> Option<String> {
-        let id = self.selected?;
+        let hosts = self.selection_hosts();
         let f = self.current()?.form();
-        if id == f.root.id {
+        if hosts.is_empty() || hosts.contains(&f.root.id) {
             return None;
         }
-        let text = formust_rust::clip::copy_text(f, &[f.find(id)?]);
+        let nodes: Vec<&Node> = hosts.iter().filter_map(|h| f.find(*h)).collect();
+        let text = formust_rust::clip::copy_text(f, &nodes);
         self.clipboard = Some(text.clone());
         Some(text)
     }
@@ -679,6 +935,368 @@ impl Designer {
         }
     }
 
+    /// Extends the selection to `id` (a shift-click): a run of siblings from the selected node.
+    /// Anything that isn't a sibling just selects `id`.
+    pub fn select_range(&mut self, id: NodeId, from_canvas: bool) {
+        let Some(form) = self.current().map(|f| f.form().clone()) else {
+            return;
+        };
+        let id = form.anchor_child(id);
+        let sibling = self.selected.is_some_and(|s| {
+            let (a, b) = (form.anchor_host(s), form.anchor_host(id));
+            a != b && form.parent_of(a).map(|p| p.0) == form.parent_of(b).map(|p| p.0)
+        });
+        if sibling {
+            self.range_to = Some(id);
+        } else {
+            self.select(Some(id), from_canvas);
+        }
+    }
+
+    /// The selection as hosts (anchor wrappers stand for their node), in tree order and with no node
+    /// inside another: the selected node, the run to a shift-clicked sibling, and the Cmd-clicked
+    /// or rubber-band nodes.
+    pub fn selection_hosts(&self) -> Vec<NodeId> {
+        let Some(f) = self.current().map(|f| f.form()) else {
+            return Vec::new();
+        };
+        let Some(first) = self.selected_host() else {
+            return Vec::new();
+        };
+        let mut hosts = match f.parent_of(first) {
+            None => vec![first],
+            Some((parent, a)) => {
+                let other = self.range_to.map(|r| f.anchor_host(r));
+                match other.and_then(|o| f.parent_of(o)) {
+                    Some((p, b)) if p == parent => {
+                        let (lo, hi) = (a.min(b), a.max(b));
+                        f.find(parent).map_or_else(Vec::new, |n| {
+                            n.children()[lo..=hi].iter().map(|c| c.id).collect()
+                        })
+                    }
+                    _ => vec![first],
+                }
+            }
+        };
+        if self.multi.is_empty() {
+            return hosts;
+        }
+        hosts.extend(
+            self.multi
+                .iter()
+                .filter(|m| f.find(**m).is_some())
+                .map(|m| f.anchor_host(*m)),
+        );
+        if hosts.contains(&f.root.id) {
+            return vec![f.root.id];
+        }
+        f.top_level(&hosts)
+    }
+
+    /// The nodes of the selection besides the selected one, as drawn (anchor wrappers as their node).
+    pub fn also_selected(&self) -> Vec<NodeId> {
+        let Some(f) = self.current().map(|f| f.form()) else {
+            return Vec::new();
+        };
+        if self.range_to.is_none() && self.multi.is_empty() {
+            return Vec::new();
+        }
+        self.selection_hosts()
+            .into_iter()
+            .map(|h| f.anchor_child(h))
+            .filter(|id| Some(*id) != self.selected)
+            .collect()
+    }
+
+    /// Cmd-click: adds `id` to the selection, or takes it out. With nothing selected it is selected.
+    pub fn toggle_select(&mut self, id: NodeId, from_canvas: bool) {
+        let Some(form) = self.current().map(|f| f.form().clone()) else {
+            return;
+        };
+        let id = form.anchor_child(id);
+        if id == form.root.id {
+            return;
+        }
+        let Some(primary) = self.selected.filter(|s| *s != form.root.id) else {
+            self.select(Some(id), from_canvas);
+            return;
+        };
+        // A shift-click range becomes part of the set.
+        let range: Vec<NodeId> = self
+            .also_selected()
+            .into_iter()
+            .filter(|n| !self.multi.contains(n))
+            .collect();
+        self.range_to = None;
+        self.multi.extend(range);
+        if id == primary {
+            self.selected = self.multi.pop();
+        } else if let Some(k) = self.multi.iter().position(|m| *m == id) {
+            self.multi.remove(k);
+        } else {
+            self.multi.push(id);
+        }
+        if from_canvas {
+            self.reveal_row = true;
+        }
+    }
+
+    /// Selects `ids` (a rubber band): the first is the primary one.
+    pub fn select_all_of(&mut self, ids: &[NodeId]) {
+        match ids.split_first() {
+            None => self.select(None, true),
+            Some((first, rest)) => {
+                self.select(Some(*first), true);
+                self.multi = rest.to_vec();
+            }
+        }
+    }
+
+    /// How many nodes are selected.
+    pub fn selection_len(&self) -> usize {
+        self.selection_hosts().len()
+    }
+
+    /// Can the selection be wrapped in a row?
+    pub fn can_wrap_selection(&self) -> bool {
+        let hosts = self.selection_hosts();
+        !hosts.is_empty()
+            && self
+                .current()
+                .is_some_and(|f| hosts.iter().all(|h| f.form().can_wrap(*h)))
+    }
+
+    /// Wraps the selection (one node, or a shift-click range) in a new Horizontal at its place, as
+    /// one undo step. The selection stays on the node it was on.
+    pub fn wrap_selected(&mut self) -> bool {
+        let hosts = self.selection_hosts();
+        if hosts.is_empty() {
+            return false;
+        }
+        if !self.can_wrap_selection() {
+            self.status = Some(
+                "Can't wrap that here: the form itself, a window, a panel, control flow or a dialog's root".to_string(),
+            );
+            return false;
+        }
+        self.wrap_selection(ContainerId::Horizontal)
+    }
+
+    /// Wraps the selection in a new `def` container (a row or a column), gathering the nodes next
+    /// to the first one when they are apart, as one undo step. The selection stays.
+    pub fn wrap_selection(&mut self, def: ContainerId) -> bool {
+        let hosts = self.selection_hosts();
+        if hosts.is_empty() || !self.can_wrap_selection() {
+            self.status = Some(
+                "Can't wrap that here: the form itself, a window, a panel, control flow, a column or a side, or a dialog's root".to_string(),
+            );
+            return false;
+        }
+        let (keep, multi) = (self.selected, self.multi.clone());
+        let range = self.range_to;
+        let done = self.try_edit(None, |f| f.wrap_any(&hosts, def).map(|_| ()));
+        if done {
+            self.selected = keep;
+            self.multi = multi;
+            self.range_to = range;
+            self.reveal_row = true;
+        }
+        done
+    }
+
+    /// The container "Unwrap" acts on: the selected node when it is a container that can be
+    /// unwrapped.
+    pub fn unwrap_target(&self) -> Option<NodeId> {
+        let id = self.selected?;
+        let f = self.current()?.form();
+        f.can_unwrap(id).then_some(id)
+    }
+
+    /// Moves the selected container's children out into its place, as one undo step, and selects
+    /// the first of them.
+    pub fn unwrap_selected(&mut self) -> bool {
+        let Some(id) = self.unwrap_target() else {
+            self.status = Some(
+                "Select a container to unwrap (not the form, a window, a panel or control flow; its own comments can't be dropped)".to_string(),
+            );
+            return false;
+        };
+        match self.edit(None, |f| f.unwrap(id)) {
+            Ok(children) => {
+                self.select(children.first().copied(), true);
+                true
+            }
+            Err(e) => {
+                self.status = Some(edit_error_text(&e));
+                false
+            }
+        }
+    }
+
+    /// Does the selected widget fill the width (`None`: Fill doesn't apply to it)?
+    pub fn selected_fill(&self) -> Option<bool> {
+        let id = self.selected?;
+        match &self.current()?.form().find(id)?.kind {
+            NodeKind::Widget { def, props, .. } => {
+                formust_model::fill_way(*def).map(|_| is_fill(*def, props))
+            }
+            _ => None,
+        }
+    }
+
+    /// Turns Fill on or off for the selected widget.
+    pub fn set_fill(&mut self, on: bool) -> bool {
+        let Some(id) = self.selected else {
+            return false;
+        };
+        self.try_edit(None, |f| f.set_fill(id, on))
+    }
+
+    pub fn toggle_fill(&mut self) -> bool {
+        match self.selected_fill() {
+            Some(on) => self.set_fill(!on),
+            None => {
+                self.status = Some(
+                    "Fill applies to text edits, progress bars, combo boxes, buttons and drag values".to_string(),
+                );
+                false
+            }
+        }
+    }
+
+    /// The selected node's anchor, and whether it can have one.
+    pub fn selected_anchor(&self) -> (Option<Anchor>, bool) {
+        let (Some(id), Some(f)) = (self.selected, self.current()) else {
+            return (None, false);
+        };
+        let form = f.form();
+        let anchor = form.anchor_of(id);
+        (anchor, anchor.is_some() || form.can_wrap(id))
+    }
+
+    /// Sets the selected node's anchor (none removes its wrapper), as one undo step.
+    pub fn set_anchor(&mut self, anchor: Option<Anchor>) -> bool {
+        let Some(id) = self.selected else {
+            return false;
+        };
+        let done = self.try_edit(None, |f| f.set_anchor(id, anchor));
+        if done {
+            self.select(Some(id), true);
+        }
+        done
+    }
+
+    /// The spacing "spacing of the parent" writes.
+    pub fn spacing(&self) -> f32 {
+        self.spacing_value.unwrap_or(8.0)
+    }
+
+    /// Moves widget `id` before (or after) `target` in the tab order, as one undo step.
+    pub fn move_in_tab_order(&mut self, id: NodeId, target: NodeId, after: bool) -> bool {
+        let done = self.try_edit(None, |f| f.move_in_tab_order(id, target, after));
+        if done {
+            self.select(Some(id), false);
+        }
+        done
+    }
+
+    /// Gives widget `id` the initial focus (and takes it from any other), or takes it away.
+    pub fn set_initial_focus(&mut self, id: NodeId, on: bool) -> bool {
+        self.try_edit(None, |f| {
+            if on {
+                for other in f.tab_order() {
+                    let has = matches!(&f.find(other).map(|n| &n.kind), Some(NodeKind::Widget { props, .. }) if props.contains_key("initial_focus"));
+                    if other != id && has {
+                        f.clear_prop(other, "initial_focus")?;
+                    }
+                }
+            }
+            f.set_prop(id, "initial_focus", PropValue::Bool(on))
+        })
+    }
+
+    /// Removes every size property of the selected node.
+    pub fn reset_size(&mut self) -> bool {
+        let Some(id) = self.selected else {
+            return false;
+        };
+        self.try_edit(None, |f| f.reset_size(id))
+    }
+
+    /// Starts a resize drag on the selected node's handle.
+    pub fn begin_resize(&mut self, id: NodeId, edges: (bool, bool), start: Rect, row_height: f32) {
+        let Some(loaded) = self.loaded.as_ref() else {
+            return;
+        };
+        let rows = self.current().and_then(|f| match &f.form().find(id)?.kind {
+            NodeKind::Widget {
+                def: formust_model::WidgetId::TextEditMultiline,
+                props,
+                ..
+            } => Some(match props.get("desired_rows") {
+                Some(PropValue::Int(r)) => (*r, row_height),
+                _ => (4, row_height),
+            }),
+            _ => None,
+        });
+        self.resize = Some(Resizing {
+            id,
+            edges,
+            start,
+            before: loaded.snapshot(),
+            rows,
+        });
+    }
+
+    /// One step of a resize drag: `delta` from where it started. The size goes into the node's
+    /// size properties (see `Form::resize`), starting again from the form as it was each time.
+    pub fn drag_resize(&mut self, delta: Vec2, shift: bool, alt: bool) {
+        let (Some(r), Some(i)) = (self.resize.clone(), self.current_index()) else {
+            return;
+        };
+        let size = drag_size(r.start.size(), r.edges, delta, shift, alt);
+        let rows = r.rows.map(|(rows0, row_h)| {
+            let extra = ((size.y - r.start.height()) / row_h.max(1.0)).round() as i64;
+            (rows0 + extra).max(1)
+        });
+        let mut form = r.before[i].clone();
+        let request = SizeRequest {
+            width: f64::from(size.x),
+            height: f64::from(size.y),
+            rows,
+            change_width: r.edges.0,
+            change_height: r.edges.1,
+        };
+        match form.resize(r.id, request) {
+            Ok(()) => {
+                if let Some(l) = self.loaded.as_mut() {
+                    l.forms[i].imported.form = form;
+                }
+                self.status = None;
+            }
+            Err(e) => self.status = Some(edit_error_text(&e)),
+        }
+    }
+
+    /// The end of a resize drag: one undo step if the size changed.
+    pub fn end_resize(&mut self) {
+        let Some(r) = self.resize.take() else { return };
+        if let Some(l) = self.loaded.as_mut()
+            && l.snapshot() != r.before
+        {
+            l.history.checkpoint(None, || r.before);
+        }
+    }
+
+    /// Escape during a resize drag: the forms as they were, and no undo step.
+    pub fn cancel_resize(&mut self) {
+        if let Some(r) = self.resize.take()
+            && let Some(l) = self.loaded.as_mut()
+        {
+            l.restore(r.before);
+        }
+    }
+
     /// The conflict prompt's "keep": the form stays as it is and is now based on the source as it
     /// is, so the question doesn't come back. Exported with the next save.
     pub fn keep_form(&mut self, form: &str, read: &dyn Fn(&Path) -> Option<String>) {
@@ -688,11 +1306,10 @@ impl Designer {
         let Ok(t) = export::target(loaded, &|p| p.exists()) else {
             return;
         };
-        let Some(source) = t
-            .source
-            .as_deref()
-            .and_then(read)
-            .and_then(|text| formust_rust::import(&text).ok())
+        let Some(source) =
+            t.source.as_deref().and_then(read).and_then(|text| {
+                formust_rust::import_with(&text, import_options(self.extended)).ok()
+            })
         else {
             return;
         };
@@ -718,11 +1335,10 @@ impl Designer {
         let Ok(t) = export::target(loaded, &|p| p.exists()) else {
             return false;
         };
-        let Some(source) = t
-            .source
-            .as_deref()
-            .and_then(read)
-            .and_then(|text| formust_rust::import(&text).ok())
+        let Some(source) =
+            t.source.as_deref().and_then(read).and_then(|text| {
+                formust_rust::import_with(&text, import_options(self.extended)).ok()
+            })
         else {
             self.status = Some("The source can't be read or doesn't parse".to_string());
             return false;
@@ -777,6 +1393,9 @@ impl Designer {
         if self.form_id.as_ref() != Some(&id) {
             self.form_id = Some(id);
             self.selected = None;
+            self.multi.clear();
+            self.range_to = None;
+            self.resize = None;
             self.hovered = None;
             self.scroll = Vec2::ZERO;
             self.rects.clear();
@@ -786,6 +1405,10 @@ impl Designer {
     /// Selects a node (or nothing). `from_canvas` decides which side follows: the outline scrolls
     /// to a node picked on the canvas, the canvas to one picked in the outline.
     pub fn select(&mut self, id: Option<NodeId>, from_canvas: bool) {
+        // An anchor wrapper is shown as its node: selecting it selects the node.
+        let id = id.map(|i| self.current().map_or(i, |f| f.form().anchor_child(i)));
+        self.range_to = None;
+        self.multi.clear();
         if self.selected != id
             && let Some(l) = self.loaded.as_mut()
         {
@@ -847,11 +1470,9 @@ pub fn edit_error_text(e: &EditError) -> String {
         EditError::IntoOwnSubtree => "A container can't go inside itself".to_string(),
         EditError::NoSuchProp(p) => format!("No property {p} here"),
         EditError::IsCustom(_) => "Custom code is locked: edit it in the code editor".to_string(),
-        EditError::WrapperTaken(w) => {
-            format!("This widget already uses {w}; clear it first (one add_* wrapper per widget)")
-        }
         EditError::Locked(_) => {
-            "A branch of an if or match can't be moved or removed on its own".to_string()
+            "A branch of an if or match, a column or a side can't be moved or removed on its own"
+                .to_string()
         }
         EditError::NeedsUi(_) => {
             "Here is the dialog's context, not a Ui: put widgets inside its Window or dialog"
@@ -894,6 +1515,21 @@ pub fn node_title(n: &Node) -> String {
                 // `Dialog crate::style::dialog(ctx, "about", None, 540.0`.
                 let call = call.trim().trim_end_matches(',').trim();
                 return format!("{} {}", d.label, one_line(call, 40));
+            }
+            if let NodeKind::Container {
+                def: ContainerId::Column,
+                ident,
+                ..
+            } = &n.kind
+            {
+                return format!("{} {ident}", d.label);
+            }
+            if *def == ContainerId::Side {
+                return if n.leading.contains(',') {
+                    "Right side".to_string()
+                } else {
+                    "Left side".to_string()
+                };
             }
             if matches!(def, ContainerId::Flow) {
                 let head = shell
@@ -958,6 +1594,13 @@ pub fn show_value(v: &PropValue) -> String {
             dark: Some(d),
         } => format!("{} light, {} dark", hex(light), hex(d)),
         PropValue::Expr(e) => e.clone(),
+        PropValue::Stroke { width, light, dark } => {
+            let color = show_value(&PropValue::Color {
+                light: *light,
+                dark: *dark,
+            });
+            format!("{width:?} pt, {color}")
+        }
         PropValue::Items(items) => items
             .iter()
             .map(|i| match &i.label {
@@ -1408,6 +2051,144 @@ impl About {
         assert!(
             text.contains("pub fn show(ctx: &egui::Context) -> bool {"),
             "{text}"
+        );
+    }
+
+    fn root_kids(d: &Designer) -> Vec<String> {
+        d.current()
+            .unwrap()
+            .form()
+            .root
+            .children()
+            .iter()
+            .map(node_title)
+            .collect()
+    }
+
+    /// A shift-click range of siblings wraps in one Horizontal as one undo step; Unwrap puts them
+    /// back; the selection stays on the node it was on.
+    #[test]
+    fn a_range_wraps_in_a_row_and_unwraps() {
+        let mut d = Designer::default();
+        d.store(load(Path::new("/p/login.rs"), LOGIN, None), 1);
+        let before = root_kids(&d);
+        let kids: Vec<NodeId> = d.current().unwrap().form().root.children()[1..3]
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        d.select(Some(kids[0]), true);
+        d.select_range(kids[1], true);
+        assert_eq!(d.selection_hosts(), kids);
+        assert_eq!(d.also_selected(), [kids[1]]);
+        assert!(d.wrap_selected());
+        assert_eq!(d.selected, Some(kids[0]));
+        assert_eq!(d.loaded.as_ref().unwrap().history.steps(), 1);
+        let row = d.current().unwrap().form().parent_of(kids[0]).unwrap().0;
+        assert_eq!(
+            d.current().unwrap().form().parent_of(kids[1]),
+            Some((row, 1))
+        );
+        assert_eq!(root_kids(&d)[1], "Horizontal");
+        let text = formust_rust::emit_form_item(d.current().unwrap().form());
+        assert!(
+            text.contains("        ui.horizontal(|ui| {\n            ui.checkbox(&mut self.remember, \"Remember\");"),
+            "{text}"
+        );
+        d.select(Some(row), true);
+        assert_eq!(d.unwrap_target(), Some(row));
+        assert!(d.unwrap_selected());
+        assert_eq!(root_kids(&d), before);
+        assert_eq!(d.selected, Some(kids[0]));
+        // The form itself can't be wrapped, and a widget isn't unwrapped.
+        d.select(Some(d.current().unwrap().form().root.id), true);
+        assert!(!d.wrap_selected() && !d.unwrap_selected());
+        assert!(d.undo() && d.undo());
+        assert!(!d.is_dirty());
+    }
+
+    /// An anchored node is selected, moved, copied and deleted with its wrapper, which the
+    /// outline and canvas never show as a node of its own.
+    #[test]
+    fn an_anchored_node_acts_with_its_wrapper() {
+        let mut d = Designer::default();
+        d.store(load(Path::new("/p/login.rs"), LOGIN, None), 1);
+        let checkbox = d.current().unwrap().form().root.children()[1].id;
+        d.select(Some(checkbox), true);
+        assert_eq!(d.selected_anchor(), (None, true));
+        assert!(d.set_anchor(Some(Anchor::Right)));
+        assert_eq!(d.selected, Some(checkbox));
+        assert_eq!(d.selected_anchor(), (Some(Anchor::Right), true));
+        let wrapper = d.host(checkbox);
+        assert_ne!(wrapper, checkbox);
+        d.select(Some(wrapper), true);
+        assert_eq!(d.selected, Some(checkbox), "the wrapper selects its node");
+        let copied = d.copy_selected().unwrap();
+        assert!(
+            copied.starts_with(
+                "ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {"
+            ),
+            "{copied}"
+        );
+        assert!(d.nudge(-1));
+        assert_eq!(d.current().unwrap().form().parent_of(wrapper).unwrap().1, 0);
+        let copy = d.duplicate_selected().unwrap();
+        assert!(d.current().unwrap().form().anchor_of(copy).is_some());
+        assert!(d.delete_selected());
+        assert!(d.current().unwrap().form().find(copy).is_none());
+        d.select(Some(checkbox), true);
+        assert!(d.set_anchor(None));
+        assert!(d.current().unwrap().form().find(wrapper).is_none());
+        assert_eq!(
+            d.current().unwrap().form().parent_of(checkbox).unwrap().0,
+            d.current().unwrap().form().root.id
+        );
+    }
+
+    /// A resize drag is applied from the form as it was on every step, is one undo step at the
+    /// end, and Escape puts everything back without a step.
+    #[test]
+    fn a_resize_drag_is_one_step_and_escape_cancels_it() {
+        let mut d = Designer::default();
+        d.store(load(Path::new("/p/login.rs"), LOGIN, None), 1);
+        let row = d.current().unwrap().form().root.children()[0].id;
+        let field = d.current().unwrap().form().find(row).unwrap().children()[1].id;
+        d.select(Some(field), true);
+        let start = Rect::from_min_size(eframe::egui::pos2(10.0, 10.0), Vec2::new(280.0, 20.0));
+        d.begin_resize(field, (true, false), start, 16.0);
+        for dx in [10.0, 30.0, 61.4] {
+            d.drag_resize(Vec2::new(dx, 5.0), false, false);
+        }
+        let width = |d: &Designer| match &d.current().unwrap().form().find(field).unwrap().kind {
+            NodeKind::Widget { props, .. } => props.get("desired_width").cloned(),
+            _ => None,
+        };
+        assert_eq!(width(&d), Some(PropValue::Float(341.0)));
+        d.end_resize();
+        assert_eq!(d.loaded.as_ref().unwrap().history.steps(), 1);
+        d.begin_resize(field, (true, false), start, 16.0);
+        d.drag_resize(Vec2::new(-100.0, 0.0), false, true);
+        assert_eq!(width(&d), Some(PropValue::Float(180.0)), "Alt snaps to 4pt");
+        d.cancel_resize();
+        assert_eq!(width(&d), Some(PropValue::Float(341.0)));
+        assert_eq!(d.loaded.as_ref().unwrap().history.steps(), 1);
+        assert!(d.undo());
+        assert_eq!(width(&d), None);
+    }
+
+    #[test]
+    fn a_drag_size_keeps_the_aspect_with_shift_and_a_minimum() {
+        let start = Vec2::new(100.0, 50.0);
+        assert_eq!(
+            drag_size(start, (true, true), Vec2::new(50.0, 0.0), true, false),
+            Vec2::new(150.0, 75.0)
+        );
+        assert_eq!(
+            drag_size(start, (false, true), Vec2::new(50.0, -100.0), false, false),
+            Vec2::new(100.0, MIN_SIZE)
+        );
+        assert_eq!(
+            drag_size(start, (true, false), Vec2::new(1.4, 9.0), false, false),
+            Vec2::new(101.0, 50.0)
         );
     }
 
